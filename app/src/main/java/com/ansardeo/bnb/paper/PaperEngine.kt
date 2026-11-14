@@ -68,7 +68,7 @@ class PaperEngine(private val db: PaperDatabase, val stage: TradingStage = Tradi
      * Deliberate user action (More > Reset, with confirmation): wipes ALL local virtual data
      * (wallet, cycles, entries, orders, history, events) and restores the starting virtual balance.
      */
-    suspend fun resetAllData(starting: Double = 100.0): EngineResult = mutex.withLock {
+    suspend fun resetAllData(starting: Double = 5000.0): EngineResult = mutex.withLock {
         assertSimulatedExecutionAllowed()
         withContext(Dispatchers.IO) { db.clearAllTables() }
         db.withTransaction {

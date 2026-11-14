@@ -203,43 +203,81 @@ class MainActivity : AppCompatActivity() {
     private fun stopRefresh() { refreshGen++; refreshRunnable?.let { mainHandler.removeCallbacks(it) }; refreshRunnable = null }
 
     // ---------------- HOME ----------------
+    private var homeTab = "Volume"
+
+    private fun fmtVol(v: Double?): String {
+        if (v == null || !v.isFinite()) return "--"
+        val a = kotlin.math.abs(v)
+        return when {
+            a >= 1e9 -> String.format(Locale.US, "%.2fB", v / 1e9)
+            a >= 1e6 -> String.format(Locale.US, "%.2fM", v / 1e6)
+            a >= 1e3 -> String.format(Locale.US, "%.2fK", v / 1e3)
+            else -> String.format(Locale.US, "%.2f", v)
+        }
+    }
+
     private fun dashboardPage() {
         stopRefresh()
         val root = pageContainer()
-        root.addView(text("Home", 23f, white, true))
-        root.addView(text("BNB — Binance Android Bot — ${stage().title}", 12f, yellow, true))
-        root.addView(text("Live USDⓈ-M Futures market (public, read-only). Stage 1 never submits real orders.", 11f, muted))
-        addSpace(root, 8)
 
-        val phaseCard = addCard(root, "TRADING STAGE", "Only Stage 1 (Virtual) is available. It never submits real Binance orders.")
-        addLabel(phaseCard, "Stage 1", "Live market prices + virtual balance (100 USDT) — ACTIVE", green)
-        addLabel(phaseCard, "Stage 2", "Demo — not available (needs separate approval)", lockedColor)
-        addLabel(phaseCard, "Stage 3", "Live — not available (needs separate approval)", lockedColor)
-        addLabel(phaseCard, "Monitoring", if (TradingControlStore.isPaused(this)) "PAUSED (More > Resume)" else "Running while the app is open", if (TradingControlStore.isPaused(this)) yellow else green)
+        // 1) WALLET BALANCE (top)
+        val balCard = addCard(root, "WALLET BALANCE - ${stage().shortLabel}")
+        val balText = priceTv("-- USDT", 26f, green).apply { gravity = Gravity.END; textAlignment = View.TEXT_ALIGNMENT_VIEW_END }
+        balCard.addView(balText, LinearLayout.LayoutParams(-1, -2))
+        addSpace(balCard, 4)
+        val balSub = text("Loading ${stage().shortLabel} wallet...", 12f, muted); balCard.addView(balSub)
 
-        val balCard = addCard(root, "WALLET — ${stage().shortLabel}")
-        val balText = priceTv("-- USDT", 20f, green); balCard.addView(balText)
-        val balSub = text("Loading ${stage().shortLabel} wallet...", 11f, muted); addSpace(balCard, 4); balCard.addView(balSub)
+        // 2) LIVE MARKET (below)
+        val marketCard = addCard(root, "LIVE CRYPTOCURRENCY PRICES (READ-ONLY)")
+        val mStatus = text("Loading market data...", 11f, yellow, true)
 
-        val marketCard = addCard(root, "LIVE CRYPTOCURRENCY PRICES (READ-ONLY)", "Tap any coin for details. Prices use dynamic decimals, right-aligned.")
-        val mStatus = text("Loading market data...", 12f, yellow, true); marketCard.addView(mStatus)
-        val mUpdated = text("Last update: --", 11f, muted); marketCard.addView(mUpdated); addSpace(marketCard, 8)
-
-        fun section(title: String): LinearLayout {
-            marketCard.addView(text(title, 11f, muted, true)); addSpace(marketCard, 4)
-            val box = column(); marketCard.addView(box); addSpace(marketCard, 8)
-            box.addView(text("Loading...", 12f, muted)); return box
+        val tabsBar = row().apply { background = rounded(inputBg, 14); setPadding(dp(4), dp(4), dp(4), dp(4)) }
+        val tabNames = listOf("Favorites", "Volume", "Gainers", "Losers")
+        val tabViews = tabNames.map { name ->
+            text(name, 13f, muted, false).apply { gravity = Gravity.CENTER; setPadding(0, dp(10), 0, dp(10)) }
+                .also { tabsBar.addView(it, LinearLayout.LayoutParams(0, -2, 1f)) }
         }
-        val secVol = section("TOP 10 BY 24H QUOTE VOLUME")
-        val secGain = section("TOP 10 GAINERS (24h %)")
-        val secLoss = section("TOP 10 LOSERS (24h %)")
-        val secFav = section("MY FAVORITES")
+        addSpace(marketCard, 8); marketCard.addView(tabsBar, LinearLayout.LayoutParams(-1, -2))
+        addSpace(marketCard, 8)
+
+        val head = row().apply { setPadding(dp(4), dp(4), dp(4), dp(8)) }
+        fun headCell(t: String, w: Float, end: Boolean) = text(t, 12f, muted, true).apply {
+            if (end) { gravity = Gravity.END; textAlignment = View.TEXT_ALIGNMENT_VIEW_END }
+        }.also { head.addView(it, LinearLayout.LayoutParams(0, -2, w)) }
+        headCell("Symbol", 1.25f, false); headCell("Price", 1.15f, true); headCell("24h Vol", 0.95f, true); headCell("24h %", 1.05f, true)
+        marketCard.addView(head)
+        marketCard.addView(View(this).apply { setBackgroundColor(ContextCompat.getColor(this@MainActivity, R.color.divider)) }, LinearLayout.LayoutParams(-1, dp(1)))
+        val list = column(); marketCard.addView(list)
+        addSpace(marketCard, 6)
+        marketCard.addView(mStatus)
+        val mUpdated = text("Last update: --", 11f, muted); marketCard.addView(mUpdated)
+
+        var lastOv: MarketOverview? = null
+        fun renderList() {
+            tabNames.forEachIndexed { i, n ->
+                val sel = n == homeTab
+                tabViews[i].setTextColor(if (sel) yellow else muted)
+                tabViews[i].setTypeface(null, if (sel) Typeface.BOLD else Typeface.NORMAL)
+                tabViews[i].background = if (sel) rounded(bg, 12) else null
+            }
+            val ov = lastOv
+            when (homeTab) {
+                "Favorites" -> renderFavorites(list, ov)
+                else -> {
+                    if (ov == null || !ov.dataAvailable) { list.removeAllViews(); list.addView(text("Loading live prices...", 12f, muted)); return }
+                    renderTickerList(list, when (homeTab) { "Gainers" -> ov.gainers; "Losers" -> ov.losers; else -> ov.volumeLeaders })
+                }
+            }
+        }
+        tabViews.forEachIndexed { i, v -> v.setOnClickListener { homeTab = tabNames[i]; renderList() } }
+        renderList()
 
         fun renderWallet() {
             lifecycleScope.launch {
                 try {
                     val w = engine().getWallet()
                     val active = paperDb.dao().getActiveCyclesWithEntries(stageId())
+                    val openOrders = paperDb.dao().getActiveOrders(stageId()).size
                     val prices = lastOverview?.symbols ?: emptyMap()
                     var unreal = 0.0
                     for (cwe in active) {
@@ -250,7 +288,7 @@ class MainActivity : AppCompatActivity() {
                     }
                     val equity = w.availableBalance + w.reservedMargin + unreal
                     balText.text = PriceFormatter.formatUsdt(equity)
-                    balSub.text = "Available ${PriceFormatter.formatUsdt(w.availableBalance)} | Reserved ${PriceFormatter.formatUsdt(w.reservedMargin)} | Unrealized ${PriceFormatter.formatPnl(unreal)} | Realized ${PriceFormatter.formatPnl(w.realizedPnl)}"
+                    balSub.text = "Available ${PriceFormatter.formatUsdt(w.availableBalance)} | Positions: ${active.size} | Open Orders: $openOrders | Unrealized ${PriceFormatter.formatPnl(unreal)} | Realized ${PriceFormatter.formatPnl(w.realizedPnl)} (Virtual)"
                 } catch (_: Exception) { balSub.text = "Unable to load virtual wallet." }
             }
         }
@@ -261,22 +299,18 @@ class MainActivity : AppCompatActivity() {
             lifecycleScope.launch {
                 val ov = marketRepo.getOverview()
                 if (gen != refreshGen || currentPage != "Home") return@launch
-                lastOverview = ov
+                lastOverview = ov; lastOv = ov
                 if (!ov.dataAvailable) {
                     mStatus.text = "Unavailable — ${ov.error ?: "unable to load live prices"} (retrying)"
                     mStatus.setTextColor(red)
                     mUpdated.text = "Last update: --"
-                    listOf(secVol, secGain, secLoss).forEach { it.removeAllViews(); it.addView(text("Unable to load live prices. Retrying...", 12f, red)) }
-                    renderFavorites(secFav, null)
+                    if (homeTab != "Favorites") { list.removeAllViews(); list.addView(text("Unable to load live prices. Retrying...", 12f, red)) } else renderList()
                 } else {
                     val label = if (ov.stale) "Stale" else if (ov.live) "Live" else ov.status
                     mStatus.text = "$label — Binance USDⓈ-M Futures (public, read-only)"
                     mStatus.setTextColor(if (ov.stale) yellow else green)
                     mUpdated.text = "Last update: ${ov.lastUpdate ?: "--"} (auto-refresh)"
-                    renderTickerList(secVol, ov.volumeLeaders)
-                    renderTickerList(secGain, ov.gainers)
-                    renderTickerList(secLoss, ov.losers)
-                    renderFavorites(secFav, ov)
+                    renderList()
                     renderWallet()
                 }
             }
@@ -284,6 +318,23 @@ class MainActivity : AppCompatActivity() {
         }
         renderWallet(); refreshMarket()
     }
+
+    private fun marketRow(sym: String, price: Double?, vol: Double?, pct: Double?): LinearLayout {
+        val line = row().apply {
+            isClickable = true; isFocusable = true
+            setPadding(dp(4), dp(10), dp(4), dp(10))
+            setOnClickListener { openDetail(sym) }
+        }
+        line.addView(text(sym, 13f, white, true), LinearLayout.LayoutParams(0, -2, 1.25f).apply { marginEnd = dp(6) })
+        line.addView(priceTv(PriceFormatter.formatPrice(price), 12f, white).apply { gravity = Gravity.END; textAlignment = View.TEXT_ALIGNMENT_VIEW_END }, LinearLayout.LayoutParams(0, -2, 1.15f).apply { marginEnd = dp(6) })
+        line.addView(priceTv(fmtVol(vol), 11f, muted, false).apply { gravity = Gravity.END; textAlignment = View.TEXT_ALIGNMENT_VIEW_END }, LinearLayout.LayoutParams(0, -2, 0.95f).apply { marginEnd = dp(6) })
+        val badgeWrap = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.END or Gravity.CENTER_VERTICAL }
+        badgeWrap.addView(percentBadge(pct), LinearLayout.LayoutParams(-2, -2))
+        line.addView(badgeWrap, LinearLayout.LayoutParams(0, -2, 1.05f))
+        return line
+    }
+
+    private fun divider(): View = View(this).apply { setBackgroundColor(ContextCompat.getColor(this@MainActivity, R.color.divider)) }
 
     private fun percentBadge(pct: Double?): TextView {
         val v = pct ?: 0.0
@@ -297,8 +348,8 @@ class MainActivity : AppCompatActivity() {
         return text(label, 12f, white, true).apply {
             gravity = Gravity.CENTER
             textAlignment = View.TEXT_ALIGNMENT_CENTER
-            background = rounded(bg, 8)
-            setPadding(dp(8), dp(6), dp(8), dp(6))
+            background = rounded(bg, 6)
+            setPadding(dp(6), dp(6), dp(6), dp(6))
         }
     }
 
@@ -306,26 +357,8 @@ class MainActivity : AppCompatActivity() {
         target.removeAllViews()
         if (items.isEmpty()) { target.addView(text("No live data available.", 12f, muted)); return }
         items.take(10).forEach { t ->
-            val line = row().apply {
-                isClickable = true; isFocusable = true
-                setPadding(dp(4), dp(8), dp(4), dp(8))
-                setOnClickListener { openDetail(t.symbol) }
-            }
-            // 1. Symbol (neutral)
-            line.addView(text(t.symbol, 13f, white, true), LinearLayout.LayoutParams(0, -2, 1.2f).apply { marginEnd = dp(8) })
-            // 2. Price (neutral)
-            line.addView(priceTv(PriceFormatter.formatPrice(t.lastPrice ?: t.markPrice), 12f, white).apply {
-                gravity = Gravity.END; textAlignment = View.TEXT_ALIGNMENT_VIEW_END
-            }, LinearLayout.LayoutParams(0, -2, 1.1f).apply { marginEnd = dp(8) })
-            // 3. Change % box
-            val badgeWrap = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.END or Gravity.CENTER_VERTICAL
-            }
-            badgeWrap.addView(percentBadge(t.priceChangePercent), LinearLayout.LayoutParams(-2, -2))
-            line.addView(badgeWrap, LinearLayout.LayoutParams(0, -2, 0.9f))
-            target.addView(line)
-            target.addView(View(this).apply { setBackgroundColor(ContextCompat.getColor(this@MainActivity, R.color.divider)) }, LinearLayout.LayoutParams(-1, dp(1)))
+            target.addView(marketRow(t.symbol, t.lastPrice ?: t.markPrice, t.quoteVolume, t.priceChangePercent))
+            target.addView(divider(), LinearLayout.LayoutParams(-1, dp(1)))
         }
     }
 
@@ -335,19 +368,8 @@ class MainActivity : AppCompatActivity() {
         if (favs.isEmpty()) { target.addView(text("No favorites yet. Open a coin and tap Favorite.", 12f, muted)); return }
         for (sym in favs) {
             val t = ov?.symbols?.get(sym)
-            val line = row().apply { isClickable = true; setPadding(dp(4), dp(8), dp(4), dp(8)); setOnClickListener { openDetail(sym) } }
-            line.addView(text(sym, 13f, white, true), LinearLayout.LayoutParams(0, -2, 1.2f).apply { marginEnd = dp(8) })
-            line.addView(priceTv(PriceFormatter.formatPrice(t?.lastPrice ?: t?.markPrice), 12f, white).apply {
-                gravity = Gravity.END; textAlignment = View.TEXT_ALIGNMENT_VIEW_END
-            }, LinearLayout.LayoutParams(0, -2, 1.1f).apply { marginEnd = dp(8) })
-            val badgeWrap = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.END or Gravity.CENTER_VERTICAL
-            }
-            badgeWrap.addView(percentBadge(t?.priceChangePercent), LinearLayout.LayoutParams(-2, -2))
-            line.addView(badgeWrap, LinearLayout.LayoutParams(0, -2, 0.9f))
-            target.addView(line)
-            target.addView(View(this).apply { setBackgroundColor(ContextCompat.getColor(this@MainActivity, R.color.divider)) }, LinearLayout.LayoutParams(-1, dp(1)))
+            target.addView(marketRow(sym, t?.lastPrice ?: t?.markPrice, t?.quoteVolume, t?.priceChangePercent))
+            target.addView(divider(), LinearLayout.LayoutParams(-1, dp(1)))
         }
     }
 
@@ -1010,7 +1032,7 @@ class MainActivity : AppCompatActivity() {
                 .setPositiveButton("CANCEL ORDERS") { _, _ -> lifecycleScope.launch { val r = engine().cancelAllPendingOrders(); result.text = r.message; toast("Done") } }
                 .setNegativeButton("BACK", null).show()
         }
-        addButton(ctl, "EMERGENCY STOP", 0xFF3A2E16.toInt()).setOnClickListener {
+        addButton(ctl, "EMERGENCY STOP", 0xFF3A3416.toInt()).setOnClickListener {
             AlertDialog.Builder(this).setTitle("Emergency stop?")
                 .setMessage("Pauses the bot and cancels all pending orders (simulated). Open positions are NOT closed.")
                 .setPositiveButton("STOP") { _, _ ->
@@ -1031,9 +1053,9 @@ class MainActivity : AppCompatActivity() {
         ctl.addView(result)
 
         val wal = addCard(root, "VIRTUAL WALLET")
-        addButton(wal, "RESET ALL VIRTUAL DATA (100 USDT)", 0xFF3A2E16.toInt()).setOnClickListener {
+        addButton(wal, "RESET ALL VIRTUAL DATA (5000 USDT)", 0xFF3A3416.toInt()).setOnClickListener {
             AlertDialog.Builder(this).setTitle("Reset ALL virtual data?")
-                .setMessage("Deletes the virtual wallet history, all cycles, orders, positions, history and events, then restores 100 USDT. This cannot be undone.")
+                .setMessage("Deletes the virtual wallet history, all cycles, orders, positions, history and events, then restores 5000 USDT. This cannot be undone.")
                 .setPositiveButton("RESET") { _, _ -> lifecycleScope.launch { engine().resetAllData(); toast("Virtual data reset"); showPage("More") } }
                 .setNegativeButton("CANCEL", null).show()
         }

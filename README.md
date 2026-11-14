@@ -1,6 +1,6 @@
 # BNB – Binance Android Bot (Stage 1 / Virtual only)
 
-BNB is an Android app that simulates a USDⓈ-M Futures strategy on a **virtual 100 USDT wallet** using **live public Binance market data**.
+BNB is an Android app that simulates a USDⓈ-M Futures strategy on a **virtual 5000 USDT wallet (matches the Binance Demo balance for the later stage)** using **live public Binance market data**.
 
 > **Safety boundary:** This build is **Stage 1 (Virtual) only**. It uses public, unauthenticated Binance endpoints. There are **no API keys, no signing, no private endpoints and no real orders**. Stage 2 (Demo) and Stage 3 (Live) are **not authorized and not available**; unknown or stored stage values fail closed to Stage 1.
 
@@ -17,7 +17,9 @@ BNB is an Android app that simulates a USDⓈ-M Futures strategy on a **virtual 
 - Settings are snapshotted when a cycle is created; later changes never alter running cycles.
 
 ## App structure
-Bottom tabs: **Home, Manual, Positions, Settings, More**.
+Bottom tabs: **Home, Trade, Positions, Settings, More** ("Trade" = the former Manual tab, where entries are placed).
+- Home: Wallet Balance card on top; below it Live Prices with four sub-tabs (Favorites, Volume, Gainers, Losers) and a Symbol / Price / 24h Vol / 24h % table.
+- Colour scheme follows the Binance app (dark #0B0E11 background, yellow #FCD535 accent, green #0ECB81 / red #F6465D).
 - Positions: *Open / Closed*; Open Orders: *Basic / Conditional*; History: *Open / Closed*.
 - Settings = central Dashboard with Global defaults and per-symbol overrides, each labelled **Global / Inherited / Symbol Override**.
 - More: status, pause/resume, cancel pending orders, emergency stop, panic close (simulated), full virtual reset, sanitized event log.
