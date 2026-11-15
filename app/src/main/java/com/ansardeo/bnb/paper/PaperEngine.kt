@@ -783,8 +783,6 @@ class PaperEngine(private val db: PaperDatabase, val stage: TradingStage = Tradi
         val pending = dao.getEntries(cycle.id).any { it.status == "PENDING" }
         if (pending) return
         if (cycle.status == "CLOSED") return
-        dao.requestCancelAllSlForCycle(cycle.id, "CANCELLING", now)
-        dao.verifyCancelAllSlForCycle(cycle.id, now)
         dao.getActiveOrdersForCycle(cycle.id).forEach { dao.updateOrder(it.copy(status = "CANCEL_VERIFIED", cancelVerifiedAt = now, updatedAt = now)) }
         val realized = cycle.realizedPnl ?: 0.0
         dao.updateCycle(cycle.copy(status = "CLOSED", closeReason = reason, closePrice = mark, closedAt = now, updatedAt = now, totalRemainingQuantity = 0.0, realizedPnl = realized))
