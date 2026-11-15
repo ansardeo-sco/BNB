@@ -14,6 +14,7 @@ import android.view.ViewGroup
 import android.widget.*
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import com.ansardeo.bnb.BuildConfig
@@ -70,10 +71,21 @@ class MainActivity : AppCompatActivity() {
     private var refreshGen: Long = 0L
     private var lastOverview: MarketOverview? = null
 
+    private val notificationPermission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { /* the service runs either way; without it the notification is only visible in the system task manager */ }
+
+    /** Starts the foreground monitoring service (if the user has not switched it off). Idempotent; independent of this Activity's lifecycle. */
+    private fun startBackgroundMonitoring() {
+        if (android.os.Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(this, android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            runCatching { notificationPermission.launch(android.Manifest.permission.POST_NOTIFICATIONS) }
+        }
+        com.ansardeo.bnb.paper.PaperMonitorService.startIfEnabled(this)
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         handleTradeIntent(intent)
         setContentView(R.layout.activity_main)
+        startBackgroundMonitoring()
         content = findViewById(R.id.contentFrame)
         topStatus = findViewById(R.id.txtTopStatus)
         navItems = listOf(
@@ -282,7 +294,7 @@ class MainActivity : AppCompatActivity() {
                     val prices = lastOverview?.symbols ?: emptyMap()
                     var unreal = 0.0
                     for (cwe in active) {
-                        val px = prices[cwe.cycle.symbol]?.markPrice ?: prices[cwe.cycle.symbol]?.lastPrice ?: continue
+                        val px = prices[cwe.cycle.symbol]?.markPrice ?: continue // Mark Price only; no last-price substitute
                         val avg = cwe.cycle.averageEntryPrice ?: continue
                         val qty = cwe.cycle.totalRemainingQuantity.takeIf { it > 0 } ?: cwe.cycle.totalQuantity
                         unreal += if (cwe.cycle.direction == "LONG") (px - avg) * qty else (avg - px) * qty
@@ -358,7 +370,7 @@ class MainActivity : AppCompatActivity() {
         target.removeAllViews()
         if (items.isEmpty()) { target.addView(text("No live data available.", 12f, muted)); return }
         items.take(10).forEach { t ->
-            target.addView(marketRow(t.symbol, t.lastPrice ?: t.markPrice, t.quoteVolume, t.priceChangePercent))
+            target.addView(marketRow(t.symbol, t.lastPrice, t.quoteVolume, t.priceChangePercent))
             target.addView(divider(), LinearLayout.LayoutParams(-1, dp(1)))
         }
     }
@@ -369,7 +381,7 @@ class MainActivity : AppCompatActivity() {
         if (favs.isEmpty()) { target.addView(text("No favorites yet. Open a coin and tap Favorite.", 12f, muted)); return }
         for (sym in favs) {
             val t = ov?.symbols?.get(sym)
-            target.addView(marketRow(sym, t?.lastPrice ?: t?.markPrice, t?.quoteVolume, t?.priceChangePercent))
+            target.addView(marketRow(sym, t?.lastPrice, t?.quoteVolume, t?.priceChangePercent))
             target.addView(divider(), LinearLayout.LayoutParams(-1, dp(1)))
         }
     }
@@ -400,7 +412,8 @@ class MainActivity : AppCompatActivity() {
         val btnOpenShort = view.findViewById<Button>(R.id.btnOpenShort)
         val result = view.findViewById<TextView>(R.id.txtManualResult)
 
-        var currentLivePrice: Double? = null
+        var currentLivePrice: Double? = null // Binance LAST price (LIMIT entry suggestion / display)
+        var currentMarkPrice: Double? = null // Binance MARK price (kept separate)
         var userEditedEntryPrice = false
         val prefillSymbol = pendingTradeSymbol?.uppercase()
         val prefillPrice = pendingTradePrice
@@ -443,7 +456,8 @@ class MainActivity : AppCompatActivity() {
             summaryBox.removeAllViews()
             addSummaryRow("Stage", stage().title, green)
             addSummaryRow("Symbol", sym)
-            addSummaryRow("Live Price", "${PriceFormatter.formatPrice(currentLivePrice)} USDT")
+            addSummaryRow("Last Price", "${PriceFormatter.formatPrice(currentLivePrice)} USDT")
+            addSummaryRow("Mark Price", "${PriceFormatter.formatPrice(currentMarkPrice)} USDT")
             addSummaryRow("Intended LIMIT Entry", "${PriceFormatter.formatPrice(intended)} USDT")
             addSummaryRow("Margin", "${PriceFormatter.formatUsdt(margin)} / ${lev}x")
             addSummaryRow("Cycle Stop Loss (ROI)", if (eff.stopLossEnabled) "-${fmtNum(eff.stopLossRoi)}% Position ROI" else "Disabled")
@@ -472,11 +486,12 @@ class MainActivity : AppCompatActivity() {
             fun tick() {
                 if (myGen != refreshGen || currentPage != "Trade" || selectedSym() != sym) return
                 lifecycleScope.launch {
-                    val px = marketRepo.getMarkPrice(sym)
+                    val lp = marketRepo.getLivePrices(sym)
                     if (myGen != refreshGen || currentPage != "Trade" || selectedSym() != sym) return@launch
-                    currentLivePrice = px
-                    livePriceTv.text = "Live price: ${PriceFormatter.formatPrice(currentLivePrice)} USDT"
-                    liveStatus.text = if (currentLivePrice != null) "Live public mark/price (auto-refresh)" else "Price unavailable — retrying"
+                    currentLivePrice = lp.last
+                    currentMarkPrice = lp.mark
+                    livePriceTv.text = "Last price: ${PriceFormatter.formatPrice(currentLivePrice)} USDT  |  Mark: ${PriceFormatter.formatPrice(currentMarkPrice)}"
+                    liveStatus.text = if (currentLivePrice != null) "Live public Binance prices (auto-refresh)" else "Price unavailable — retrying"
                     liveStatus.setTextColor(if (currentLivePrice != null) muted else red)
                     if (!userEditedEntryPrice && currentLivePrice != null && entryPriceInput.text.isNullOrBlank()) {
                         entryPriceInput.setText(PriceFormatter.formatPrice(currentLivePrice))
@@ -524,7 +539,7 @@ class MainActivity : AppCompatActivity() {
             val warn = "${s.shortLabel} is simulated. No real Binance order will be submitted."
             AlertDialog.Builder(this)
                 .setTitle("Confirm $dir LIMIT Entry")
-                .setMessage("Stage: ${s.title}\n$warn\n\n$sym $dir\nIntended LIMIT price: ${PriceFormatter.formatPrice(intended)}\nLive price: ${PriceFormatter.formatPrice(currentLivePrice)}\nMargin ${PriceFormatter.formatUsdt(margin)} | ${lev}x\n\nPlace this $dir LIMIT entry?")
+                .setMessage("Stage: ${s.title}\n$warn\n\n$sym $dir\nIntended LIMIT price: ${PriceFormatter.formatPrice(intended)}\nLast price: ${PriceFormatter.formatPrice(currentLivePrice)}\nMargin ${PriceFormatter.formatUsdt(margin)} | ${lev}x\n\nPlace this $dir LIMIT entry?")
                 .setPositiveButton("CONFIRM") { _, _ ->
                     setButtonsEnabled(false); result.setTextColor(muted); result.text = "Placing simulated $dir LIMIT entry..."
                     lifecycleScope.launch {
@@ -532,7 +547,7 @@ class MainActivity : AppCompatActivity() {
                         setButtonsEnabled(true)
                         if (res.ok) {
                             result.setTextColor(green); result.text = "[OK] ${res.message} (Cycle #${res.cycleId})"; toast("$dir LIMIT entry placed")
-                            runCatching { currentLivePrice?.let { engine().processAll(this@MainActivity, mapOf(sym to it)) } }
+                            runCatching { val m = currentMarkPrice; val l = currentLivePrice; if (m != null || l != null) engine().processAll(this@MainActivity, if (m != null) mapOf(sym to m) else emptyMap(), if (l != null) mapOf(sym to l) else emptyMap()) }
                         } else {
                             result.setTextColor(red); result.text = "[X] ${res.message}"
                         }
@@ -681,7 +696,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun currentPriceText(prices: Map<String, Ticker>, symbol: String, state: String): String {
-        val px = prices[symbol]?.markPrice ?: prices[symbol]?.lastPrice
+        val px = prices[symbol]?.lastPrice // display = Binance last price
         return when {
             px != null -> PriceFormatter.formatPrice(px)
             state == "Loading" -> "Loading..."
@@ -697,7 +712,7 @@ class MainActivity : AppCompatActivity() {
             val c = cwe.cycle
             val openEntries = cwe.entries.filter { it.status == "FILLED" && it.remainingQuantity > 1e-12 }
             if (openEntries.isEmpty()) continue
-            val px = prices[c.symbol]?.markPrice ?: prices[c.symbol]?.lastPrice
+            val px = prices[c.symbol]?.markPrice // PNL / ROI use the Binance MARK price (no last-price substitute)
             for (e in openEntries) {
                 val entryPrice = e.fillPrice
                 val entryQty = e.remainingQuantity
@@ -711,7 +726,8 @@ class MainActivity : AppCompatActivity() {
                 val header = row().apply { isClickable = true; setOnClickListener { openDetail(c.symbol) } }
                 header.addView(text("${c.symbol}  ${c.direction}", 15f, if (c.direction == "LONG") green else red, true), LinearLayout.LayoutParams(0, -2, 1f))
                 header.addView(text("${c.leverage}x", 12f, muted, true)); box.addView(header)
-                addLabel(box, "Current Price", currentPriceText(prices, c.symbol, priceState), white, true)
+                addLabel(box, "Last Price", currentPriceText(prices, c.symbol, priceState), white, true)
+                addLabel(box, "Mark Price", PriceFormatter.formatPrice(px), white, true)
                 addLabel(box, "Entry Price", PriceFormatter.formatPrice(entryPrice), white, true)
                 addLabel(box, "Margin", PriceFormatter.formatUsdt(entryMargin), white, true)
                 addLabel(box, "Cycle WAP", PriceFormatter.formatPrice(c.averageEntryPrice), white, true)
@@ -1117,13 +1133,26 @@ class MainActivity : AppCompatActivity() {
         addLabel(info, "Bot", if (paused) "PAUSED" else "Running", if (paused) yellow else green)
         addLabel(info, "Market data", "Binance public USDⓈ-M endpoints (read-only)", muted)
 
+        val mon = addCard(root, "BACKGROUND MONITORING (FOREGROUND SERVICE)")
+        mon.addView(Switch(this).apply {
+            text = "Keep monitoring when the screen is off or the app is closed"; isChecked = TradingControlStore.isMonitoringEnabled(this@MainActivity); setTextColor(white)
+            setOnCheckedChangeListener { _, on ->
+                if (on) com.ansardeo.bnb.paper.PaperMonitorService.start(this@MainActivity) else com.ansardeo.bnb.paper.PaperMonitorService.stop(this@MainActivity)
+                toast(if (on) "Monitoring service started" else "Monitoring service stopped")
+            }
+        })
+        mon.addView(text("While it runs a persistent notification is shown (with Pause/Resume and Stop). Android Force Stop, some manufacturers' battery savers or switching the phone off stop it; it cannot be guaranteed on every device. If monitoring stops, allow BNB to run unrestricted in battery settings.", 12f, muted))
+        addButton(mon, "BATTERY SETTINGS", inputBg).setOnClickListener {
+            runCatching { startActivity(Intent(android.provider.Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)) }
+        }
+
         val ctl = addCard(root, "SAFETY CONTROLS (LOCAL SIMULATION ONLY)")
         val result = text("", 12f, muted)
         fun livePrices(onReady: (Map<String, Double>?) -> Unit) {
             lifecycleScope.launch {
                 val ov = lastOverview ?: runCatching { marketRepo.getOverview().also { lastOverview = it } }.getOrNull()
                 if (ov == null || !ov.dataAvailable || ov.stale) { onReady(null); return@launch }
-                onReady(ov.symbols.mapNotNull { (k, t) -> (t.markPrice ?: t.lastPrice)?.takeIf { it.isFinite() && it > 0.0 }?.let { k.uppercase() to it } }.toMap())
+                onReady(ov.symbols.mapNotNull { (k, t) -> t.markPrice?.takeIf { it.isFinite() && it > 0.0 }?.let { k.uppercase() to it } }.toMap())
             }
         }
         addButton(ctl, if (paused) "RESUME BOT" else "PAUSE BOT", inputBg).setOnClickListener {

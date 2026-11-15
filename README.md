@@ -31,7 +31,7 @@ Bottom tabs: **Home, Trade, Positions, Settings, More** ("Trade" = the former Ma
 
 ## Code map (`app/src/main/java/com/ansardeo/bnb`)
 - `trading/TrailingStopMath.kt` – pure BigDecimal trailing logic (unit tested).
-- `paper/` – Room database, simulation engine, monitor, pause control.
+- `paper/` – Room database (v5), simulation engine, price monitor loop, `PaperMonitorService` (foreground service), pause control.
 - `data/` – leverage table, settings + resolver, stage model, public market repository.
 - `MainActivity.kt` – UI.
 
@@ -40,7 +40,7 @@ Open in Android Studio, or `gradle assembleDebug testDebugUnitTest`. GitHub Acti
 
 ## Known limitations / notes
 - This source was prepared without a Kotlin compiler available; **the first GitHub Actions run is the real verification** (compile + tests). Nothing here claims a successful build.
-- Room schema is v4. v3 → v4 is a **non-destructive migration** (adds three snapshot columns with safe defaults; open cycles that existed before keep their old behaviour and do not suddenly place new opposite-side orders). Only the legacy v1/v2 (fixed take-profit) schemas are cleared once.
+- Room schema is **v5**. The v3 → v4 and v4 → v5 migrations are **non-destructive** (new snapshot columns with safe defaults; open cycles that existed before keep their old behaviour; legacy per-entry SL orders are retired). Only the legacy v1/v2 (fixed take-profit) schemas are cleared once.
 - Opposite-side orders are conditional-at-price entries (they fill when the price level is reached), an interpretation of "prepare a LIMIT entry at the trigger ROI"; please confirm it matches your intent.
 - Money fields in Room entities are still `Double` (calculations of the trailing logic use BigDecimal).
 - Trailing exit is simulated at the observed mark price (polling), not tick-accurate.
@@ -52,3 +52,25 @@ Room DB version 5. Migrations 3→4 and 4→5 are non-destructive (new columns w
 
 ## Verification status
 The Kotlin code was written without a compiler or Gradle available in the authoring environment, so it has **not** been compiled or test-run there. The first GitHub Actions run (`assembleDebug` + unit tests) is the real verification; if a test fails, send the failing test names.
+
+## Background monitoring (foreground service)
+- `PaperMonitorService` is an Android foreground service (type *specialUse*) that owns the price-monitor loop. It is independent of MainActivity: turning the screen off, switching apps or closing/re-creating the Activity does not stop it. It uses the same Stage 1 virtual engine and public Binance market data only; there are no real orders, API keys or secrets.
+- A persistent notification is shown while it runs, with **Pause/Resume** (the same flag as *More → Pause bot*; paused = simulation frozen, service stays alive) and **Stop monitoring**. *More → Background monitoring* has a switch and a shortcut to the battery settings.
+- Start requests are idempotent (`MonitorLifecycle`): repeated starts never create a second loop. The service is `START_STICKY`, so Android may restart it after the process was killed.
+- Android 13+: the notification permission is requested on first launch. If it is denied the service still runs, but its notification is only visible in the system task manager.
+- **Limitations (not guaranteed):** Android *Force Stop*, the user turning monitoring off, a switched-off/offline phone, and aggressive battery managers of some manufacturers stop monitoring; there is no boot receiver, so monitoring resumes only after the app is opened again. If monitoring stops, allow BNB to run unrestricted in the battery settings. While monitoring is not running, nothing in the virtual account moves.
+
+## Mark Price vs Last Price
+- **Mark Price** (Binance `premiumIndex`, `markPrice`): liquidation, Position ROI / unrealized PNL, cycle Stop Loss, trailing stop, averaging / opposite-side triggers, re-entry plan triggers, panic close.
+- **Last Price** (`ticker/24hr` / `ticker/price`, `lastPrice`): pending LIMIT entry fills, price lists, distance to the 24h/7d high/low, the suggested entry price.
+- `Ticker.markPrice` is `null` when Binance did not deliver a Mark Price; it is never filled with the last price, and a missing price is never replaced by the other one (the affected calculation waits for the next tick).
+
+## Market statistics windows
+All windows are anchored to the Binance server time (`/fapi/v1/time`); an incomplete or stale window gives "--" instead of an inaccurate value.
+- 24h High/Low and 24h Volume / Change: Binance rolling 24-hour ticker.
+- 24h RSI: 24 consecutive **closed 1h** candles (25 closes, 24 changes), RSI period 24.
+- 7d RSI: 42 consecutive **closed 4h** candles (43 closes, 42 changes = 7 days), RSI period 42.
+- 7d High/Low: every **15m** candle opened within the last 7 days (the window start is covered to within one 15m candle).
+
+## Testing status
+Unit tests (plain JVM) cover the ROI maths, opposite-side trigger, statistics windows, Mark/Last mapping, settings, migrations SQL and the monitor start/stop logic. The Foreground Service itself, notifications, Room migrations on real data and the UI have **not** been runtime-tested on a device or emulator. A successful GitHub Actions build proves compilation and the unit tests only.

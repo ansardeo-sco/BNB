@@ -92,8 +92,8 @@ class CoinDetailActivity : AppCompatActivity() {
         val status = findViewById<TextView>(R.id.txtDetailStatus)
         val statsState = findViewById<TextView>(R.id.txtStatsState)
         val price = stats.livePrice
-        currentPrice = price
-        findViewById<TextView>(R.id.txtMarkPrice).text = PriceFormatter.formatPrice(price)
+        currentPrice = price // Binance LAST price (LIMIT entry suggestion)
+        findViewById<TextView>(R.id.txtMarkPrice).text = "Last ${PriceFormatter.formatPrice(price)}  |  Mark ${PriceFormatter.formatPrice(stats.markPrice)}"
 
         val ch = stats.change24hPercent
         val changeTv = findViewById<TextView>(R.id.txtChange)

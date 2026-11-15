@@ -23,15 +23,14 @@ class MarketRepository(
         val sym = symbol.uppercase()
         try {
             val t24 = getJson("https://fapi.binance.com/fapi/v1/ticker/24hr?symbol=$sym")
-            val pm = getJson("https://fapi.binance.com/fapi/v1/premiumIndex?symbol=$sym")
+            val pm = runCatching { getJson("https://fapi.binance.com/fapi/v1/premiumIndex?symbol=$sym") }.getOrNull()
             if (t24 == null) return@withContext null
-            val mark = pm?.optString("markPrice")?.toDoubleOrNull()
             return@withContext Ticker(
                 symbol = sym,
                 lastPrice = t24.optString("lastPrice").toDoubleOrNull(),
                 priceChangePercent = t24.optString("priceChangePercent").toDoubleOrNull(),
                 quoteVolume = t24.optString("quoteVolume").toDoubleOrNull(),
-                markPrice = mark ?: t24.optString("lastPrice").toDoubleOrNull(),
+                markPrice = parseMark(pm), // real Mark Price or null - never the last price
                 highPrice = t24.optString("highPrice").toDoubleOrNull(),
                 lowPrice = t24.optString("lowPrice").toDoubleOrNull(),
                 openPrice = t24.optString("openPrice").toDoubleOrNull(),
@@ -41,16 +40,42 @@ class MarketRepository(
         }
     }
 
+    /** Binance USDⓈ-M Mark Price (premiumIndex). Returns null when unavailable; there is NO fallback to the last price. */
     suspend fun getMarkPrice(symbol: String): Double? = withContext(Dispatchers.IO) {
-        val sym = symbol.uppercase()
+        try { parseMark(getJson("https://fapi.binance.com/fapi/v1/premiumIndex?symbol=${symbol.uppercase()}")) } catch (_: Exception) { null }
+    }
+
+    /** Binance USDⓈ-M Last Price (ticker/price). Returns null when unavailable. */
+    suspend fun getLastPrice(symbol: String): Double? = withContext(Dispatchers.IO) {
         try {
-            val pm = getJson("https://fapi.binance.com/fapi/v1/premiumIndex?symbol=$sym")
-            pm?.optString("markPrice")?.toDoubleOrNull()
-                ?: getJson("https://fapi.binance.com/fapi/v1/ticker/price?symbol=$sym")
-                    ?.optString("price")?.toDoubleOrNull()
-        } catch (_: Exception) {
-            null
+            getJson("https://fapi.binance.com/fapi/v1/ticker/price?symbol=${symbol.uppercase()}")?.optString("price")?.toDoubleOrNull()?.takeIf { it.isFinite() && it > 0.0 }
+        } catch (_: Exception) { null }
+    }
+
+    /** Both prices of one symbol, kept strictly separate. Either may be null. */
+    data class LivePrices(val mark: Double?, val last: Double?)
+
+    suspend fun getLivePrices(symbol: String): LivePrices = LivePrices(mark = getMarkPrice(symbol), last = getLastPrice(symbol))
+
+    /** All symbols' Mark Prices in one request (premiumIndex without symbol). */
+    suspend fun getAllMarkPrices(): Map<String, Double> = withContext(Dispatchers.IO) {
+        try {
+            val body = getText("https://fapi.binance.com/fapi/v1/premiumIndex") ?: return@withContext emptyMap()
+            parseMarkPriceArray(JSONArray(body))
+        } catch (_: Exception) { emptyMap() }
+    }
+
+    internal fun parseMark(pm: JSONObject?): Double? = pm?.optString("markPrice")?.toDoubleOrNull()?.takeIf { it.isFinite() && it > 0.0 }
+
+    internal fun parseMarkPriceArray(arr: JSONArray): Map<String, Double> {
+        val out = HashMap<String, Double>()
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            val sym = o.optString("symbol", "").uppercase()
+            val mark = parseMark(o)
+            if (sym.isNotBlank() && mark != null) out[sym] = mark
         }
+        return out
     }
 
     /** USDⓈ-M USDT perpetual symbols (public). */
@@ -73,31 +98,38 @@ class MarketRepository(
         }
     }
 
-    /** Actual 24h + 7d market statistics from Binance public data. RSI clearly identified by interval/method. */
+    /**
+     * Actual 24h + 7d market statistics from Binance public data. All windows are anchored to the Binance server time and are
+     * exact (see [MarketStatsMath]); a statistic whose window is incomplete is returned as null instead of an inaccurate value.
+     */
     suspend fun getMarketStats(symbol: String): MarketStats = withContext(Dispatchers.IO) {
         val sym = symbol.uppercase().trim()
         if (sym.isBlank()) return@withContext MarketStats(symbol = sym, livePrice = null, change24hPercent = null, volume24h = null, high24h = null, low24h = null, rsi24h = null, high7d = null, low7d = null, rsi7d = null, error = "No symbol selected")
         try {
             val t24 = getJson("https://fapi.binance.com/fapi/v1/ticker/24hr?symbol=$sym")
-            val pm = getJson("https://fapi.binance.com/fapi/v1/premiumIndex?symbol=$sym")
-            val live = pm?.optString("markPrice")?.toDoubleOrNull() ?: t24?.optString("lastPrice")?.toDoubleOrNull()
+            val pm = runCatching { getJson("https://fapi.binance.com/fapi/v1/premiumIndex?symbol=$sym") }.getOrNull()
+            val last = t24?.optString("lastPrice")?.toDoubleOrNull()
+            val mark = parseMark(pm)
             val change = t24?.optString("priceChangePercent")?.toDoubleOrNull()
             val vol = t24?.optString("quoteVolume")?.toDoubleOrNull()
-            val high24 = t24?.optString("highPrice")?.toDoubleOrNull()
-            val low24 = t24?.optString("lowPrice")?.toDoubleOrNull()
-            val klines1h = getKlines(sym, "1h", 40)
-            val klines4h = getKlines(sym, "4h", 60)
-            val closes1h = klines1h.mapNotNull { it.close }
-            val closes4h = klines4h.mapNotNull { it.close }
-            val rsi24 = calculateRsiWilder(closes1h, 14)
-            val rsi7d = calculateRsiWilder(closes4h, 14)
-            val high7d = klines4h.mapNotNull { it.high }.maxOrNull()
-            val low7d = klines4h.mapNotNull { it.low }.minOrNull()
-            val stale = live == null && t24 == null
+            val hi24 = t24?.optString("highPrice")?.toDoubleOrNull()
+            val lo24 = t24?.optString("lowPrice")?.toDoubleOrNull()
+            val valid24 = MarketStatsMath.validHighLow(hi24, lo24)
+            val now = runCatching { getJson("https://fapi.binance.com/fapi/v1/time")?.optLong("serverTime", 0L) }.getOrNull()?.takeIf { it > 0L }
+            var rsi24: Double? = null
+            var rsi7d: Double? = null
+            var hl7: MarketStatsMath.HighLow? = null
+            if (now != null) {
+                // 24h RSI: 24 closed 1h candles; 7d RSI: 42 closed 4h candles; 7d high/low: every 15m candle of the last 7 days.
+                rsi24 = runCatching { MarketStatsMath.windowRsi(getKlines(sym, "1h", 30), now, MarketStatsMath.HOUR_MS, MarketStatsMath.RSI24_INTERVALS) }.getOrNull()
+                rsi7d = runCatching { MarketStatsMath.windowRsi(getKlines(sym, "4h", 50), now, MarketStatsMath.HOURS_4_MS, MarketStatsMath.RSI7D_INTERVALS) }.getOrNull()
+                hl7 = runCatching { MarketStatsMath.highLow(getKlines(sym, "15m", 1000, startTime = now - MarketStatsMath.WEEK_MS), now, MarketStatsMath.WEEK_MS, MarketStatsMath.MIN_15_MS) }.getOrNull()
+            }
+            val stale = last == null && mark == null && t24 == null
             MarketStats(
-                symbol = sym, livePrice = live, change24hPercent = change, volume24h = vol,
-                high24h = high24, low24h = low24, rsi24h = rsi24,
-                high7d = high7d, low7d = low7d, rsi7d = rsi7d,
+                symbol = sym, livePrice = last, markPrice = mark, change24hPercent = change, volume24h = vol,
+                high24h = if (valid24) hi24 else null, low24h = if (valid24) lo24 else null, rsi24h = rsi24,
+                high7d = hl7?.high, low7d = hl7?.low, rsi7d = rsi7d,
                 isStale = stale, error = if (stale) "Market data unavailable" else null
             )
         } catch (e: Exception) {
@@ -105,16 +137,20 @@ class MarketRepository(
         }
     }
 
-    private data class Kline(val high: Double?, val low: Double?, val close: Double?)
-
-    private fun getKlines(symbol: String, interval: String, limit: Int): List<Kline> {
-        val text = getText("https://fapi.binance.com/fapi/v1/klines?symbol=$symbol&interval=$interval&limit=$limit") ?: return emptyList()
+    private fun getKlines(symbol: String, interval: String, limit: Int, startTime: Long? = null): List<Candle> {
+        val st = if (startTime != null) "&startTime=$startTime" else ""
+        val text = getText("https://fapi.binance.com/fapi/v1/klines?symbol=$symbol&interval=$interval&limit=$limit$st") ?: return emptyList()
         val arr = JSONArray(text)
-        val out = ArrayList<Kline>(arr.length())
+        val out = ArrayList<Candle>(arr.length())
         for (i in 0 until arr.length()) {
             val k = arr.optJSONArray(i) ?: continue
-            fun d(idx: Int) = k.optString(idx, "").toDoubleOrNull()
-            out.add(Kline(high = d(2), low = d(3), close = d(4)))
+            val open = k.optLong(0, -1L)
+            val close = k.optLong(6, -1L)
+            val h = k.optString(2, "").toDoubleOrNull()
+            val l = k.optString(3, "").toDoubleOrNull()
+            val c = k.optString(4, "").toDoubleOrNull()
+            if (open < 0 || close < 0 || h == null || l == null || c == null) continue
+            out.add(Candle(open, close, h, l, c))
         }
         return out
     }
@@ -147,7 +183,9 @@ class MarketRepository(
             val body = getText("https://fapi.binance.com/fapi/v1/ticker/24hr")
                 ?: return unavailable("Unable to load live prices")
             val arr = JSONArray(body)
-            parseBinanceArray(arr)
+            // Real Mark Prices come from premiumIndex. If that request fails the mark stays null (no last-price substitute).
+            val marks = runCatching { getText("https://fapi.binance.com/fapi/v1/premiumIndex")?.let { parseMarkPriceArray(JSONArray(it)) } }.getOrNull() ?: emptyMap()
+            parseBinanceArray(arr, marks)
         } catch (e: Exception) {
             unavailable(e.message)
         }
@@ -183,7 +221,7 @@ class MarketRepository(
         )
     }
 
-    private fun parseBinanceArray(arr: JSONArray): MarketOverview {
+    private fun parseBinanceArray(arr: JSONArray, marks: Map<String, Double> = emptyMap()): MarketOverview {
         val list = mutableListOf<Ticker>()
         val map = mutableMapOf<String, Ticker>()
         for (i in 0 until arr.length()) {
@@ -196,7 +234,7 @@ class MarketRepository(
                 lastPrice = last,
                 priceChangePercent = o.optString("priceChangePercent").toDoubleOrNull() ?: 0.0,
                 quoteVolume = o.optString("quoteVolume").toDoubleOrNull() ?: 0.0,
-                markPrice = last,
+                markPrice = marks[sym],
             )
             list.add(t)
             map[sym] = t
@@ -223,7 +261,7 @@ class MarketRepository(
             lastPrice = last,
             priceChangePercent = if (o.has("priceChangePercent")) o.optDouble("priceChangePercent").takeIf { !it.isNaN() } else null,
             quoteVolume = if (o.has("quoteVolume")) o.optDouble("quoteVolume").takeIf { !it.isNaN() } else null,
-            markPrice = if (o.has("markPrice")) o.optDouble("markPrice").takeIf { !it.isNaN() } else last,
+            markPrice = if (o.has("markPrice")) o.optDouble("markPrice").takeIf { !it.isNaN() } else null,
         )
     }
 

@@ -13,6 +13,7 @@ import com.ansardeo.bnb.trading.StrategyRules
 import com.ansardeo.bnb.data.TradingStage
 import com.ansardeo.bnb.paper.db.*
 import com.ansardeo.bnb.trading.TrailSide
+import com.ansardeo.bnb.trading.OppositeTrigger
 import com.ansardeo.bnb.trading.TrailingConfig
 import com.ansardeo.bnb.trading.TrailingState
 import com.ansardeo.bnb.trading.TrailingStopMath
@@ -236,9 +237,15 @@ class PaperEngine(private val db: PaperDatabase, val stage: TradingStage = Tradi
         return r.cycleId?.let { dao.getCycle(it) }
     }
 
-    suspend fun processAll(context: Context, prices: Map<String, Double>) {
+    /**
+     * [prices] are Binance MARK prices: used for liquidation, Position ROI, cycle Stop Loss, trailing stop, averaging / opposite-side
+     * triggers and re-entry plan triggers. [lastPrices] are Binance LAST prices: used ONLY to decide whether a pending LIMIT entry
+     * fills (an order fills when the market trades through it). If no last price is available for a symbol its pending entries
+     * simply wait for the next tick - the mark price is never substituted for it.
+     */
+    suspend fun processAll(context: Context, prices: Map<String, Double>, lastPrices: Map<String, Double> = emptyMap()) {
         assertSimulatedExecutionAllowed()
-        if (prices.isEmpty()) return
+        if (prices.isEmpty() && lastPrices.isEmpty()) return
         if (TradingControlStore.isPaused(context)) return // paused: the simulation is frozen (no fills, no exits)
         mutex.withLock {
             db.withTransaction {
@@ -246,8 +253,8 @@ class PaperEngine(private val db: PaperDatabase, val stage: TradingStage = Tradi
                 ensureWallet()
                 // Pending entry LIMIT orders (initial/averaging/opposite/reentry)
                 dao.getPendingEntries(stage.id).forEach { entry ->
-                    val mark = prices[entry.symbol.uppercase()] ?: return@forEach
-                    tryFillPendingEntryLocked(context, entry, mark, now)
+                    val last = lastPrices[entry.symbol.uppercase()] ?: return@forEach
+                    tryFillPendingEntryLocked(context, entry, last, now)
                 }
                 // Re-entry plans waiting for pullback
                 dao.getPendingReentryPlans(stage.id).forEach { plan ->
@@ -327,7 +334,8 @@ class PaperEngine(private val db: PaperDatabase, val stage: TradingStage = Tradi
         return EngineResult(true, "Initial LIMIT entry placed for $sym $dir @ ${fmtPx(intendedLimitPrice)}.", cycleId, entryId, orderId)
     }
 
-    private suspend fun tryFillPendingEntryLocked(context: Context, entry: PaperEntryEntity, mark: Double, now: Long) {
+    private suspend fun tryFillPendingEntryLocked(context: Context, entry: PaperEntryEntity, lastPrice: Double, now: Long) {
+        val mark = lastPrice // LIMIT fills are decided on the LAST (traded) price, see processAll
         if (entry.status != "PENDING" || !mark.isFinite() || mark <= 0.0) return
         val owner = dao.getCycle(entry.cycleId)
         if (owner == null || owner.status == "CLOSED") { cancelPendingEntryLocked(entry, now, "CYCLE_CLOSED"); return }
@@ -480,10 +488,8 @@ class PaperEngine(private val db: PaperDatabase, val stage: TradingStage = Tradi
         val wap = cycle.averageEntryPrice ?: return
         if (wap <= 0.0 || !mark.isFinite() || mark <= 0.0) return
         val oppositeDir = if (cycle.direction == "LONG") "SHORT" else "LONG"
-        val oppSide = TrailSide.fromDirection(oppositeDir)
-        val cfg = TrailingConfig(bd(kotlin.math.abs(cycle.oppositeTriggerRoi)), bd(cycle.oppositeCallbackRoi))
         val prev = TrailingState(cycle.oppositeTrailActive, cycle.oppositeTrailExtreme?.let { bd(it) }, cycle.oppositeTrailStop?.let { bd(it) })
-        val step = TrailingStopMath.step(oppSide, bd(wap), cycle.leverage, cfg, prev, bd(mark))
+        val step = OppositeTrigger.step(TrailSide.fromDirection(cycle.direction), bd(wap), cycle.leverage, bd(cycle.oppositeTriggerRoi), bd(cycle.oppositeCallbackRoi), prev, bd(mark))
         val newExtreme = step.state.extreme?.toDouble()
         val newStop = step.state.stopPrice?.toDouble()
         var live = cycle
@@ -757,7 +763,7 @@ class PaperEngine(private val db: PaperDatabase, val stage: TradingStage = Tradi
                 margin = cycle.initialMargin, referenceClosePrice = closePrice, triggerPrice = price, status = "WAITING",
                 clientPlanId = "re-${stage.id}-${cycle.id}-$dir", createdAt = now, updatedAt = now))
             dao.insertEvent(PaperEventEntity(stage = stage.id, cycleId = cycle.id, symbol = cycle.symbol, type = "REENTRY_WAITING",
-                message = "Re-entry $dir waiting @ ${fmtPx(price)} (Re-entry ROI ${roi.stripTrailingZeros().toPlainString()}% = Activation ROI/2, ${cycle.leverage}x, from close ${fmtPx(closePrice)}). Becomes a NEW cycle; the other side is cancelled when one fills.",
+                message = "Re-entry $dir waiting @ ${fmtPx(price)} (Re-entry ROI ${roi.stripTrailingZeros().toPlainString()}% = Activation ROI/2, ${cycle.leverage}x, from close ${fmtPx(closePrice)}). Becomes a NEW cycle when it fills. The LONG and SHORT re-entry orders are independent: a fill never cancels the other one, which stays pending until it fills or you cancel it manually.",
                 price = price, dedupeKey = "re-wait-${cycle.id}-$dir"))
         }
     }

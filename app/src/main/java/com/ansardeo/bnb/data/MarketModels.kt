@@ -5,6 +5,7 @@ data class Ticker(
     val lastPrice: Double?,
     val priceChangePercent: Double?,
     val quoteVolume: Double?,
+    /** Binance Mark Price (premiumIndex). null = not available. NEVER filled with the Last Price. */
     val markPrice: Double? = null,
     val highPrice: Double? = null,
     val lowPrice: Double? = null,
@@ -26,6 +27,7 @@ data class MarketOverview(
 
 data class MarketStats(
     val symbol: String,
+    /** Binance LAST price (used for the distance to the 24h/7d high/low, which are last-price based). */
     val livePrice: Double?,
     val change24hPercent: Double?,
     val volume24h: Double?,
@@ -35,8 +37,10 @@ data class MarketStats(
     val high7d: Double?,
     val low7d: Double?,
     val rsi7d: Double?,
-    val rsi24hInterval: String = "1h (RSI 14, Wilder)",
-    val rsi7dInterval: String = "4h (RSI 14, Wilder)",
+    /** Binance Mark Price (premiumIndex), separate from [livePrice]; null when unavailable. */
+    val markPrice: Double? = null,
+    val rsi24hInterval: String = "24h window: 24 closed 1h candles (RSI 24)",
+    val rsi7dInterval: String = "7d window: 42 closed 4h candles (RSI 42)",
     val isLoading: Boolean = false,
     val isStale: Boolean = false,
     val error: String? = null,

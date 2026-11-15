@@ -5,55 +5,54 @@ import com.ansardeo.bnb.data.MarketRepository
 import com.ansardeo.bnb.data.TradingStage
 import com.ansardeo.bnb.paper.db.PaperDatabase
 import kotlinx.coroutines.*
-import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * Background price monitor for BNB Stage 1 (Virtual).
- * Fetches live public Binance prices for symbols with active work and evaluates engine conditions.
- * NEVER submits real Binance orders (public read-only price data only).
+ * Price-monitor loop for BNB Stage 1 (Virtual). It is owned by [PaperMonitorService] (an Android foreground service), NOT by any
+ * Activity, so it keeps running with the screen off or the app in the background. It uses only public, read-only Binance data
+ * and NEVER submits real orders. [start] / [stop] are idempotent (see [MonitorLifecycle]).
+ *
+ * Prices: Mark Price (premiumIndex) drives liquidation, ROI, stop loss, trailing and triggers; Last Price drives LIMIT fills.
+ * A missing price is never replaced by the other one.
  */
 object PaperMonitor {
-    private val started = AtomicBoolean(false)
+    private val lifecycle = MonitorLifecycle()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private var job: Job? = null
+    @Volatile private var job: Job? = null
+
+    val isRunning: Boolean get() = lifecycle.isRunning
 
     fun start(context: Context) {
-        if (!started.compareAndSet(false, true)) return
+        if (!lifecycle.requestStart()) return // already running: never create a second loop
         val appCtx = context.applicationContext
         job = scope.launch {
             val repo = MarketRepository()
-            val db = PaperDatabase.get(appCtx)
-            val dao = db.dao()
+            val dao = PaperDatabase.get(appCtx).dao()
+            val engine = PaperEngineProvider.get(appCtx, TradingStage.STAGE_1)
+            val st = TradingStage.STAGE_1.id
             while (isActive) {
                 try {
-                    val engines = listOf(PaperEngineProvider.get(appCtx, TradingStage.STAGE_1))
+                    if (TradingControlStore.isPaused(appCtx)) { delay(10_000L); continue } // paused: simulation frozen, no network use
                     val workSymbols = mutableSetOf<String>()
-                    val st = TradingStage.STAGE_1.id
-                    runCatching { dao.getActiveCycles(st) }.getOrDefault(emptyList()).forEach { workSymbols += it.symbol }
-                    runCatching { dao.getPendingEntries(st) }.getOrDefault(emptyList()).forEach { workSymbols += it.symbol }
-                    runCatching { dao.getPendingReentryPlans(st) }.getOrDefault(emptyList()).forEach { workSymbols += it.symbol }
-                    val hasWork = workSymbols.isNotEmpty() || engines.any { runCatching { it.hasPendingWork() }.getOrDefault(false) }
+                    runCatching { dao.getActiveCycles(st) }.getOrDefault(emptyList()).forEach { workSymbols += it.symbol.uppercase() }
+                    runCatching { dao.getPendingEntries(st) }.getOrDefault(emptyList()).forEach { workSymbols += it.symbol.uppercase() }
+                    runCatching { dao.getPendingReentryPlans(st) }.getOrDefault(emptyList()).forEach { workSymbols += it.symbol.uppercase() }
+                    val hasWork = workSymbols.isNotEmpty() || runCatching { engine.hasPendingWork() }.getOrDefault(false)
                     if (hasWork) {
-                        val prices = mutableMapOf<String, Double>()
-                        // Overview prices (bulk)
+                        val marks = mutableMapOf<String, Double>()
+                        val lasts = mutableMapOf<String, Double>()
                         runCatching { repo.getOverview() }.getOrNull()?.symbols?.forEach { (k, v) ->
-                            val px = v.markPrice ?: v.lastPrice
-                            if (px != null && px.isFinite() && px > 0.0) prices[k] = px
+                            v.markPrice?.takeIf { it.isFinite() && it > 0.0 }?.let { marks[k.uppercase()] = it }
+                            v.lastPrice?.takeIf { it.isFinite() && it > 0.0 }?.let { lasts[k.uppercase()] = it }
                         }
-                        // Ensure all work symbols have a price
                         for (sym in workSymbols) {
-                            if (prices[sym] == null) {
-                                val px = runCatching { repo.getMarkPrice(sym) }.getOrNull()
-                                if (px != null && px.isFinite() && px > 0.0) prices[sym] = px
-                            }
+                            if (marks[sym] == null) runCatching { repo.getMarkPrice(sym) }.getOrNull()?.takeIf { it.isFinite() && it > 0.0 }?.let { marks[sym] = it }
+                            if (lasts[sym] == null) runCatching { repo.getLastPrice(sym) }.getOrNull()?.let { lasts[sym] = it }
                         }
-                        if (prices.isNotEmpty()) {
-                            engines.forEach { e -> runCatching { e.processAll(appCtx, prices) } }
-                        }
+                        if (marks.isNotEmpty() || lasts.isNotEmpty()) runCatching { engine.processAll(appCtx, marks, lasts) }
                     }
                     delay(if (hasWork) 10_000L else 30_000L)
-                } catch (_: CancellationException) {
-                    throw CancellationException()
+                } catch (e: CancellationException) {
+                    throw e
                 } catch (_: Exception) {
                     delay(15_000L)
                 }
@@ -62,8 +61,8 @@ object PaperMonitor {
     }
 
     fun stop() {
+        if (!lifecycle.requestStop()) return
         job?.cancel()
         job = null
-        started.set(false)
     }
 }
