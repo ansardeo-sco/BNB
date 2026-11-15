@@ -1,6 +1,7 @@
 package com.ansardeo.bnb.data
 
 import android.content.Context
+import com.ansardeo.bnb.trading.RoiMath
 import org.json.JSONObject
 
 /** Where an effective setting value comes from (shown next to every setting in the Dashboard). */
@@ -15,44 +16,46 @@ enum class SettingSource(val label: String) {
 
 /** Stable keys for every overridable setting. */
 object SettingKeys {
-    const val ENABLED_LONG = "enabledLong"
-    const val ENABLED_SHORT = "enabledShort"
     const val MARGIN = "marginAmount"
     const val LEVERAGE = "leverage"
     const val OPPOSITE_ENABLED = "oppositeEnabled"
     const val OPPOSITE_MARGIN = "oppositeMargin"
     const val AVERAGING_ENABLED = "averagingEnabled"
     const val AVERAGING_MARGIN = "averagingMargin"
+    const val AVERAGING_TRIGGER_ROI = "averagingTriggerRoi"
+    const val OPPOSITE_TRIGGER_ROI = "oppositeTriggerRoi"
     const val REENTRY_ENABLED = "reentryEnabled"
     const val TRAILING_ENABLED = "trailingEnabled"
     const val TRAILING_ACTIVATION_ROI = "trailingActivationRoi"
     const val TRAILING_CALLBACK_ROI = "trailingCallbackRoi"
 
     val ALL = listOf(
-        ENABLED_LONG, ENABLED_SHORT, MARGIN, LEVERAGE,
+        MARGIN, LEVERAGE,
         TRAILING_ENABLED, TRAILING_ACTIVATION_ROI, TRAILING_CALLBACK_ROI,
-        AVERAGING_ENABLED, AVERAGING_MARGIN, REENTRY_ENABLED, OPPOSITE_ENABLED, OPPOSITE_MARGIN,
+        AVERAGING_ENABLED, AVERAGING_MARGIN, AVERAGING_TRIGGER_ROI, REENTRY_ENABLED, OPPOSITE_ENABLED, OPPOSITE_MARGIN, OPPOSITE_TRIGGER_ROI,
     )
 }
 
 /**
  * BNB settings (global defaults, or the effective values for one symbol).
  *
- * Only these values are user-editable. Re-entry pullback, averaging trigger and entry Stop Loss
- * percentages are derived from [leverage] via [LeverageConfig] and are NOT user-editable.
+ * Only these values are user-editable. The entry Stop Loss percentage is derived from [leverage] via
+ * [LeverageConfig] and is NOT user-editable. Re-entry ROI is derived automatically as Activation ROI / 2.
+ * LONG and SHORT are ALWAYS permitted: direction is not a setting.
+ * Averaging and Opposite-Side are independent features, each with its own enable, margin and negative Position ROI trigger.
  * There is no Take Profit setting: the profit exit is the ROI Trailing Stop
  * (activation ROI default 33, callback ROI default 3; ROI percentages, not price percentages).
  */
 data class LocalCoinSettings(
     val symbol: String,
-    val enabledLong: Boolean = true,
-    val enabledShort: Boolean = true,
     val marginAmount: Double = 2.0,
     val leverage: Int = 6,
     val oppositeEnabled: Boolean = true,
     val oppositeMargin: Double = 2.0,
     val averagingEnabled: Boolean = true,
     val averagingMargin: Double = 2.0,
+    val averagingTriggerRoi: Double = DEFAULT_AVERAGING_TRIGGER_ROI,
+    val oppositeTriggerRoi: Double = DEFAULT_OPPOSITE_TRIGGER_ROI,
     val reentryEnabled: Boolean = true,
     val trailingEnabled: Boolean = true,
     val trailingActivationRoi: Double = DEFAULT_ACTIVATION_ROI,
@@ -65,27 +68,31 @@ data class LocalCoinSettings(
         require(oppositeMargin > 0.0) { "Opposite margin must be positive" }
         require(trailingActivationRoi.isFinite() && trailingActivationRoi > 0.0) { "Trailing activation ROI must be greater than 0" }
         require(trailingCallbackRoi.isFinite() && trailingCallbackRoi > 0.0) { "Trailing callback ROI must be greater than 0" }
+        require(RoiMath.isValidLossTrigger(averagingTriggerRoi)) { "Averaging Trigger ROI must be between -69% and 0% (the entry Stop Loss is at -69%)" }
+        require(RoiMath.isValidLossTrigger(oppositeTriggerRoi)) { "Opposite-Side Trigger ROI must be between -69% and 0% (the entry Stop Loss is at -69%)" }
     }
 
     val profile: LeverageProfile get() = LeverageConfig.requireProfile(leverage)
     val slPercent: Double get() = profile.slPercent
-    val averagingPercent: Double get() = profile.averagingPercent
-    val reentryPercent: Double get() = profile.reentryPullbackPercent
+    /** Re-entry ROI is calculated automatically: Trailing Activation ROI / 2. */
+    val reentryRoi: Double get() = trailingActivationRoi / 2.0
 
     companion object {
         const val DEFAULT_ACTIVATION_ROI = 33.0
         const val DEFAULT_CALLBACK_ROI = 3.0
+        const val DEFAULT_AVERAGING_TRIGGER_ROI = -60.0
+        const val DEFAULT_OPPOSITE_TRIGGER_ROI = -50.0
 
         fun sanitized(
             symbol: String,
-            enabledLong: Boolean = true,
-            enabledShort: Boolean = true,
             marginAmount: Double = 2.0,
             leverage: Int = 6,
             oppositeEnabled: Boolean = true,
             oppositeMargin: Double = 2.0,
             averagingEnabled: Boolean = true,
             averagingMargin: Double = 2.0,
+            averagingTriggerRoi: Double = DEFAULT_AVERAGING_TRIGGER_ROI,
+            oppositeTriggerRoi: Double = DEFAULT_OPPOSITE_TRIGGER_ROI,
             reentryEnabled: Boolean = true,
             trailingEnabled: Boolean = true,
             trailingActivationRoi: Double = DEFAULT_ACTIVATION_ROI,
@@ -95,14 +102,14 @@ data class LocalCoinSettings(
             fun pos(v: Double, d: Double) = if (v.isFinite() && v > 0.0) v else d
             return LocalCoinSettings(
                 symbol = symbol.uppercase(),
-                enabledLong = enabledLong,
-                enabledShort = enabledShort,
                 marginAmount = pos(marginAmount, 2.0),
                 leverage = lev,
                 oppositeEnabled = oppositeEnabled,
                 oppositeMargin = pos(oppositeMargin, 2.0),
                 averagingEnabled = averagingEnabled,
                 averagingMargin = pos(averagingMargin, 2.0),
+                averagingTriggerRoi = RoiMath.normalizeLossTrigger(averagingTriggerRoi).takeIf { RoiMath.isValidLossTrigger(it) } ?: DEFAULT_AVERAGING_TRIGGER_ROI,
+                oppositeTriggerRoi = RoiMath.normalizeLossTrigger(oppositeTriggerRoi).takeIf { RoiMath.isValidLossTrigger(it) } ?: DEFAULT_OPPOSITE_TRIGGER_ROI,
                 reentryEnabled = reentryEnabled,
                 trailingEnabled = trailingEnabled,
                 trailingActivationRoi = pos(trailingActivationRoi, DEFAULT_ACTIVATION_ROI),
@@ -123,14 +130,36 @@ object SettingsResolver {
         fun i(key: String, base: Int) = (overrides[key] as? Number)?.toInt() ?: base
         return LocalCoinSettings.sanitized(
             symbol = symbol,
-            enabledLong = b(SettingKeys.ENABLED_LONG, global.enabledLong),
-            enabledShort = b(SettingKeys.ENABLED_SHORT, global.enabledShort),
             marginAmount = n(SettingKeys.MARGIN, global.marginAmount),
             leverage = i(SettingKeys.LEVERAGE, global.leverage),
             oppositeEnabled = b(SettingKeys.OPPOSITE_ENABLED, global.oppositeEnabled),
             oppositeMargin = n(SettingKeys.OPPOSITE_MARGIN, global.oppositeMargin),
             averagingEnabled = b(SettingKeys.AVERAGING_ENABLED, global.averagingEnabled),
             averagingMargin = n(SettingKeys.AVERAGING_MARGIN, global.averagingMargin),
+            averagingTriggerRoi = n(SettingKeys.AVERAGING_TRIGGER_ROI, global.averagingTriggerRoi),
+            oppositeTriggerRoi = n(SettingKeys.OPPOSITE_TRIGGER_ROI, global.oppositeTriggerRoi),
+            reentryEnabled = b(SettingKeys.REENTRY_ENABLED, global.reentryEnabled),
+            trailingEnabled = b(SettingKeys.TRAILING_ENABLED, global.trailingEnabled),
+            trailingActivationRoi = n(SettingKeys.TRAILING_ACTIVATION_ROI, global.trailingActivationRoi),
+            trailingCallbackRoi = n(SettingKeys.TRAILING_CALLBACK_ROI, global.trailingCallbackRoi),
+        )
+    }
+
+    /** Same merge as [resolve] but STRICT: invalid values throw IllegalArgumentException instead of being silently corrected. */
+    fun resolveStrict(symbol: String, global: LocalCoinSettings, overrides: Map<String, Any>): LocalCoinSettings {
+        fun b(key: String, base: Boolean) = (overrides[key] as? Boolean) ?: base
+        fun n(key: String, base: Double) = (overrides[key] as? Number)?.toDouble() ?: base
+        fun i(key: String, base: Int) = (overrides[key] as? Number)?.toInt() ?: base
+        return LocalCoinSettings(
+            symbol = symbol.uppercase(),
+            marginAmount = n(SettingKeys.MARGIN, global.marginAmount),
+            leverage = i(SettingKeys.LEVERAGE, global.leverage),
+            oppositeEnabled = b(SettingKeys.OPPOSITE_ENABLED, global.oppositeEnabled),
+            oppositeMargin = n(SettingKeys.OPPOSITE_MARGIN, global.oppositeMargin),
+            averagingEnabled = b(SettingKeys.AVERAGING_ENABLED, global.averagingEnabled),
+            averagingMargin = n(SettingKeys.AVERAGING_MARGIN, global.averagingMargin),
+            averagingTriggerRoi = n(SettingKeys.AVERAGING_TRIGGER_ROI, global.averagingTriggerRoi),
+            oppositeTriggerRoi = n(SettingKeys.OPPOSITE_TRIGGER_ROI, global.oppositeTriggerRoi),
             reentryEnabled = b(SettingKeys.REENTRY_ENABLED, global.reentryEnabled),
             trailingEnabled = b(SettingKeys.TRAILING_ENABLED, global.trailingEnabled),
             trailingActivationRoi = n(SettingKeys.TRAILING_ACTIVATION_ROI, global.trailingActivationRoi),
@@ -191,14 +220,14 @@ object LocalCoinSettingsStore {
     fun saveGlobal(context: Context, settings: LocalCoinSettings) {
         LeverageConfig.requireSupported(settings.leverage)
         val m = mapOf<String, Any>(
-            SettingKeys.ENABLED_LONG to settings.enabledLong,
-            SettingKeys.ENABLED_SHORT to settings.enabledShort,
             SettingKeys.MARGIN to settings.marginAmount,
             SettingKeys.LEVERAGE to settings.leverage,
             SettingKeys.OPPOSITE_ENABLED to settings.oppositeEnabled,
             SettingKeys.OPPOSITE_MARGIN to settings.oppositeMargin,
             SettingKeys.AVERAGING_ENABLED to settings.averagingEnabled,
             SettingKeys.AVERAGING_MARGIN to settings.averagingMargin,
+            SettingKeys.AVERAGING_TRIGGER_ROI to settings.averagingTriggerRoi,
+            SettingKeys.OPPOSITE_TRIGGER_ROI to settings.oppositeTriggerRoi,
             SettingKeys.REENTRY_ENABLED to settings.reentryEnabled,
             SettingKeys.TRAILING_ENABLED to settings.trailingEnabled,
             SettingKeys.TRAILING_ACTIVATION_ROI to settings.trailingActivationRoi,
@@ -207,20 +236,52 @@ object LocalCoinSettingsStore {
         prefs(context).edit().putString(GLOBAL_KEY, mapToJson(m).toString()).apply()
     }
 
-    /** Overrides ONE setting for a symbol. The value is validated by resolving the effective settings first. */
-    fun setOverride(context: Context, symbol: String, key: String, value: Any) {
+    private const val CUSTOM_MARKER = "__custom"
+    private const val OVERRIDE_PREFIX = "override_"
+
+    /**
+     * Symbol-level WRITES are `internal` on purpose: the UI must go through [com.ansardeo.bnb.paper.PaperEngine]
+     * (updateSymbolSettings / deleteSymbolSettings), which refuses the change while the symbol has an open
+     * position or order. Existing cycles keep their own snapshot, so no write here ever alters a running cycle.
+     */
+    internal fun setOverride(context: Context, symbol: String, key: String, value: Any) {
         val sym = symbol.uppercase()
         require(sym != GLOBAL_SYMBOL) { "Use saveGlobal for global defaults" }
         require(key in SettingKeys.ALL) { "Unknown setting '$key'" }
         val next = HashMap(overridesFor(context, sym)); next[key] = value
-        SettingsResolver.resolve(sym, loadGlobal(context), next) // throws if invalid (e.g. non-positive ROI)
-        prefs(context).edit().putString("override_$sym", mapToJson(next).toString()).apply()
+        SettingsResolver.resolve(sym, loadGlobal(context), next) // sanitised resolve never throws; strict validation is done by the caller
+        prefs(context).edit().putString(OVERRIDE_PREFIX + sym, mapToJson(next).toString()).apply()
+    }
+
+    /** Marks the symbol as having saved custom settings (so it appears in Saved Coin Settings) and stores [changes]. */
+    internal fun saveSymbol(context: Context, symbol: String, changes: Map<String, Any>) {
+        val sym = symbol.uppercase()
+        require(sym != GLOBAL_SYMBOL) { "Use saveGlobal for global defaults" }
+        changes.keys.forEach { require(it in SettingKeys.ALL) { "Unknown setting '$it'" } }
+        val next = HashMap(overridesFor(context, sym)); next.putAll(changes); next[CUSTOM_MARKER] = true
+        prefs(context).edit().putString(OVERRIDE_PREFIX + sym, mapToJson(next).toString()).apply()
     }
 
     /** Removes one symbol override so the symbol inherits the global value again. */
-    fun clearOverride(context: Context, symbol: String, key: String) {
+    internal fun clearOverride(context: Context, symbol: String, key: String) {
         val sym = symbol.uppercase()
         val next = HashMap(overridesFor(context, sym)); next.remove(key)
-        prefs(context).edit().putString("override_$sym", mapToJson(next).toString()).apply()
+        prefs(context).edit().putString(OVERRIDE_PREFIX + sym, mapToJson(next).toString()).apply()
     }
+
+    /** Deletes the symbol's whole custom configuration: the symbol inherits Global Settings again. */
+    internal fun deleteSymbol(context: Context, symbol: String) {
+        prefs(context).edit().remove(OVERRIDE_PREFIX + symbol.uppercase()).apply()
+    }
+
+    fun hasCustomSettings(context: Context, symbol: String): Boolean = isCustom(overridesFor(context, symbol))
+
+    /** Symbols that have saved custom settings (never the Global Settings), sorted. */
+    fun customSymbols(context: Context): List<String> =
+        prefs(context).all.keys.filter { it.startsWith(OVERRIDE_PREFIX) }
+            .map { it.removePrefix(OVERRIDE_PREFIX) }
+            .filter { isCustom(overridesFor(context, it)) }
+            .sorted()
+
+    private fun isCustom(m: Map<String, Any>): Boolean = m[CUSTOM_MARKER] == true || m.keys.any { it in SettingKeys.ALL }
 }

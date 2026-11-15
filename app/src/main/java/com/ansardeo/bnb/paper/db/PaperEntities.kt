@@ -36,8 +36,10 @@ data class PaperCycleEntity(
     val averagingMargin: Double,
     val oppositeMargin: Double = 0.0,
     val slPercent: Double,
-    val averagingPercent: Double,
-    val reentryPercent: Double,
+    /** LEGACY (pre-v4 price-percent snapshots). Unused since v4; kept so the table needs no rebuild. */
+    val averagingPercent: Double = 0.0,
+    /** LEGACY (pre-v4). Unused since v4; see [reentryRoi]. */
+    val reentryPercent: Double = 0.0,
     val averagingEnabled: Boolean,
     val reentryEnabled: Boolean,
     val oppositeEnabled: Boolean = false,
@@ -48,6 +50,13 @@ data class PaperCycleEntity(
     val trailingEnabled: Boolean = true,
     val activationRoi: Double = 33.0,
     val callbackRoi: Double = 3.0,
+    // v4 snapshot (captured when the cycle is created, never changed afterwards):
+    /** Negative Position ROI at which the (single) averaging LIMIT is priced. */
+    val averagingTriggerRoi: Double = -60.0,
+    /** Negative Position ROI at which the independent opposite-side LIMIT is priced. */
+    val oppositeTriggerRoi: Double = -50.0,
+    /** Re-entry ROI = activationRoi / 2, fixed at snapshot time. */
+    val reentryRoi: Double = 16.5,
     // Persisted trailing state (survives app restart).
     val activationPrice: Double? = null,
     val trailingActive: Boolean = false,
@@ -64,7 +73,7 @@ data class PaperCycleEntity(
     val updatedAt: Long = System.currentTimeMillis(),
     val closedAt: Long? = null,
     val sourceCycleId: Long? = null,
-    val sourceType: String? = null, // MANUAL, AVERAGING_OPPOSITE, REENTRY
+    val sourceType: String? = null, // MANUAL, OPPOSITE, REENTRY
     val lastProcessedMark: Double? = null,
     val lastError: String? = null,
 )

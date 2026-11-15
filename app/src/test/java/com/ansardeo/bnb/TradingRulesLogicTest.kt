@@ -67,17 +67,12 @@ class TradingRulesLogicTest {
         assertEquals("+10.00%", com.ansardeo.bnb.util.PriceFormatter.formatPercent(roi))
     }
 
-    @Test fun averagingLimitPriceIsCalculatedFromInitialFillUsingLeverageFormula() {
-        val p = LeverageConfig.requireProfile(10) // Averaging 6.60%
-        val initialFill = 100.0
-        val longAvgPrice = initialFill * (1.0 - p.averagingPercent / 100.0)
-        val shortAvgPrice = initialFill * (1.0 + p.averagingPercent / 100.0)
-        assertEquals(93.4, longAvgPrice, 1e-9)
-        assertEquals(106.6, shortAvgPrice, 1e-9)
-        // Averaging must be allowed only once per cycle (guarded by pending/filled checks + averagingDone).
-        val averagingDone = false
-        val hasPendingOrFilled = false
-        assertTrue(!averagingDone && !hasPendingOrFilled)
+    @Test fun averagingLimitPriceUsesConfiguredPositionRoi() {
+        // -60% Position ROI at 10x on WAP 100 -> 6% price move: LONG averaging 94, SHORT averaging 106
+        val l = com.ansardeo.bnb.trading.RoiMath.priceAtRoi(com.ansardeo.bnb.trading.TrailSide.LONG, java.math.BigDecimal("100"), 10, java.math.BigDecimal("-60"))
+        val s = com.ansardeo.bnb.trading.RoiMath.priceAtRoi(com.ansardeo.bnb.trading.TrailSide.SHORT, java.math.BigDecimal("100"), 10, java.math.BigDecimal("-60"))
+        assertEquals(0, java.math.BigDecimal("94").compareTo(l))
+        assertEquals(0, java.math.BigDecimal("106").compareTo(s))
     }
 
     @Test fun pendingInitialLimitNotPositionAndFilledBecomesOpenPosition_semantics() {

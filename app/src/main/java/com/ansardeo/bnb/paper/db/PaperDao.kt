@@ -131,4 +131,16 @@ interface PaperDao {
 
     @Query("SELECT COUNT(*) FROM trading_cycles WHERE stage = :stage AND symbol = :symbol AND status IN ('PENDING_ENTRY','ACTIVE','CLOSING')")
     suspend fun countOpenCyclesAnyDirection(stage: String, symbol: String): Int
+
+    @Query("SELECT * FROM reentry_plans WHERE sourceCycleId = :sourceCycleId")
+    suspend fun getReentryPlansForSource(sourceCycleId: Long): List<PaperReentryPlanEntity>
+
+    @Query("SELECT COUNT(*) FROM trading_orders WHERE stage = :stage AND symbol = :symbol AND status IN ('ACTIVE','CANCELLING')")
+    suspend fun countLiveOrdersForSymbol(stage: String, symbol: String): Int
+
+    @Query("SELECT COUNT(*) FROM trading_entries WHERE stage = :stage AND symbol = :symbol AND status = 'PENDING'")
+    suspend fun countPendingEntriesForSymbol(stage: String, symbol: String): Int
+
+    @Query("SELECT COUNT(*) FROM reentry_plans WHERE stage = :stage AND symbol = :symbol AND status IN ('WAITING','TRIGGERED','ORDER_PLACED')")
+    suspend fun countOpenReentryPlansForSymbol(stage: String, symbol: String): Int
 }
