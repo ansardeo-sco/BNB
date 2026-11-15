@@ -9,14 +9,14 @@ BNB is an Android app that simulates a USDⓈ-M Futures strategy on a **virtual 
   - LONG: activation `W·(1 + A/(100·L))`, stop `H·(1 − C/(100·L))`
   - SHORT: activation `W·(1 − A/(100·L))`, stop `Lo·(1 + C/(100·L))`
   - Stop is monotonic (LONG never falls, SHORT never rises); closing exits **all** remaining quantity of the cycle.
-- Each executed entry has its own fixed **Stop Loss** from its own fill price that closes only that entry.
+- **One Stop Loss per whole cycle** (Dashboard section *Stop Loss*: Enable + Stop Loss ROI, default **80** = −80% Position ROI, leverage included, measured on the cycle WAP). When hit, all remaining quantity is closed, the cycle's pending orders are cancelled and the close is recorded in History (reason `SL`). Disabled = no Stop Loss at all. There is no per-entry Stop Loss. Each cycle is independent.
 - All entries are **LIMIT**. One cycle per symbol + direction; LONG and SHORT are independent.
 - **Position ROI** is the single measure used everywhere (trailing, re-entry, averaging, opposite-side): `ROI = ±(P − W)/W · L · 100`, i.e. leverage included; never raw price % and never account equity (`trading/RoiMath.kt`).
 - **Averaging** (D): one LIMIT per cycle at the price where Position ROI = *Averaging Trigger ROI* (default **−60**). WAP and trailing activation are recalculated from the new WAP (an already-active trail is kept, never loosened).
-- **Opposite-Side** (E): independent of averaging (own enable, margin and *Trigger ROI*, default **−50**). A separate cycle in the other direction is prepared at the price where the original position reaches that ROI; only if no opposite-direction cycle is open. It fills when that price level is reached (conditional LIMIT). It has its own margin, SL, trailing stop and snapshot.
-- **Re-entry** (C): after a trailing-stop exit, **Re-entry ROI = Activation ROI / 2** (automatic). A LONG LIMIT below and a SHORT LIMIT above the closing price, each at that Position-ROI distance (leverage included). When one fills (new cycle) the other is cancelled automatically.
-- Trigger ROI inputs are stored negative (30 and −30 both become −30) and must lie between −69 and 0 (the entry SL sits at −69% ROI).
-- Only the entry Stop Loss comes from the leverage table (3x–20x): SL = 69/L price %.
+- **Opposite-Side** (E): controlled only by its own Enable toggle, with its own margin, *Trigger ROI* (default **−50**) and *Callback ROI* (default **5**). When the position's ROI reaches the trigger it activates, then trails the adverse extreme; when price reverses by the callback ROI, an opposite-direction LIMIT entry is placed as a separate cycle (own margin, leverage, Stop Loss, trailing, snapshot). Only if no opposite-direction cycle is open; hedge-born cycles do not spawn further opposite cycles.
+- **Re-entry** (C): after a trailing-stop exit, **Re-entry ROI = Activation ROI / 2** (automatic). A LONG LIMIT below and a SHORT LIMIT above the closing price, each at that Position-ROI distance (leverage included). The two orders are **independent**: a fill starts a new cycle (new ID) and does **not** cancel the other order, which stays pending until it fills or you cancel it manually (Open Orders → Cancel). One active cycle per symbol+direction still applies.
+- Trigger ROI inputs are stored negative (30 and −30 both become −30) and must lie between −(Stop Loss ROI) and 0 (up to −93 when the Stop Loss is disabled).
+- Leverage is limited to 3x–20x. No percentage is derived from a leverage table any more.
 - LONG and SHORT are **always** permitted; direction is not a setting.
 - Settings are snapshotted when a cycle is created; later changes never alter running cycles.
 
@@ -45,3 +45,10 @@ Open in Android Studio, or `gradle assembleDebug testDebugUnitTest`. GitHub Acti
 - Money fields in Room entities are still `Double` (calculations of the trailing logic use BigDecimal).
 - Trailing exit is simulated at the observed mark price (polling), not tick-accurate.
 - No instrumented/UI tests yet.
+
+
+## Database / migration
+Room DB version 5. Migrations 3→4 and 4→5 are non-destructive (new columns with defaults; legacy per-entry SL orders are retired; open cycles keep their old behaviour). Only versions 1–2 fall back to a destructive rebuild.
+
+## Verification status
+The Kotlin code was written without a compiler or Gradle available in the authoring environment, so it has **not** been compiled or test-run there. The first GitHub Actions run (`assembleDebug` + unit tests) is the real verification; if a test fails, send the failing test names.

@@ -69,14 +69,14 @@ interface PaperDao {
     @Query("SELECT * FROM trading_orders WHERE id = :id LIMIT 1")
     suspend fun getOrder(id: Long): PaperOrderEntity?
 
-    @Query("SELECT * FROM trading_orders WHERE cycleId = :cycleId AND entryId = :entryId AND orderType = 'ENTRY_SL' AND status IN ('ACTIVE','CANCELLING') LIMIT 1")
-    suspend fun getActiveSlForEntry(cycleId: Long, entryId: Long): PaperOrderEntity?
-
     @Query("SELECT * FROM trading_orders WHERE cycleId = :cycleId AND orderType = 'CYCLE_TRAILING' AND status IN ('ACTIVE','CANCELLING') LIMIT 1")
     suspend fun getActiveTrailingForCycle(cycleId: Long): PaperOrderEntity?
 
-    @Query("SELECT * FROM trading_orders WHERE cycleId = :cycleId AND orderType = 'ENTRY_SL' AND status IN ('ACTIVE','CANCELLING')")
-    suspend fun getActiveSlOrdersForCycle(cycleId: Long): List<PaperOrderEntity>
+    @Query("SELECT * FROM trading_orders WHERE cycleId = :cycleId AND orderType = 'CYCLE_SL' AND status IN ('ACTIVE','CANCELLING') LIMIT 1")
+    suspend fun getActiveStopLossForCycle(cycleId: Long): PaperOrderEntity?
+
+    @Query("SELECT * FROM trading_orders WHERE cycleId = :cycleId AND orderType = 'OPPOSITE_TRAIL' AND status IN ('ACTIVE','CANCELLING') LIMIT 1")
+    suspend fun getActiveOppositeTrailForCycle(cycleId: Long): PaperOrderEntity?
 
     @Insert(onConflict = OnConflictStrategy.ABORT)
     suspend fun insertOrder(order: PaperOrderEntity): Long
@@ -86,15 +86,6 @@ interface PaperDao {
 
     @Update
     suspend fun updateOrder(order: PaperOrderEntity)
-
-    @Query("UPDATE trading_orders SET status = :status, updatedAt = :updatedAt, cancelRequestedAt = COALESCE(cancelRequestedAt, :updatedAt) WHERE cycleId = :cycleId AND orderType = 'ENTRY_SL' AND status IN ('ACTIVE','CANCELLING')")
-    suspend fun requestCancelAllSlForCycle(cycleId: Long, status: String, updatedAt: Long)
-
-    @Query("UPDATE trading_orders SET status = 'CANCEL_VERIFIED', cancelVerifiedAt = :now, updatedAt = :now, lastError = NULL WHERE cycleId = :cycleId AND orderType = 'ENTRY_SL' AND status IN ('ACTIVE','CANCELLING','CANCELLED')")
-    suspend fun verifyCancelAllSlForCycle(cycleId: Long, now: Long)
-
-    @Query("SELECT COUNT(*) FROM trading_orders WHERE cycleId = :cycleId AND orderType = 'ENTRY_SL' AND status IN ('ACTIVE','CANCELLING')")
-    suspend fun countUnverifiedActiveSlForCycle(cycleId: Long): Int
 
     @Insert(onConflict = OnConflictStrategy.IGNORE)
     suspend fun insertHistoryClose(history: PaperHistoryCloseEntity): Long

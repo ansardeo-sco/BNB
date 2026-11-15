@@ -433,12 +433,11 @@ class MainActivity : AppCompatActivity() {
             val sym = selectedSym().ifBlank { "--" }
             val margin = marginInput.text.toString().toDoubleOrNull() ?: 0.0
             val lev = try { LeverageConfig.requireSupported(selectedLev()) } catch (_: Exception) { 6 }
-            val profile = LeverageConfig.requireProfile(lev)
             val intended = entryPriceInput.text.toString().toDoubleOrNull()
             val qty = if (intended != null && intended > 0 && margin > 0) (margin * lev) / intended else null
             val eff = LocalCoinSettingsStore.load(this, sym)
-            val slLong = if (intended != null && intended > 0) intended * (1 - profile.slPercent/100.0) else null
-            val slShort = if (intended != null && intended > 0) intended * (1 + profile.slPercent/100.0) else null
+            val slLong = if (eff.stopLossEnabled && intended != null && intended > 0) runCatching { PaperEngine.stopLossPrice("LONG", intended, lev, eff.stopLossRoi) }.getOrNull() else null
+            val slShort = if (eff.stopLossEnabled && intended != null && intended > 0) runCatching { PaperEngine.stopLossPrice("SHORT", intended, lev, eff.stopLossRoi) }.getOrNull() else null
             val actLong = if (intended != null && intended > 0) runCatching { TrailingStopMath.activationPrice(TrailSide.LONG, TrailingStopMath.bd(intended), lev, TrailingStopMath.bd(eff.trailingActivationRoi)).toDouble() }.getOrNull() else null
             val actShort = if (intended != null && intended > 0) runCatching { TrailingStopMath.activationPrice(TrailSide.SHORT, TrailingStopMath.bd(intended), lev, TrailingStopMath.bd(eff.trailingActivationRoi)).toDouble() }.getOrNull() else null
             summaryBox.removeAllViews()
@@ -447,14 +446,14 @@ class MainActivity : AppCompatActivity() {
             addSummaryRow("Live Price", "${PriceFormatter.formatPrice(currentLivePrice)} USDT")
             addSummaryRow("Intended LIMIT Entry", "${PriceFormatter.formatPrice(intended)} USDT")
             addSummaryRow("Margin", "${PriceFormatter.formatUsdt(margin)} / ${lev}x")
-            addSummaryRow("Entry SL (fixed %)", "${profile.slPercent}%")
+            addSummaryRow("Cycle Stop Loss (ROI)", if (eff.stopLossEnabled) "-${fmtNum(eff.stopLossRoi)}% Position ROI" else "Disabled")
             addSummaryRow("Trailing ROI (activation / callback)", if (eff.trailingEnabled) "${eff.trailingActivationRoi} / ${eff.trailingCallbackRoi}" else "Disabled")
             addSummaryRow("Averaging trigger ROI", if (eff.averagingEnabled) "${fmtNum(eff.averagingTriggerRoi)}% (margin ${fmtNum(eff.averagingMargin)})" else "Disabled")
-            addSummaryRow("Opposite-side trigger ROI", if (eff.oppositeEnabled) "${fmtNum(eff.oppositeTriggerRoi)}% (margin ${fmtNum(eff.oppositeMargin)})" else "Disabled")
+            addSummaryRow("Opposite-side trigger ROI / callback", if (eff.oppositeEnabled) "${fmtNum(eff.oppositeTriggerRoi)}% / ${fmtNum(eff.oppositeCallbackRoi)}% (margin ${fmtNum(eff.oppositeMargin)})" else "Disabled")
             addSummaryRow("Re-entry ROI (Activation/2)", if (eff.reentryEnabled) "${fmtNum(eff.reentryRoi)}%" else "Disabled")
             addSummaryRow("Estimated Qty", if (qty != null) PriceFormatter.formatQty(qty) else "--")
-            addSummaryRow("Long: Trailing activation / SL", "${PriceFormatter.formatPrice(actLong)} / ${PriceFormatter.formatPrice(slLong)}", green)
-            addSummaryRow("Short: Trailing activation / SL", "${PriceFormatter.formatPrice(actShort)} / ${PriceFormatter.formatPrice(slShort)}", red)
+            addSummaryRow("Long: Trailing activation / cycle SL", "${PriceFormatter.formatPrice(actLong)} / ${PriceFormatter.formatPrice(slLong)}", green)
+            addSummaryRow("Short: Trailing activation / cycle SL", "${PriceFormatter.formatPrice(actShort)} / ${PriceFormatter.formatPrice(slShort)}", red)
             val note = text("All entries are LIMIT orders. Stage 1 is simulated only. No MARKET orders. No fixed Take Profit: profit exit is the ROI trailing stop.", 11f, muted)
             summaryBox.addView(note)
         }
@@ -626,7 +625,7 @@ class MainActivity : AppCompatActivity() {
                     val cyclesAll = dao.getRecentCycles(sid, 300)
                     val cycleById = cyclesAll.associateBy { it.id }
                     val openEntryOrders = allOrders.filter { it.orderType == "ENTRY_LIMIT" }
-                    val protectiveOrders = allOrders.filter { it.orderType == "CYCLE_TRAILING" || it.orderType == "ENTRY_SL" }
+                    val protectiveOrders = allOrders.filter { it.orderType == "CYCLE_TRAILING" || it.orderType == "CYCLE_SL" || it.orderType == "OPPOSITE_TRAIL" }
                     val reentries = dao.getPendingReentryPlans(sid).filter { it.status !in listOf("EXECUTED","CANCELLED","FAILED") }
                     val history = dao.getHistoryCloses(sid, 500)
                     // Conditional opposite triggers (awaiting averaging execution) - pending trigger, shown in Conditional
@@ -717,7 +716,7 @@ class MainActivity : AppCompatActivity() {
                 addLabel(box, "Margin", PriceFormatter.formatUsdt(entryMargin), white, true)
                 addLabel(box, "Cycle WAP", PriceFormatter.formatPrice(c.averageEntryPrice), white, true)
                 addLabel(box, "Trailing Stop", trailingText(c), yellow, true)
-                addLabel(box, "Entry SL", PriceFormatter.formatPrice(e.slPrice), white, true)
+                addLabel(box, "Cycle Stop Loss", c.averageEntryPrice.let { w -> if (c.stopLossEnabled && w != null) PriceFormatter.formatPrice(PaperEngine.stopLossPrice(c.direction, w, c.leverage, c.stopLossRoi)) else "Disabled" }, white, true)
                 addLabel(box, "ROI", PriceFormatter.formatPercent(roi), pnlColor(roi), true)
                 addLabel(box, "Unrealized PNL", PriceFormatter.formatPnl(unreal), pnlColor(unreal), true)
             }
@@ -757,6 +756,7 @@ class MainActivity : AppCompatActivity() {
             header.addView(text(tag, 12f, yellow, true)); box.addView(header)
             addLabel(box, "Order Price", PriceFormatter.formatPrice(o.triggerPrice), white, true)
             addLabel(box, "Current Price", currentPriceText(prices, o.symbol, priceState), white, true)
+            addCancelButton(box, "Cancel order") { engine().cancelEntryOrder(o.id) }
         }
         for (r in reentries.sortedByDescending { it.createdAt }) {
             any = true
@@ -766,8 +766,20 @@ class MainActivity : AppCompatActivity() {
             header.addView(text("Re-entry", 12f, yellow, true)); box.addView(header)
             addLabel(box, "Order Price", PriceFormatter.formatPrice(r.triggerPrice), white, true)
             addLabel(box, "Current Price", currentPriceText(prices, r.symbol, priceState), white, true)
+            addCancelButton(box, "Cancel re-entry") { engine().cancelReentryOrder(r.id) }
         }
         if (!any) body.addView(text("No open orders.", 13f, muted))
+    }
+
+    /** Manual cancel of ONE pending order (confirmation first). Only that order is affected. */
+    private fun addCancelButton(box: LinearLayout, label: String, action: suspend () -> PaperEngine.EngineResult) {
+        val b = Button(this).apply { text = label; isAllCaps = false; setTextColor(white); background = rounded(0xFF5A1E1E.toInt(), 12) }
+        box.addView(b, LinearLayout.LayoutParams(-1, dp(40)).apply { topMargin = dp(8) })
+        b.setOnClickListener {
+            AlertDialog.Builder(this).setTitle(label + "?").setMessage("Only this order is cancelled. Other orders and open positions are not changed.")
+                .setPositiveButton("CANCEL ORDER") { _, _ -> lifecycleScope.launch { val r = action(); toast(r.message); showPage("Future") } }
+                .setNegativeButton("BACK", null).show()
+        }
     }
 
     private fun renderOrdersConditional(body: LinearLayout, protectiveOrders: List<PaperOrderEntity>, conditionalOpposites: List<PaperCycleEntity>, cycleById: Map<Long, PaperCycleEntity>, prices: Map<String, Ticker>, priceState: String) {
@@ -779,9 +791,9 @@ class MainActivity : AppCompatActivity() {
             val sym = cycle?.symbol ?: orders.firstOrNull()?.symbol ?: "--"
             val tp = orders.firstOrNull { it.orderType == "CYCLE_TRAILING" }
             // show cycle-level trailing stop and a representative SL price per card context; margin is cycle initial+avg context - use cycle margins
-            val sls = orders.filter { it.orderType == "ENTRY_SL" }
+            val sl = orders.firstOrNull { it.orderType == "CYCLE_SL" }
+            val opp = orders.firstOrNull { it.orderType == "OPPOSITE_TRAIL" }
             val marginAmt = if (cycle != null) {
-                // total margin for open executed entries approximated by initial+averaging when applicable
                 cycle.initialMargin + if (cycle.averagingDone) cycle.averagingMargin else 0.0
             } else 0.0
             val box = makeItemCard(body)
@@ -790,27 +802,14 @@ class MainActivity : AppCompatActivity() {
             box.addView(header)
             addLabel(box, "Margin Amount", PriceFormatter.formatUsdt(marginAmt), white, true)
             addLabel(box, "Current Price", currentPriceText(prices, sym, priceState), white, true)
-            addLabel(box, "Trailing Stop", if (cycle != null) trailingText(cycle) else PriceFormatter.formatPrice(tp?.triggerPrice), green, true)
-            // If multiple independent SLs exist, show each as its own separate card per-entry context while keeping only 4 fields
-            if (sls.isEmpty()) {
-                addLabel(box, "SL Order Price", "--", red, true)
-            } else if (sls.size == 1) {
-                addLabel(box, "SL Order Price", PriceFormatter.formatPrice(sls.first().triggerPrice), red, true)
-            } else {
-                // first in this card, rest as separate cards (each must be separate clean card per requirement intent)
-                addLabel(box, "SL Order Price", PriceFormatter.formatPrice(sls.first().triggerPrice), red, true)
-                for (sl in sls.drop(1)) {
-                    val c2 = makeItemCard(body)
-                    val h2 = row(); h2.addView(text("$sym ${cycle?.direction ?: ""}".trim(), 15f, if (cycle?.direction == "SHORT") red else green, true), LinearLayout.LayoutParams(0,-2,1f)); c2.addView(h2)
-                    val entryMargin = cycle?.initialMargin ?: marginAmt
-                    addLabel(c2, "Margin Amount", PriceFormatter.formatUsdt(entryMargin), white, true)
-                    addLabel(c2, "Current Price", currentPriceText(prices, sym, priceState), white, true)
-                    addLabel(c2, "Trailing Stop", if (cycle != null) trailingText(cycle) else PriceFormatter.formatPrice(tp?.triggerPrice), green, true)
-                    addLabel(c2, "SL Order Price", PriceFormatter.formatPrice(sl.triggerPrice), red, true)
-                }
+            if (tp != null || cycle?.trailingEnabled == true) addLabel(box, "Trailing Stop", if (cycle != null) trailingText(cycle) else PriceFormatter.formatPrice(tp?.triggerPrice), green, true)
+            addLabel(box, "Cycle Stop Loss", if (sl != null) PriceFormatter.formatPrice(sl.triggerPrice) else "Disabled", red, true)
+            if (opp != null) {
+                val active = cycle?.oppositeTrailActive == true
+                addLabel(box, "Opposite ${opp.direction} " + if (active) "trigger" else "activation", PriceFormatter.formatPrice(opp.triggerPrice), yellow, true)
             }
         }
-        // Conditional opposite-side triggers (awaiting averaging execution)
+        // (legacy list, always empty: opposite-side triggers are OPPOSITE_TRAIL orders above)
         for (c in conditionalOpposites) {
             any = true
             val box = makeItemCard(body)
@@ -900,6 +899,8 @@ class MainActivity : AppCompatActivity() {
                 SettingKeys.AVERAGING_ENABLED to eff.averagingEnabled, SettingKeys.AVERAGING_MARGIN to eff.averagingMargin, SettingKeys.AVERAGING_TRIGGER_ROI to eff.averagingTriggerRoi,
                 SettingKeys.REENTRY_ENABLED to eff.reentryEnabled,
                 SettingKeys.OPPOSITE_ENABLED to eff.oppositeEnabled, SettingKeys.OPPOSITE_MARGIN to eff.oppositeMargin, SettingKeys.OPPOSITE_TRIGGER_ROI to eff.oppositeTriggerRoi,
+                SettingKeys.OPPOSITE_CALLBACK_ROI to eff.oppositeCallbackRoi,
+                SettingKeys.STOP_LOSS_ENABLED to eff.stopLossEnabled, SettingKeys.STOP_LOSS_ROI to eff.stopLossRoi,
             )
             val boolControls = LinkedHashMap<String, Switch>()
             val numControls = LinkedHashMap<String, EditText>()
@@ -945,7 +946,7 @@ class MainActivity : AppCompatActivity() {
             num(b, "Activation ROI (%)", SettingKeys.TRAILING_ACTIVATION_ROI)
             num(b, "Callback ROI (%)", SettingKeys.TRAILING_CALLBACK_ROI)
 
-            val c = addCard(formBox, "C. DUAL-SIDE RE-ENTRY", "After a cycle closes profitably by its trailing stop, a LONG (below the close) and a SHORT (above the close) re-entry LIMIT are prepared. The first to fill starts a NEW cycle; the other is cancelled automatically.")
+            val c = addCard(formBox, "C. DUAL-SIDE RE-ENTRY", "After a cycle closes profitably by its trailing stop, a LONG (below the close) and a SHORT (above the close) re-entry LIMIT are prepared. The two orders are independent: a fill starts a NEW cycle and does NOT cancel the other order, which stays pending until it fills or you cancel it manually (Open Orders → Cancel).")
             sw(c, "Re-entry enabled", SettingKeys.REENTRY_ENABLED)
             val reRoi = eff.reentryRoi
             c.addView(text("Re-entry ROI (automatic) = Activation ROI / 2 = ${fmtNum(reRoi)}%  (price distance ${fmtNum(reRoi / eff.leverage)}% at ${eff.leverage}x)", 12f, yellow))
@@ -954,20 +955,24 @@ class MainActivity : AppCompatActivity() {
             val d = addCard(formBox, "D. AVERAGING", "One averaging LIMIT per cycle, priced where Position ROI reaches the trigger (leverage included). Independent of Opposite-Side.")
             sw(d, "Averaging enabled", SettingKeys.AVERAGING_ENABLED)
             num(d, "Averaging margin (USDT)", SettingKeys.AVERAGING_MARGIN)
-            num(d, "Averaging Trigger ROI (%) — negative, -69 to 0", SettingKeys.AVERAGING_TRIGGER_ROI, signed = true)
+            num(d, "Averaging Trigger ROI (%) — negative, default -60, limited by the Stop Loss ROI", SettingKeys.AVERAGING_TRIGGER_ROI, signed = true)
 
-            val e = addCard(formBox, "E. OPPOSITE-SIDE", "A separate, independent cycle in the other direction, prepared where the original position's Position ROI reaches the trigger. Only if no opposite-direction cycle is open. Independent of Averaging.")
+            val e = addCard(formBox, "E. OPPOSITE-SIDE", "Activates when the position's ROI reaches the trigger, then trails the adverse move; when price reverses by the callback ROI, a LIMIT entry opens a separate opposite cycle (own margin, leverage, Stop Loss and trailing). Only if no opposite-direction cycle is open. Controlled only by this toggle; independent of Averaging.")
             sw(e, "Opposite-side enabled", SettingKeys.OPPOSITE_ENABLED)
             num(e, "Opposite-side margin (USDT)", SettingKeys.OPPOSITE_MARGIN)
-            num(e, "Opposite-Side Trigger ROI (%) — negative, -69 to 0", SettingKeys.OPPOSITE_TRIGGER_ROI, signed = true)
+            num(e, "Opposite-Side Trigger ROI (%) — negative, default -50 (activation)", SettingKeys.OPPOSITE_TRIGGER_ROI, signed = true)
+            num(e, "Opposite-Side Callback ROI (%) — reversal confirmation, default 5", SettingKeys.OPPOSITE_CALLBACK_ROI)
+
+            val sl = addCard(formBox, "STOP LOSS (per cycle)", "One Stop Loss per whole cycle, measured as Position ROI (leverage included). When hit, all remaining quantity is closed and that cycle's pending orders are cancelled. Disabled = no Stop Loss at all. Enter a positive number (80 = -80% ROI).")
+            sw(sl, "Stop Loss enabled", SettingKeys.STOP_LOSS_ENABLED)
+            num(sl, "Stop Loss ROI (%) — default 80", SettingKeys.STOP_LOSS_ROI)
 
             val f = addCard(formBox, "F. DEFAULT TRADING SETTINGS", "LONG and SHORT are always permitted (not configurable).")
             num(f, "Default margin (USDT)", SettingKeys.MARGIN)
             header(f, "Default leverage (3x–20x)", SettingKeys.LEVERAGE)
             levSpin = Spinner(this).apply { adapter = createDarkSpinnerAdapter(LeverageConfig.SUPPORTED_LEVERAGES.map { "${it}x" }); setPopupBackgroundDrawable(rounded(inputBg, 10)); setBackgroundColor(inputBg); setSelection(LeverageConfig.SUPPORTED_LEVERAGES.indexOf(eff.leverage).coerceAtLeast(0)) }
             f.addView(levSpin, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) })
-            val p = eff.profile
-            f.addView(text("Derived (read-only) at ${eff.leverage}x: Entry SL ${p.slPercent}% price move (= -69% ROI) | Averaging trigger ${fmtNum(eff.averagingTriggerRoi)}% ROI | Opposite trigger ${fmtNum(eff.oppositeTriggerRoi)}% ROI | Re-entry ${fmtNum(reRoi)}% ROI", 12f, yellow))
+            f.addView(text("Derived (read-only) at ${eff.leverage}x: Stop Loss ${if (eff.stopLossEnabled) "-" + fmtNum(eff.stopLossRoi) + "% ROI" else "Disabled"} | Averaging trigger ${fmtNum(eff.averagingTriggerRoi)}% ROI | Opposite trigger ${fmtNum(eff.oppositeTriggerRoi)}% ROI | Re-entry ${fmtNum(reRoi)}% ROI", 12f, yellow))
 
             val msg = text("", 12f, muted)
             val saveCard = column(); formBox.addView(saveCard)
@@ -978,6 +983,7 @@ class MainActivity : AppCompatActivity() {
                     boolControls.forEach { (k, s) -> v[k] = s.isChecked }
                     numControls.forEach { (k, et) -> v[k] = et.text.toString().toDoubleOrNull() ?: throw IllegalArgumentException("Enter a valid number for every field.") }
                     listOf(SettingKeys.AVERAGING_TRIGGER_ROI, SettingKeys.OPPOSITE_TRIGGER_ROI).forEach { k -> v[k] = RoiMath.normalizeLossTrigger(v[k] as Double) }
+                    v[SettingKeys.STOP_LOSS_ROI] = Math.abs(v[SettingKeys.STOP_LOSS_ROI] as Double)
                     v[SettingKeys.LEVERAGE] = LeverageConfig.requireSupported(LeverageConfig.SUPPORTED_LEVERAGES.getOrElse(levSpin.selectedItemPosition) { 6 })
                     // Strict validation (throws with a readable message) before anything is saved.
                     val candidate = LocalCoinSettings(
@@ -985,6 +991,8 @@ class MainActivity : AppCompatActivity() {
                         marginAmount = v[SettingKeys.MARGIN] as Double, leverage = v[SettingKeys.LEVERAGE] as Int,
                         oppositeEnabled = v[SettingKeys.OPPOSITE_ENABLED] as Boolean, oppositeMargin = v[SettingKeys.OPPOSITE_MARGIN] as Double,
                         oppositeTriggerRoi = v[SettingKeys.OPPOSITE_TRIGGER_ROI] as Double,
+                        oppositeCallbackRoi = v[SettingKeys.OPPOSITE_CALLBACK_ROI] as Double,
+                        stopLossEnabled = v[SettingKeys.STOP_LOSS_ENABLED] as Boolean, stopLossRoi = v[SettingKeys.STOP_LOSS_ROI] as Double,
                         averagingEnabled = v[SettingKeys.AVERAGING_ENABLED] as Boolean, averagingMargin = v[SettingKeys.AVERAGING_MARGIN] as Double,
                         averagingTriggerRoi = v[SettingKeys.AVERAGING_TRIGGER_ROI] as Double,
                         reentryEnabled = v[SettingKeys.REENTRY_ENABLED] as Boolean,
@@ -1047,7 +1055,8 @@ class MainActivity : AppCompatActivity() {
                     addLabel(box, "Opposite-Side Trigger ROI", "${fmtNum(eff.oppositeTriggerRoi)}%${tag(SettingKeys.OPPOSITE_TRIGGER_ROI)}")
                     addLabel(box, "Trailing Stop", if (eff.trailingEnabled) "ON  (activation ${fmtNum(eff.trailingActivationRoi)}% / callback ${fmtNum(eff.trailingCallbackRoi)}% ROI)${tag(SettingKeys.TRAILING_ACTIVATION_ROI)}" else "OFF${tag(SettingKeys.TRAILING_ENABLED)}")
                     addLabel(box, "Re-entry", onOff(eff.reentryEnabled) + " (ROI ${fmtNum(eff.reentryRoi)}% = Activation/2)" + tag(SettingKeys.REENTRY_ENABLED), if (eff.reentryEnabled) green else lockedColor)
-                    addLabel(box, "Entry Stop Loss", "${eff.slPercent}% price move (-69% ROI, fixed)")
+                    addLabel(box, "Stop Loss", (if (eff.stopLossEnabled) "ON, -${fmtNum(eff.stopLossRoi)}% ROI" else "OFF") + tag(SettingKeys.STOP_LOSS_ENABLED), if (eff.stopLossEnabled) green else lockedColor)
+                    addLabel(box, "Opposite Callback ROI", "${fmtNum(eff.oppositeCallbackRoi)}%${tag(SettingKeys.OPPOSITE_CALLBACK_ROI)}")
                     if (lock != null) { box.addView(text(lock, 12f, yellow, true)); addSpace(box, 4) }
                     val actions = row(); box.addView(actions)
                     val edit = Button(this@MainActivity).apply { text = "Edit"; isAllCaps = false; isEnabled = lock == null; alpha = if (lock == null) 1f else 0.4f; setTextColor(if (lock == null) 0xFF000000.toInt() else white); background = rounded(if (lock == null) yellow else inputBg, 12) }

@@ -21,8 +21,11 @@ object RoiMath {
     private val HUNDRED = BigDecimal(100)
     private val TWO = BigDecimal(2)
 
-    /** Fixed by the leverage table (entry SL = 69 / L price percent) = -69% Position ROI at every leverage. */
-    val SL_ROI: BigDecimal = BigDecimal(69)
+    /**
+     * The simulated liquidation sits at about -93% Position ROI at every leverage (see PaperEngine.liquidationPrice).
+     * Stop Loss and loss triggers beyond it could never fire.
+     */
+    const val LIQUIDATION_ROI: Double = 93.0
 
     private fun fraction(roi: BigDecimal, leverage: Int): BigDecimal {
         require(leverage > 0) { "Leverage must be greater than 0" }
@@ -73,6 +76,15 @@ object RoiMath {
         return if (input == 0.0) 0.0 else -kotlin.math.abs(input)
     }
 
-    /** A loss trigger must be below 0 and not beyond the fixed entry SL ROI (-69%), otherwise it could never fire. */
-    fun isValidLossTrigger(roi: Double): Boolean = roi.isFinite() && roi < 0.0 && roi >= -SL_ROI.toDouble()
+    /** Stop Loss ROI is entered as a positive number (80 = -80% Position ROI) and must lie before liquidation. */
+    fun isValidStopLossRoi(roi: Double): Boolean = roi.isFinite() && roi > 0.0 && roi < LIQUIDATION_ROI
+
+    /**
+     * Largest loss (as a positive number) a trigger may reach: the Stop Loss ROI when the SL is enabled (a trigger beyond it
+     * could never fire), otherwise the liquidation ROI.
+     */
+    fun triggerLimit(stopLossEnabled: Boolean, stopLossRoi: Double): Double = if (stopLossEnabled) stopLossRoi else LIQUIDATION_ROI
+
+    /** A loss trigger must be below 0 and not beyond [limitAbs] (see [triggerLimit]), otherwise it could never fire. */
+    fun isValidLossTrigger(roi: Double, limitAbs: Double): Boolean = roi.isFinite() && roi < 0.0 && roi >= -limitAbs
 }

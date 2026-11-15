@@ -1,6 +1,5 @@
 package com.ansardeo.bnb
 
-import com.ansardeo.bnb.data.LeverageConfig
 import com.ansardeo.bnb.data.TradingStage
 import com.ansardeo.bnb.paper.PaperEngine
 import org.junit.Assert.*
@@ -12,21 +11,15 @@ class TradingRulesLogicTest {
         assertEquals(95.0, avg, 1e-9)
     }
 
-    @Test fun independentSlPerEntryFixedFromActualFill() {
-        val p = LeverageConfig.requireProfile(10) // SL 6.90%
-        val slInitial = PaperEngine.calcSl("LONG", 100.0, p.slPercent)
-        val slAvg = PaperEngine.calcSl("LONG", 90.0, p.slPercent)
-        assertEquals(93.10, slInitial, 1e-9)
-        assertEquals(83.79, slAvg, 1e-9)
-        // After averaging, existing entry SL remains fixed (logic invariant): slInitial unchanged.
-        assertEquals(93.10, slInitial, 1e-9)
+    @Test fun cycleStopLossIsOneLevelFromTheCycleWap() {
+        // Default SL 80% ROI at 10x: WAP 100 -> 92; after averaging WAP 95 -> 87.4 (one level for the whole cycle)
+        assertEquals(92.0, PaperEngine.stopLossPrice("LONG", 100.0, 10, 80.0), 1e-9)
+        assertEquals(87.4, PaperEngine.stopLossPrice("LONG", PaperEngine.weightedAvg(listOf(100.0 to 1.0, 90.0 to 1.0)), 10, 80.0), 1e-9)
     }
 
-    @Test fun individualSlClosesOnlyThatEntryQty() {
-        val pnlInitial = PaperEngine.realizedPnl("LONG", 100.0, 93.10, 0.05) // only initial qty
-        val pnlAvg = PaperEngine.realizedPnl("LONG", 90.0, 95.0, 0.02) // avg entry unaffected
-        assertTrue(pnlInitial < 0)
-        assertEquals(0.1, pnlAvg, 1e-9)
+    @Test fun cycleStopLossClosesTheWholeRemainingQuantity() {
+        val pnl = PaperEngine.realizedPnl("LONG", 95.0, 87.4, 0.05)
+        assertTrue(pnl < 0)
     }
 
     @Test fun cycleTrailingExitClosesRemainingQty() {
@@ -85,7 +78,7 @@ class TradingRulesLogicTest {
     }
 
     @Test fun conditionalCardShowsTrailingNotFixedTakeProfit() {
-        val fields = listOf("Margin Amount", "Current Price", "Trailing Activation Price", "Trailing Stop Price", "SL Order Price")
+        val fields = listOf("Margin Amount", "Current Price", "Trailing Activation Price", "Trailing Stop Price", "Cycle Stop Loss")
         assertFalse(fields.any { it.contains("TP", ignoreCase = false) || it.contains("Take Profit") })
     }
 }

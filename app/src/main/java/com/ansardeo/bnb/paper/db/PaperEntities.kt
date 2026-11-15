@@ -35,7 +35,8 @@ data class PaperCycleEntity(
     val initialMargin: Double,
     val averagingMargin: Double,
     val oppositeMargin: Double = 0.0,
-    val slPercent: Double,
+    /** LEGACY per-entry SL percent (pre-v5). Unused; kept so the table needs no rebuild. */
+    val slPercent: Double = 0.0,
     /** LEGACY (pre-v4 price-percent snapshots). Unused since v4; kept so the table needs no rebuild. */
     val averagingPercent: Double = 0.0,
     /** LEGACY (pre-v4). Unused since v4; see [reentryRoi]. */
@@ -57,6 +58,17 @@ data class PaperCycleEntity(
     val oppositeTriggerRoi: Double = -50.0,
     /** Re-entry ROI = activationRoi / 2, fixed at snapshot time. */
     val reentryRoi: Double = 16.5,
+    // v5 snapshot: ONE cycle-level Stop Loss (replaces the removed per-entry SL) and the opposite-side reversal trigger.
+    /** Cycle Stop Loss on/off. Off = no SL at all (the position may run until liquidation). */
+    val stopLossEnabled: Boolean = true,
+    /** Stop Loss threshold as a POSITIVE number: 80 means -80% Position ROI on the cycle WAP. */
+    val stopLossRoi: Double = 80.0,
+    /** Opposite-side reversal confirmation: callback ROI (default 5) after the trigger ROI (oppositeTriggerRoi) was reached. */
+    val oppositeCallbackRoi: Double = 5.0,
+    // Persisted opposite-side trailing-trigger state (survives app restart).
+    val oppositeTrailActive: Boolean = false,
+    val oppositeTrailExtreme: Double? = null,
+    val oppositeTrailStop: Double? = null,
     // Persisted trailing state (survives app restart).
     val activationPrice: Double? = null,
     val trailingActive: Boolean = false,
@@ -131,7 +143,7 @@ data class PaperOrderEntity(
     val symbol: String,
     val direction: String,
     val side: String, // BUY/SELL (execution side)
-    val orderType: String, // ENTRY_LIMIT, CYCLE_TRAILING, ENTRY_SL
+    val orderType: String, // ENTRY_LIMIT, CYCLE_TRAILING, CYCLE_SL, OPPOSITE_TRAIL (legacy: ENTRY_SL)
     val triggerPrice: Double,
     val limitPrice: Double? = null,
     val quantity: Double,

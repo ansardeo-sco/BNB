@@ -33,8 +33,38 @@ class SettingsResolverTest {
         try { LocalCoinSettings(symbol = "X", trailingCallbackRoi = -1.0); fail() } catch (_: IllegalArgumentException) {}
     }
 
-    @Test fun derivedStopLossComesFromLeverageTable() {
-        assertEquals(6.90, LocalCoinSettings.sanitized("BTCUSDT", leverage = 10).slPercent, 1e-9)
+    @Test fun stopLossDefaultsAreEnabledAnd80() {
+        val s = LocalCoinSettings.sanitized("X")
+        assertTrue(s.stopLossEnabled)
+        assertEquals(80.0, s.stopLossRoi, 1e-9)
+        assertEquals(5.0, s.oppositeCallbackRoi, 1e-9)
+    }
+
+    @Test fun stopLossInputIsPositiveAndInvalidFallsBackToDefault() {
+        assertEquals(70.0, LocalCoinSettings.sanitized("X", stopLossRoi = -70.0).stopLossRoi, 1e-9)
+        assertEquals(80.0, LocalCoinSettings.sanitized("X", stopLossRoi = 0.0).stopLossRoi, 1e-9)
+        assertEquals(80.0, LocalCoinSettings.sanitized("X", stopLossRoi = 150.0).stopLossRoi, 1e-9)
+        try { LocalCoinSettings(symbol = "X", stopLossRoi = 0.0); fail() } catch (_: IllegalArgumentException) {}
+    }
+
+    @Test fun disablingStopLossWidensTheTriggerLimit() {
+        try { LocalCoinSettings(symbol = "X", averagingTriggerRoi = -85.0); fail() } catch (_: IllegalArgumentException) {}
+        val s = LocalCoinSettings(symbol = "X", stopLossEnabled = false, averagingTriggerRoi = -85.0)
+        assertEquals(-85.0, s.averagingTriggerRoi, 1e-9)
+        assertFalse(s.stopLossEnabled)
+    }
+
+    @Test fun triggerMustStayInsideTheConfiguredStopLoss() {
+        try { LocalCoinSettings(symbol = "X", stopLossRoi = 55.0, averagingTriggerRoi = -60.0); fail() } catch (_: IllegalArgumentException) {}
+        LocalCoinSettings(symbol = "X", stopLossRoi = 55.0, averagingTriggerRoi = -55.0, oppositeTriggerRoi = -50.0)
+    }
+
+    @Test fun stopLossAndCallbackAreOverridablePerSymbol() {
+        val s = SettingsResolver.resolve("X", global, mapOf(SettingKeys.STOP_LOSS_ROI to 70.0, SettingKeys.OPPOSITE_CALLBACK_ROI to 8.0, SettingKeys.STOP_LOSS_ENABLED to false))
+        assertEquals(70.0, s.stopLossRoi, 1e-9)
+        assertEquals(8.0, s.oppositeCallbackRoi, 1e-9)
+        assertFalse(s.stopLossEnabled)
+        try { LocalCoinSettings(symbol = "X", oppositeCallbackRoi = 0.0); fail() } catch (_: IllegalArgumentException) {}
     }
 
     @Test fun reentryRoiIsHalfOfActivationRoi() {
@@ -64,11 +94,11 @@ class SettingsResolverTest {
     }
 
     @Test fun triggersBeyondStopLossAreRejectedStrictly() {
-        for (bad in listOf(-69.01, -70.0, -100.0, 0.0, 5.0)) {
+        for (bad in listOf(-80.01, -90.0, -100.0, 0.0, 5.0)) {
             try { LocalCoinSettings(symbol = "X", averagingTriggerRoi = bad); fail("avg $bad") } catch (_: IllegalArgumentException) {}
             try { LocalCoinSettings(symbol = "X", oppositeTriggerRoi = bad); fail("opp $bad") } catch (_: IllegalArgumentException) {}
         }
-        LocalCoinSettings(symbol = "X", averagingTriggerRoi = -69.0, oppositeTriggerRoi = -0.5) // boundaries allowed
+        LocalCoinSettings(symbol = "X", averagingTriggerRoi = -80.0, oppositeTriggerRoi = -0.5) // boundaries allowed
     }
 
     @Test fun resolveStrictThrowsWhereResolveCorrects() {

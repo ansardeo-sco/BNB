@@ -51,10 +51,11 @@ class RoiMathTest {
         val l = RoiMath.reentryPrice(TrailSide.LONG, close, 7, d("12"))
         val s = RoiMath.reentryPrice(TrailSide.SHORT, close, 7, d("12"))
         assertTrue(l < close && s > close)
-        // a LONG opened at l reaches +12% ROI back at the close price... (up to the linear definition)
-        val back = RoiMath.positionRoi(TrailSide.LONG, l, close, 7)
-        assertTrue(back > d("12"))
-        assertNum("12", RoiMath.positionRoi(TrailSide.LONG, close, RoiMath.priceAtRoi(TrailSide.LONG, close, 7, d("12")), 7))
+        // a LONG opened at l reaches more than +12% ROI at the close price (the distance is measured from the close, not from l)
+        assertTrue(RoiMath.positionRoi(TrailSide.LONG, l, close, 7) > d("12"))
+        // The inverse is rounded to MathContext(28): compare with a tolerance, never with exact BigDecimal equality.
+        val back = RoiMath.positionRoi(TrailSide.LONG, close, RoiMath.priceAtRoi(TrailSide.LONG, close, 7, d("12")), 7)
+        assertTrue("back=$back", back.subtract(d("12")).abs() < d("1e-12"))
     }
 
     // ---- Trigger input ----
@@ -63,21 +64,55 @@ class RoiMathTest {
         assertEquals(-30.0, RoiMath.normalizeLossTrigger(-30.0), 0.0)
     }
 
-    @Test fun lossTriggerRange() {
-        assertTrue(RoiMath.isValidLossTrigger(-60.0))
-        assertTrue(RoiMath.isValidLossTrigger(-69.0))
-        assertFalse(RoiMath.isValidLossTrigger(-69.5))
-        assertFalse(RoiMath.isValidLossTrigger(0.0))
-        assertFalse(RoiMath.isValidLossTrigger(Double.NaN))
+    @Test fun triggerLimitFollowsStopLoss() {
+        assertEquals(80.0, RoiMath.triggerLimit(true, 80.0), 0.0)
+        assertEquals(50.0, RoiMath.triggerLimit(true, 50.0), 0.0)
+        assertEquals(RoiMath.LIQUIDATION_ROI, RoiMath.triggerLimit(false, 80.0), 0.0)
     }
 
-    @Test fun triggerMustBeReachableBeforeEntryStopLoss() {
-        // entry SL is 69/L price % => -69% ROI at any leverage; a -66% trigger price lies before it.
+    @Test fun lossTriggerRangeDependsOnLimit() {
+        assertTrue(RoiMath.isValidLossTrigger(-60.0, 80.0))
+        assertTrue(RoiMath.isValidLossTrigger(-80.0, 80.0))
+        assertFalse(RoiMath.isValidLossTrigger(-80.5, 80.0))
+        assertFalse(RoiMath.isValidLossTrigger(0.0, 80.0))
+        assertFalse(RoiMath.isValidLossTrigger(Double.NaN, 80.0))
+        assertTrue(RoiMath.isValidLossTrigger(-90.0, RoiMath.LIQUIDATION_ROI))
+    }
+
+    @Test fun stopLossRoiRange() {
+        assertTrue(RoiMath.isValidStopLossRoi(80.0))
+        assertTrue(RoiMath.isValidStopLossRoi(0.5))
+        assertFalse(RoiMath.isValidStopLossRoi(0.0))
+        assertFalse(RoiMath.isValidStopLossRoi(-80.0))
+        assertFalse(RoiMath.isValidStopLossRoi(RoiMath.LIQUIDATION_ROI))
+        assertFalse(RoiMath.isValidStopLossRoi(Double.NaN))
+    }
+
+    @Test fun cycleStopLossPriceIncludesLeverage() {
+        // -80% ROI at 10x = 8% price move
+        assertEquals(92.0, com.ansardeo.bnb.paper.PaperEngine.stopLossPrice("LONG", 100.0, 10, 80.0), 1e-9)
+        assertEquals(108.0, com.ansardeo.bnb.paper.PaperEngine.stopLossPrice("SHORT", 100.0, 10, 80.0), 1e-9)
+        // 20x halves the distance
+        assertEquals(96.0, com.ansardeo.bnb.paper.PaperEngine.stopLossPrice("LONG", 100.0, 20, 80.0), 1e-9)
+    }
+
+    @Test fun triggersLieBeforeTheStopLossPrice() {
         for (lev in 3..20) {
-            val sl = com.ansardeo.bnb.data.LeverageConfig.requireProfile(lev).slPercent
-            val trigger = RoiMath.priceAtRoi(TrailSide.LONG, d("100"), lev, d("-66"))
-            val slPrice = d("100").multiply(BigDecimal.ONE.subtract(BigDecimal(sl.toString()).divide(d("100"), java.math.MathContext.DECIMAL64)))
+            val trigger = RoiMath.priceAtRoi(TrailSide.LONG, d("100"), lev, d("-60"))
+            val slPrice = RoiMath.priceAtRoi(TrailSide.LONG, d("100"), lev, d("-80"))
             assertTrue("lev $lev", trigger > slPrice)
         }
+    }
+
+    @Test fun oppositeTriggerUsesTrailingMathOnTheOppositeSide() {
+        // Source LONG at WAP 100, 10x: -50% Position ROI is at price 95 (the trigger activates there).
+        val activation = RoiMath.priceAtRoi(TrailSide.LONG, d("100"), 10, d("-50"))
+        assertNum("95", activation)
+        // callback 5% ROI at 10x = 0.5% price: stop = low * (1 + 0.005)
+        val low = d("93")
+        val stop = low.multiply(d("1.005"))
+        assertNum("93.465", stop)
+        // SHORT source mirrored: -50% ROI at 105, reversal below the high.
+        assertNum("105", RoiMath.priceAtRoi(TrailSide.SHORT, d("100"), 10, d("-50")))
     }
 }
