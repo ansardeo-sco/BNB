@@ -39,6 +39,12 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
+/** One compact Settings tile (view + expanded state). */
+private class SettingTile(val view: LinearLayout, val full: Boolean) {
+    var expanded = false
+    var refresh: () -> Unit = {}
+}
+
 class MainActivity : AppCompatActivity() {
 
     private val marketRepo = MarketRepository()
@@ -883,23 +889,26 @@ class MainActivity : AppCompatActivity() {
 
     private fun settingsPage() {
         val root = pageContainer()
-        root.addView(text("Settings — Dashboard", 23f, white, true))
-        root.addView(text("Central configuration for Stage 1 (Virtual). New cycles take a snapshot of these values; existing cycles are never changed silently. SL, averaging and re-entry percentages come from the fixed leverage table. There is no Take Profit: the profit exit is the ROI trailing stop.", 12f, muted))
+        root.addView(text("Settings — Dashboard", 20f, white, true))
+        root.addView(text("Stage 1 (Virtual). New cycles take a snapshot of these values; existing cycles never change. No Take Profit: the profit exit is the ROI trailing stop. Tap a tile to edit it.", 11f, muted))
+        addSpace(root, 8)
 
-        // A. Trading mode & bot controls
-        val modeCard = addCard(root, "A. TRADING MODE & BOT CONTROLS")
-        addLabel(modeCard, "Active stage", stage().title, green)
-        addLabel(modeCard, "Stage 2 / Stage 3", "Not available (separate approval required)", lockedColor)
-        val botSwitch = Switch(this).apply {
-            text = "Bot enabled (monitoring and strategy)"; isChecked = !TradingControlStore.isPaused(this@MainActivity); setTextColor(white)
+        // Bot control (one compact row)
+        val botRow = row().apply { background = rounded(card, 14); setPadding(dp(14), dp(8), dp(14), dp(8)) }
+        botRow.addView(text("Stage 1 • Virtual", 13f, green, true), LinearLayout.LayoutParams(0, -2, 1f))
+        botRow.addView(Switch(this).apply {
+            text = "Bot enabled  "; isChecked = !TradingControlStore.isPaused(this@MainActivity); setTextColor(white)
             setOnCheckedChangeListener { _, on -> TradingControlStore.setPaused(this@MainActivity, !on); updateTopStatus() }
-        }
-        modeCard.addView(botSwitch)
+        })
+        root.addView(botRow, LinearLayout.LayoutParams(-1, -2))
 
-        // Scope: Global defaults or one symbol
-        val scopeCard = addCard(root, "SETTINGS SCOPE", "Leave blank to edit the Global defaults. Type a symbol (e.g. BTCUSDT) to see its effective values and override individual settings.")
+        // Scope: Global defaults or one symbol (one compact row)
         val symEt = EditText(this).apply { hint = "Symbol (blank = Global)"; setText(""); setTextColor(white); setHintTextColor(muted); setBackgroundColor(inputBg); setPadding(dp(10), dp(8), dp(10), dp(8)); inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS }
-        scopeCard.addView(symEt, LinearLayout.LayoutParams(-1, -2))
+        val scopeRow = row().apply { background = rounded(card, 14); setPadding(dp(10), dp(8), dp(10), dp(8)) }
+        scopeRow.addView(symEt, LinearLayout.LayoutParams(0, dp(44), 1f).apply { marginEnd = dp(8) })
+        val loadBtn = Button(this).apply { text = "LOAD"; isAllCaps = false; setTextColor(0xFF000000.toInt()); background = rounded(yellow, 12) }
+        scopeRow.addView(loadBtn, LinearLayout.LayoutParams(dp(84), dp(44)))
+        addSpace(root, 8); root.addView(scopeRow, LinearLayout.LayoutParams(-1, -2))
         val formBox = column()
         var renderSavedRef: () -> Unit = {}
         fun renderSaved() = renderSavedRef()
@@ -921,6 +930,7 @@ class MainActivity : AppCompatActivity() {
             val boolControls = LinkedHashMap<String, Switch>()
             val numControls = LinkedHashMap<String, EditText>()
             lateinit var levSpin: Spinner
+            var refreshAll: () -> Unit = {}
             val lockNote = text("", 12f, yellow, true)
 
             fun header(card: LinearLayout, label: String, k: String) {
@@ -939,56 +949,153 @@ class MainActivity : AppCompatActivity() {
                 }
                 card.addView(h)
             }
-            fun sw(card: LinearLayout, label: String, k: String) {
-                header(card, label, k)
-                val s = Switch(this).apply { text = label; isChecked = cur[k] as Boolean; setTextColor(white) }
-                boolControls[k] = s; card.addView(s); addSpace(card, 4)
-            }
             fun num(card: LinearLayout, label: String, k: String, signed: Boolean = false) {
                 header(card, label, k)
                 val e = EditText(this).apply {
                     setText(fmtNum((cur[k] as Number).toDouble())); setTextColor(white); setHintTextColor(muted); setBackgroundColor(inputBg); setPadding(dp(10), dp(8), dp(10), dp(8))
                     inputType = android.text.InputType.TYPE_CLASS_NUMBER or android.text.InputType.TYPE_NUMBER_FLAG_DECIMAL or (if (signed) android.text.InputType.TYPE_NUMBER_FLAG_SIGNED else 0)
                 }
+                e.addTextChangedListener(object : android.text.TextWatcher {
+                    override fun afterTextChanged(s: android.text.Editable?) { refreshAll() }
+                    override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+                    override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+                })
                 numControls[k] = e; card.addView(e, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) })
             }
 
-            val scopeLabel = if (isGlobal) "GLOBAL DEFAULTS" else "SYMBOL: $sym (effective values)"
-            addCard(formBox, scopeLabel, if (isGlobal) "Every value below is a Global default." else "Values marked Inherited come from Global. Change a value and SAVE to create/update this symbol's custom settings; RESET returns one value to Inherited.")
-                .also { if (!isGlobal) it.addView(lockNote) }
+            formBox.addView(text(if (isGlobal) "Scope: GLOBAL defaults" else "Scope: $sym (effective values, ● = custom for this symbol)", 12f, yellow, true))
+            if (!isGlobal) formBox.addView(lockNote)
 
-            val b = addCard(formBox, "B. TRAILING STOP (ROI)", "Activation and callback are ROI percentages (not price percentages). The trailing stop is the only profit exit; there is no fixed Take Profit.")
-            sw(b, "Trailing stop enabled", SettingKeys.TRAILING_ENABLED)
-            num(b, "Activation ROI (%)", SettingKeys.TRAILING_ACTIVATION_ROI)
-            num(b, "Callback ROI (%)", SettingKeys.TRAILING_CALLBACK_ROI)
+            fun numOf(k: String): Double? = numControls[k]?.text?.toString()?.toDoubleOrNull()
+            fun boolOf(k: String): Boolean = boolControls[k]?.isChecked ?: (cur[k] as Boolean)
+            fun f(v: Double?): String = if (v == null) "--" else fmtNum(v)
+            fun levNow(): Int = LeverageConfig.SUPPORTED_LEVERAGES.getOrElse(levSpin.selectedItemPosition) { eff.leverage }
 
-            val c = addCard(formBox, "C. DUAL-SIDE RE-ENTRY", "After a cycle closes profitably by its trailing stop, a LONG (below the close) and a SHORT (above the close) re-entry LIMIT are prepared. The two orders are independent: a fill starts a NEW cycle and does NOT cancel the other order, which stays pending until it fills or you cancel it manually (Open Orders → Cancel).")
-            sw(c, "Re-entry enabled", SettingKeys.REENTRY_ENABLED)
-            val reRoi = eff.reentryRoi
-            c.addView(text("Re-entry ROI (automatic) = Activation ROI / 2 = ${fmtNum(reRoi)}%  (price distance ${fmtNum(reRoi / eff.leverage)}% at ${eff.leverage}x)", 12f, yellow))
-            addSpace(c, 4)
+            levSpin = Spinner(this).apply {
+                adapter = createDarkSpinnerAdapter(LeverageConfig.SUPPORTED_LEVERAGES.map { "${it}x" }); setPopupBackgroundDrawable(rounded(inputBg, 10)); setBackgroundColor(inputBg)
+                setSelection(LeverageConfig.SUPPORTED_LEVERAGES.indexOf(eff.leverage).coerceAtLeast(0))
+                onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+                    override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) { refreshAll() }
+                    override fun onNothingSelected(parent: AdapterView<*>?) {}
+                }
+            }
 
-            val d = addCard(formBox, "D. AVERAGING", "One averaging LIMIT per cycle, priced where Position ROI reaches the trigger (leverage included). Independent of Opposite-Side.")
-            sw(d, "Averaging enabled", SettingKeys.AVERAGING_ENABLED)
-            num(d, "Averaging margin (USDT)", SettingKeys.AVERAGING_MARGIN)
-            num(d, "Averaging Trigger ROI (%) — negative, default -60, limited by the Stop Loss ROI", SettingKeys.AVERAGING_TRIGGER_ROI, signed = true)
+            val tiles = ArrayList<SettingTile>()
+            val grid = column()
+            fun relayout() {
+                tiles.forEach { t -> (t.view.parent as? ViewGroup)?.removeView(t.view) }
+                grid.removeAllViews()
+                var i = 0
+                while (i < tiles.size) {
+                    val t = tiles[i]
+                    val rowL = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                    if (t.full || t.expanded) { rowL.addView(t.view, LinearLayout.LayoutParams(-1, -2)); i++ }
+                    else {
+                        rowL.addView(t.view, LinearLayout.LayoutParams(0, -2, 1f).apply { marginEnd = dp(4) })
+                        val n = tiles.getOrNull(i + 1)
+                        if (n != null && !n.full && !n.expanded) { rowL.addView(n.view, LinearLayout.LayoutParams(0, -2, 1f).apply { marginStart = dp(4) }); i += 2 }
+                        else { rowL.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f).apply { marginStart = dp(4) }); i++ }
+                    }
+                    grid.addView(rowL, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(8) })
+                }
+            }
 
-            val e = addCard(formBox, "E. OPPOSITE-SIDE", "Activates when the position's ROI reaches the trigger, then trails the adverse move; when price reverses by the callback ROI, a LIMIT entry opens a separate opposite cycle (own margin, leverage, Stop Loss and trailing). Only if no opposite-direction cycle is open. Controlled only by this toggle; independent of Averaging.")
-            sw(e, "Opposite-side enabled", SettingKeys.OPPOSITE_ENABLED)
-            num(e, "Opposite-side margin (USDT)", SettingKeys.OPPOSITE_MARGIN)
-            num(e, "Opposite-Side Trigger ROI (%) — negative, default -50 (activation)", SettingKeys.OPPOSITE_TRIGGER_ROI, signed = true)
-            num(e, "Opposite-Side Callback ROI (%) — reversal confirmation, default 5", SettingKeys.OPPOSITE_CALLBACK_ROI)
+            /** One compact tile: title (+ enable switch), live summary; tap the title to expand the inline editor. */
+            fun tile(title: String, full: Boolean, toggleKey: String?, keys: List<String>, hint: String, summary: (TextView, TextView) -> Unit, editor: (LinearLayout) -> Unit): SettingTile {
+                val box = cardView().apply { setPadding(dp(12), dp(10), dp(12), dp(10)) }
+                val head = row()
+                val titleTv = text(title, 13f, yellow, true)
+                head.addView(titleTv, LinearLayout.LayoutParams(0, -2, 1f))
+                val custom = !isGlobal && keys.any { LocalCoinSettingsStore.sourceOf(this, key, it) == SettingSource.SYMBOL_OVERRIDE }
+                if (custom) head.addView(text("● ", 11f, yellow, true))
+                if (toggleKey != null) {
+                    val sw = Switch(this).apply { isChecked = cur[toggleKey] as Boolean; setOnCheckedChangeListener { _, _ -> refreshAll() } }
+                    boolControls[toggleKey] = sw
+                    head.addView(sw)
+                }
+                val chev = text("  ▾", 14f, muted, true)
+                head.addView(chev)
+                box.addView(head)
+                val big = text("", 17f, white, true)
+                val cap = text("", 11f, muted)
+                box.addView(big); box.addView(cap)
+                val ed = column().apply { visibility = View.GONE }
+                addSpace(ed, 6)
+                ed.addView(text(hint, 11f, muted)); addSpace(ed, 6)
+                if (toggleKey != null) header(ed, "Enabled", toggleKey)
+                editor(ed)
+                box.addView(ed)
+                val t = SettingTile(box, full)
+                t.refresh = {
+                    summary(big, cap)
+                    val on = toggleKey?.let { boolOf(it) } ?: true
+                    big.alpha = if (on) 1f else 0.4f; cap.alpha = if (on) 1f else 0.4f
+                }
+                head.setOnClickListener {
+                    t.expanded = !t.expanded
+                    ed.visibility = if (t.expanded) View.VISIBLE else View.GONE
+                    chev.text = if (t.expanded) "  ▴" else "  ▾"
+                    relayout()
+                }
+                tiles.add(t)
+                return t
+            }
 
-            val sl = addCard(formBox, "STOP LOSS (per cycle)", "One Stop Loss per whole cycle, measured as Position ROI (leverage included). When hit, all remaining quantity is closed and that cycle's pending orders are cancelled. Disabled = no Stop Loss at all. Enter a positive number (80 = -80% ROI).")
-            sw(sl, "Stop Loss enabled", SettingKeys.STOP_LOSS_ENABLED)
-            num(sl, "Stop Loss ROI (%) — default 80", SettingKeys.STOP_LOSS_ROI)
+            val derivedTv = text("", 11f, yellow)
+            val tDefault = tile("Default Trading Settings", true, null, listOf(SettingKeys.MARGIN, SettingKeys.LEVERAGE),
+                "LONG and SHORT are always permitted (not configurable).",
+                { big, cap -> big.text = "${f(numOf(SettingKeys.MARGIN))} USDT  |  ${levNow()}x"; cap.text = "Margin  |  Leverage (3x–20x)" }
+            ) { ed ->
+                num(ed, "Default margin (USDT)", SettingKeys.MARGIN)
+                header(ed, "Default leverage (3x–20x)", SettingKeys.LEVERAGE)
+                ed.addView(levSpin, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) })
+            }
+            tDefault.view.addView(derivedTv, 3)
 
-            val f = addCard(formBox, "F. DEFAULT TRADING SETTINGS", "LONG and SHORT are always permitted (not configurable).")
-            num(f, "Default margin (USDT)", SettingKeys.MARGIN)
-            header(f, "Default leverage (3x–20x)", SettingKeys.LEVERAGE)
-            levSpin = Spinner(this).apply { adapter = createDarkSpinnerAdapter(LeverageConfig.SUPPORTED_LEVERAGES.map { "${it}x" }); setPopupBackgroundDrawable(rounded(inputBg, 10)); setBackgroundColor(inputBg); setSelection(LeverageConfig.SUPPORTED_LEVERAGES.indexOf(eff.leverage).coerceAtLeast(0)) }
-            f.addView(levSpin, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = dp(8) })
-            f.addView(text("Derived (read-only) at ${eff.leverage}x: Stop Loss ${if (eff.stopLossEnabled) "-" + fmtNum(eff.stopLossRoi) + "% ROI" else "Disabled"} | Averaging trigger ${fmtNum(eff.averagingTriggerRoi)}% ROI | Opposite trigger ${fmtNum(eff.oppositeTriggerRoi)}% ROI | Re-entry ${fmtNum(reRoi)}% ROI", 12f, yellow))
+            tile("Stop Loss (per cycle)", false, SettingKeys.STOP_LOSS_ENABLED, listOf(SettingKeys.STOP_LOSS_ENABLED, SettingKeys.STOP_LOSS_ROI),
+                "One Stop Loss per whole cycle, as Position ROI (leverage included). Hit = all remaining quantity closed and that cycle's pending orders cancelled. Disabled = no Stop Loss at all. Enter a positive number (80 = -80% ROI).",
+                { big, cap -> big.text = if (boolOf(SettingKeys.STOP_LOSS_ENABLED)) "-${f(numOf(SettingKeys.STOP_LOSS_ROI))}%" else "OFF"; cap.text = "Cycle Stop Loss ROI" }
+            ) { ed -> num(ed, "Stop Loss ROI (%) — default 80", SettingKeys.STOP_LOSS_ROI) }
+
+            tile("Trailing Stop (ROI)", false, SettingKeys.TRAILING_ENABLED, listOf(SettingKeys.TRAILING_ENABLED, SettingKeys.TRAILING_ACTIVATION_ROI, SettingKeys.TRAILING_CALLBACK_ROI),
+                "Activation and callback are ROI percentages (not price percentages). The only profit exit; there is no fixed Take Profit.",
+                { big, cap -> big.text = "${f(numOf(SettingKeys.TRAILING_ACTIVATION_ROI))}%  |  ${f(numOf(SettingKeys.TRAILING_CALLBACK_ROI))}%"; cap.text = "Activation  |  Callback ROI" }
+            ) { ed ->
+                num(ed, "Activation ROI (%)", SettingKeys.TRAILING_ACTIVATION_ROI)
+                num(ed, "Callback ROI (%)", SettingKeys.TRAILING_CALLBACK_ROI)
+            }
+
+            tile("Dual-Side Re-entry", false, SettingKeys.REENTRY_ENABLED, listOf(SettingKeys.REENTRY_ENABLED),
+                "After a profitable trailing-stop close, a LONG (below the close) and a SHORT (above the close) re-entry LIMIT are prepared. The two orders are independent: a fill starts a NEW cycle and does NOT cancel the other order, which stays pending until it fills or you cancel it manually (Open Orders → Cancel). Re-entry ROI = Activation ROI / 2 (automatic).",
+                { big, cap -> big.text = "${f(numOf(SettingKeys.TRAILING_ACTIVATION_ROI)?.div(2.0))}%"; cap.text = "Re-entry ROI (Activation / 2)" }
+            ) { _ -> }
+
+            tile("Averaging", false, SettingKeys.AVERAGING_ENABLED, listOf(SettingKeys.AVERAGING_ENABLED, SettingKeys.AVERAGING_MARGIN, SettingKeys.AVERAGING_TRIGGER_ROI),
+                "One averaging LIMIT per cycle, priced where Position ROI reaches the trigger (leverage included). Independent of Opposite-Side. Trigger is negative (default -60) and limited by the Stop Loss ROI.",
+                { big, cap -> big.text = "${f(numOf(SettingKeys.AVERAGING_MARGIN))} USDT  |  ${f(numOf(SettingKeys.AVERAGING_TRIGGER_ROI))}%"; cap.text = "Margin  |  Trigger ROI" }
+            ) { ed ->
+                num(ed, "Averaging margin (USDT)", SettingKeys.AVERAGING_MARGIN)
+                num(ed, "Averaging Trigger ROI (%) — negative, default -60", SettingKeys.AVERAGING_TRIGGER_ROI, signed = true)
+            }
+
+            tile("Opposite-Side", true, SettingKeys.OPPOSITE_ENABLED, listOf(SettingKeys.OPPOSITE_ENABLED, SettingKeys.OPPOSITE_MARGIN, SettingKeys.OPPOSITE_TRIGGER_ROI, SettingKeys.OPPOSITE_CALLBACK_ROI),
+                "Activates when the position's ROI reaches the trigger, then trails the adverse move; when price reverses by the callback ROI, a LIMIT entry opens a separate opposite cycle (own margin, leverage, Stop Loss and trailing). Only if no opposite-direction cycle is open. Controlled only by this toggle; independent of Averaging.",
+                { big, cap -> big.text = "${f(numOf(SettingKeys.OPPOSITE_MARGIN))} USDT  |  ${f(numOf(SettingKeys.OPPOSITE_TRIGGER_ROI))}% / ${f(numOf(SettingKeys.OPPOSITE_CALLBACK_ROI))}%"; cap.text = "Margin  |  Trigger / Callback ROI" }
+            ) { ed ->
+                num(ed, "Opposite-side margin (USDT)", SettingKeys.OPPOSITE_MARGIN)
+                num(ed, "Opposite-Side Trigger ROI (%) — negative, default -50 (activation)", SettingKeys.OPPOSITE_TRIGGER_ROI, signed = true)
+                num(ed, "Opposite-Side Callback ROI (%) — reversal confirmation, default 5", SettingKeys.OPPOSITE_CALLBACK_ROI)
+            }
+
+            refreshAll = {
+                tiles.forEach { it.refresh() }
+                val slTxt = if (boolOf(SettingKeys.STOP_LOSS_ENABLED)) "-${f(numOf(SettingKeys.STOP_LOSS_ROI))}%" else "Disabled"
+                derivedTv.text = "Derived at ${levNow()}x: Stop Loss $slTxt | Averaging ${f(numOf(SettingKeys.AVERAGING_TRIGGER_ROI))}% | Opposite ${f(numOf(SettingKeys.OPPOSITE_TRIGGER_ROI))}% | Re-entry ${f(numOf(SettingKeys.TRAILING_ACTIVATION_ROI)?.div(2.0))}%"
+            }
+            refreshAll()
+            relayout()
+            formBox.addView(grid)
+            addSpace(formBox, 10)
 
             val msg = text("", 12f, muted)
             val saveCard = column(); formBox.addView(saveCard)
@@ -1044,12 +1151,18 @@ class MainActivity : AppCompatActivity() {
 
         // ---- Saved Coin Settings (very bottom, below SAVE SETTINGS) ----
         val savedBox = column()
+        var savedOpen = false
         fun renderSavedImpl() {
             lifecycleScope.launch {
                 val symbols = LocalCoinSettingsStore.customSymbols(this@MainActivity)
                 val locks = symbols.associateWith { runCatching { engine().symbolLockReason(it) }.getOrNull() }
                 savedBox.removeAllViews()
-                savedBox.addView(text("Saved Coin Settings", 18f, white, true))
+                val savedHead = row().apply { background = rounded(card, 14); setPadding(dp(14), dp(12), dp(14), dp(12)) }
+                savedHead.addView(text("Saved Coin Settings (${symbols.size})", 15f, white, true), LinearLayout.LayoutParams(0, -2, 1f))
+                savedHead.addView(text(if (savedOpen) "▴" else "▾", 15f, muted, true))
+                savedHead.setOnClickListener { savedOpen = !savedOpen; renderSavedRef() }
+                savedBox.addView(savedHead, LinearLayout.LayoutParams(-1, -2))
+                if (!savedOpen) return@launch
                 addSpace(savedBox, 4)
                 if (symbols.isEmpty()) { savedBox.addView(text("No symbol has custom settings yet. Type a symbol above and press SAVE SETTINGS to create one.", 12f, muted)); return@launch }
                 for (sym in symbols) {
@@ -1100,7 +1213,7 @@ class MainActivity : AppCompatActivity() {
             }
         }
         renderSavedRef = { renderSavedImpl() }
-        addActionButton(scopeCard, "LOAD SETTINGS FOR THIS SCOPE") { renderForm() }
+        loadBtn.setOnClickListener { renderForm() }
         root.addView(formBox)
         addSpace(root, 16)
         root.addView(savedBox)

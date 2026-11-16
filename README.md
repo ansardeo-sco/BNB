@@ -74,3 +74,6 @@ All windows are anchored to the Binance server time (`/fapi/v1/time`); an incomp
 
 ## Testing status
 Unit tests (plain JVM) cover the ROI maths, opposite-side trigger, statistics windows, Mark/Last mapping, settings, migrations SQL and the monitor start/stop logic. The Foreground Service itself, notifications, Room migrations on real data and the UI have **not** been runtime-tested on a device or emulator. A successful GitHub Actions build proves compilation and the unit tests only.
+
+## Settings Dashboard layout
+Compact tiles instead of long forms: Default Trading Settings (full width), Stop Loss | Trailing Stop, Re-entry | Averaging, Opposite-Side (full width). Each tile shows its Enable switch and a live summary of the key values (dimmed when disabled; ● = custom value for the selected symbol). Tapping a tile expands its editor inline (the tile becomes full width), with the explanatory text, the per-field source tag ([Global]/[Custom]) and RESET. Values keep their content when a tile is collapsed. Saved Coin Settings is a collapsed list at the bottom. All rules (validation, lock, snapshots, delete confirmation) are unchanged.
