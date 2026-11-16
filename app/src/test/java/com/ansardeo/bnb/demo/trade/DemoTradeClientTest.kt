@@ -114,14 +114,21 @@ class DemoTradeClientTest {
     }
 
     @Test fun exchangeInfoRetriesOnceAfterANetworkFailure() = runBlocking {
-        var n = 0
-        server.dispatcher = object : Dispatcher() {
-            override fun dispatch(request: RecordedRequest): MockResponse { seen.add(request); return if (n++ == 0) MockResponse().setSocketPolicy(okhttp3.mockwebserver.SocketPolicy.DISCONNECT_AFTER_REQUEST) else MockResponse().setBody("""{"symbols":[]}""") }
-        }
-        // OkHttp's own silent connection retry is switched off so the test sees exactly the client's one explicit retry.
-        val noSilentRetry = DemoTradeClient(OkHttpClient.Builder().retryOnConnectionFailure(false).build(), server.url("/"), { System.currentTimeMillis() })
-        val r = noSilentRetry.exchangeInfo("BTCUSDT")
-        assertTrue(r.describe(), r.ok); assertEquals(2, seen.size)
+        // Deterministic network failure: an interceptor throws on the first attempt only (independent of MockWebServer socket policies).
+        var attempts = 0
+        val flaky = OkHttpClient.Builder().addInterceptor { chain ->
+            if (attempts++ == 0) throw java.io.IOException("simulated network failure")
+            chain.proceed(chain.request())
+        }.build()
+        val r = DemoTradeClient(flaky, server.url("/"), { System.currentTimeMillis() }).exchangeInfo("BTCUSDT")
+        assertEquals(2, attempts); assertTrue(r.describe(), r.ok); assertEquals(1, seen.size)
+    }
+
+    @Test fun exchangeInfoRetriesAtMostOnce() = runBlocking {
+        var attempts = 0
+        val down = OkHttpClient.Builder().addInterceptor { _ -> attempts++; throw java.io.IOException("simulated network failure") }.build()
+        val r = DemoTradeClient(down, server.url("/"), { System.currentTimeMillis() }).exchangeInfo("BTCUSDT")
+        assertFalse(r.ok); assertEquals(2, attempts); assertTrue(seen.isEmpty())
     }
 
     @Test fun exchangeInfoWithLongTimeoutsStillCannotReachANonDemoHost() = runBlocking {
