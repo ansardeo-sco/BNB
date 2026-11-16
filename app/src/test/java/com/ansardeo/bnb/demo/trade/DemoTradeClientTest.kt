@@ -116,10 +116,12 @@ class DemoTradeClientTest {
     @Test fun exchangeInfoRetriesOnceAfterANetworkFailure() = runBlocking {
         var n = 0
         server.dispatcher = object : Dispatcher() {
-            override fun dispatch(request: RecordedRequest): MockResponse { seen.add(request); return if (n++ == 0) MockResponse().setSocketPolicy(okhttp3.mockwebserver.SocketPolicy.DISCONNECT_AT_START) else MockResponse().setBody("""{"symbols":[]}""") }
+            override fun dispatch(request: RecordedRequest): MockResponse { seen.add(request); return if (n++ == 0) MockResponse().setSocketPolicy(okhttp3.mockwebserver.SocketPolicy.DISCONNECT_AFTER_REQUEST) else MockResponse().setBody("""{"symbols":[]}""") }
         }
-        val r = api().exchangeInfo("BTCUSDT")
-        assertTrue(r.ok); assertEquals(2, seen.size)
+        // OkHttp's own silent connection retry is switched off so the test sees exactly the client's one explicit retry.
+        val noSilentRetry = DemoTradeClient(OkHttpClient.Builder().retryOnConnectionFailure(false).build(), server.url("/"), { System.currentTimeMillis() })
+        val r = noSilentRetry.exchangeInfo("BTCUSDT")
+        assertTrue(r.describe(), r.ok); assertEquals(2, seen.size)
     }
 
     @Test fun exchangeInfoWithLongTimeoutsStillCannotReachANonDemoHost() = runBlocking {
