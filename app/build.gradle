@@ -40,6 +40,21 @@ android {
     kotlinOptions {
         jvmTarget = '17'
     }
+
+    // Stage 1 (characterization): the Robolectric engine tests live in src/engineTest and are compiled/run ONLY when the Gradle
+    // property -PengineTests is given, so the normal build and the existing unit tests are exactly as before.
+    sourceSets {
+        test {
+            if (project.hasProperty('engineTests')) {
+                java.srcDir 'src/engineTest/java'
+            }
+        }
+    }
+    testOptions {
+        unitTests {
+            includeAndroidResources = project.hasProperty('engineTests')
+        }
+    }
 }
 
 // Room schema export: needed so future database migrations can be verified (no silent data loss from v3 on).
@@ -71,4 +86,9 @@ dependencies {
     testImplementation 'junit:junit:4.13.2'
     // Real org.json for plain-JVM unit tests (the android.jar stub throws "not mocked").
     testImplementation 'org.json:json:20231013'
+    testImplementation 'com.squareup.okhttp3:mockwebserver:4.12.0'
+    if (project.hasProperty('engineTests')) {
+        testImplementation 'org.robolectric:robolectric:4.11.1'
+        testImplementation 'androidx.test:core:1.5.0'
+    }
 }
