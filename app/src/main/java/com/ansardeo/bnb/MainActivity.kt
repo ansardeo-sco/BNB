@@ -19,6 +19,13 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import com.ansardeo.bnb.BuildConfig
 import com.ansardeo.bnb.data.*
+import com.ansardeo.bnb.demo.BinanceDemoApi
+import com.ansardeo.bnb.demo.CredentialState
+import com.ansardeo.bnb.demo.DemoConnectionStatusStore
+import com.ansardeo.bnb.demo.DemoCredentialStore
+import com.ansardeo.bnb.demo.trade.DemoCompatibilityProbe
+import com.ansardeo.bnb.demo.trade.DemoProbeStore
+import com.ansardeo.bnb.demo.trade.DemoTradeClient
 import com.ansardeo.bnb.paper.PaperEngine
 import com.ansardeo.bnb.paper.PaperEngineProvider
 import com.ansardeo.bnb.paper.TradingControlStore
@@ -1246,6 +1253,9 @@ class MainActivity : AppCompatActivity() {
         addLabel(info, "Bot", if (paused) "PAUSED" else "Running", if (paused) yellow else green)
         addLabel(info, "Market data", "Binance public USDⓈ-M endpoints (read-only)", muted)
 
+        addDemoApiCard(root)
+        addDemoProbeCard(root)
+
         val mon = addCard(root, "BACKGROUND MONITORING (FOREGROUND SERVICE)")
         mon.addView(Switch(this).apply {
             text = "Keep monitoring when the screen is off or the app is closed"; isChecked = TradingControlStore.isMonitoringEnabled(this@MainActivity); setTextColor(white)
@@ -1312,6 +1322,131 @@ class MainActivity : AppCompatActivity() {
             val tf = java.text.SimpleDateFormat("MM-dd HH:mm:ss", Locale.US)
             ev.forEach { logs.addView(text("${tf.format(java.util.Date(it.createdAt))}  ${it.type}  ${it.message}", 11f, muted)); addSpace(logs, 4) }
         }
+    }
+
+    // ---------------- Binance Demo API configuration (Stage 2: credentials + read-only connection test; NO orders) ----------------
+    private fun addDemoApiCard(root: LinearLayout) {
+        val card = addCard(root, "BINANCE DEMO API (USDⓈ-M FUTURES — DEMO ONLY)",
+            "Demo environment only (demo-fapi.binance.com). Live keys are never accepted or used. This screen only stores your Demo keys and tests the connection with read-only requests: it places NO orders.")
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        card.addView(box)
+        val repo = DemoCredentialStore.repository(this)
+        val fmt = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
+
+        fun refresh() {
+            box.removeAllViews()
+            when (val st = repo.state()) {
+                is CredentialState.None -> addLabel(box, "Keys", "Not saved", lockedColor)
+                is CredentialState.Saved -> addLabel(box, "API Key", st.maskedKey + "  (Secret hidden)", green)
+                is CredentialState.Unreadable -> addLabel(box, "Keys", "Stored keys cannot be read — please Replace them", red)
+            }
+            val last = DemoConnectionStatusStore.load(this)
+            if (last == null) addLabel(box, "Connection", "Not tested", muted)
+            else {
+                addLabel(box, "Connection", (if (last.ok) "CONNECTED" else "FAILED") + "  ·  " + fmt.format(Date(last.atMillis)), if (last.ok) green else red)
+                box.addView(text(last.summary, 12f, if (last.ok) white else red))
+                last.steps.forEach { box.addView(text(it, 11f, muted)) }
+            }
+        }
+
+        fun showKeyDialog() {
+            val form = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(20), dp(8), dp(20), 0) }
+            val keyField = EditText(this).apply {
+                hint = "Demo API Key"; inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+                setSingleLine(true); setTextColor(white); setHintTextColor(muted)
+            }
+            val secretField = EditText(this).apply {
+                hint = "Demo Secret Key"; inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD
+                setSingleLine(true); setTextColor(white); setHintTextColor(muted)
+            }
+            if (android.os.Build.VERSION.SDK_INT >= 26) {
+                keyField.importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO
+                secretField.importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO
+            }
+            form.addView(keyField); form.addView(secretField)
+            val dialog = AlertDialog.Builder(this).setTitle(if (repo.hasCredentials()) "Replace Demo API keys" else "Save Demo API keys")
+                .setMessage("Paste the keys created in Binance DEMO Trading (not Live). They are encrypted with the Android Keystore on this device.")
+                .setView(form)
+                .setPositiveButton("SAVE", null)
+                .setNegativeButton("CANCEL", null).create()
+            dialog.window?.addFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE) // no screenshots / recents preview of the keys
+            dialog.setOnShowListener {
+                dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                    val err = repo.save(keyField.text.toString(), secretField.text.toString())
+                    if (err != null) { toast(err); return@setOnClickListener }
+                    keyField.setText(""); secretField.setText("")
+                    DemoConnectionStatusStore.clear(this) // a new key has not been tested yet
+                    toast("Demo keys saved securely."); dialog.dismiss(); refresh()
+                }
+            }
+            dialog.show()
+        }
+
+        addButton(card, "SAVE / REPLACE KEYS", inputBg).setOnClickListener { showKeyDialog() }
+        val testBtn = addButton(card, "TEST CONNECTION (read-only)", yellow)
+        testBtn.setOnClickListener {
+            val creds = repo.load()
+            if (creds == null) { toast(if (repo.hasCredentials()) "Stored keys cannot be read. Replace them." else "Save your Demo keys first."); return@setOnClickListener }
+            testBtn.isEnabled = false; testBtn.text = "Testing…"
+            lifecycleScope.launch {
+                val report = BinanceDemoApi.create().testConnection(creds.apiKey, creds.secret)
+                DemoConnectionStatusStore.save(this@MainActivity, report)
+                testBtn.isEnabled = true; testBtn.text = "TEST CONNECTION (read-only)"
+                refresh(); toast(if (report.ok) "Connected to Binance Demo" else "Connection failed")
+            }
+        }
+        addButton(card, "DELETE KEYS", 0xFF5A1E1E.toInt()).setOnClickListener {
+            if (!repo.hasCredentials()) { toast("No keys are saved."); return@setOnClickListener }
+            AlertDialog.Builder(this).setTitle("Delete Demo API keys?")
+                .setMessage("The saved keys and the encryption key are removed from this device. Nothing else (positions, settings, history) is changed.")
+                .setPositiveButton("DELETE") { _, _ -> repo.delete(); DemoConnectionStatusStore.clear(this); toast("Demo keys deleted."); refresh() }
+                .setNegativeButton("CANCEL", null).show()
+        }
+        refresh()
+    }
+
+    // ---------------- Binance Demo Compatibility Probe (Phase 3A step 2: tiny Demo orders that are always cancelled; opens NO position) ----------------
+    private fun addDemoProbeCard(root: LinearLayout) {
+        val card = addCard(root, "BINANCE DEMO COMPATIBILITY PROBE",
+            "Checks, on Binance DEMO only, that LIMIT orders and an exchange-side Stop Loss can be placed, verified and cancelled. It places a far-away LIMIT order and a far-away Stop Loss order (BTCUSDT), cancels both, and opens NO position. It changes no account setting. Trading stays on Virtual.")
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        card.addView(box)
+        val repo = DemoCredentialStore.repository(this)
+        val fmt = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
+        fun refresh() {
+            box.removeAllViews()
+            val t = DemoProbeStore.text(this)
+            if (t == null) addLabel(box, "Probe", "Not run", muted)
+            else {
+                val ok = DemoProbeStore.stopLossSupported(this)
+                addLabel(box, "Last probe", (if (ok) "PASSED" else "NOT PASSED") + "  ·  " + fmt.format(Date(DemoProbeStore.at(this))), if (ok) green else red)
+                t.lines().forEach { if (it.isNotBlank()) box.addView(text(it, 11f, muted)) }
+            }
+        }
+        val runBtn = addButton(card, "RUN PROBE (Demo, cancels its own orders)", yellow)
+        runBtn.setOnClickListener {
+            val creds = repo.load()
+            if (creds == null) { toast(if (repo.hasCredentials()) "Stored keys cannot be read. Replace them." else "Save your Demo keys first."); return@setOnClickListener }
+            AlertDialog.Builder(this).setTitle("Run Demo probe?")
+                .setMessage("This sends two tiny test orders to Binance DEMO (BTCUSDT), far from the market, and cancels them. No position is opened and no setting is changed.")
+                .setPositiveButton("RUN") { _, _ ->
+                    runBtn.isEnabled = false
+                    lifecycleScope.launch {
+                        val report = DemoCompatibilityProbe(DemoTradeClient.create()).run(creds) { msg -> runBtn.text = msg }
+                        DemoProbeStore.save(this@MainActivity, report)
+                        runBtn.isEnabled = true; runBtn.text = "RUN PROBE (Demo, cancels its own orders)"
+                        refresh(); toast(if (report.stopLossSupported && report.cleanupOk) "Probe passed" else "Probe finished — see report")
+                    }
+                }
+                .setNegativeButton("CANCEL", null).show()
+        }
+        addButton(card, "COPY REPORT", inputBg).setOnClickListener {
+            val t = DemoProbeStore.text(this)
+            if (t == null) { toast("Run the probe first."); return@setOnClickListener }
+            (getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager).setPrimaryClip(android.content.ClipData.newPlainText("BNB probe report", t))
+            toast("Report copied")
+        }
+        refresh()
     }
 
     // ---------------- helpers ----------------
