@@ -82,8 +82,6 @@ data class LocalCoinSettings(
         require(RoiMath.isValidLossTrigger(oppositeTriggerRoi, limit)) { "Opposite-Side Trigger ROI must be between -${limit.toInt()}% and 0% (the Stop Loss is at -${limit.toInt()}%)" }
     }
 
-    /** Re-entry ROI is calculated automatically: Trailing Activation ROI / 2. */
-    val reentryRoi: Double get() = trailingActivationRoi / 2.0
 
     companion object {
         const val DEFAULT_ACTIVATION_ROI = 33.0

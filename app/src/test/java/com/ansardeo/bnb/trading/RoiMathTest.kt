@@ -34,8 +34,6 @@ class RoiMathTest {
     }
 
     // ---- Re-entry ----
-    @Test fun activation24GivesReentryRoi12() { assertNum("12", RoiMath.reentryRoi(d("24"))) }
-    @Test fun defaultActivation33GivesReentryRoi16_5() { assertNum("16.5", RoiMath.reentryRoi(d("33"))) }
 
     @Test fun reentryLongBelowAndShortAboveClosePriceUsingLeverage() {
         // close 100, Re-entry ROI 12, leverage 10 -> 1.2% price distance (NOT 12%)

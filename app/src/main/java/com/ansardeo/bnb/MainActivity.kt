@@ -470,7 +470,7 @@ class MainActivity : AppCompatActivity() {
             addSummaryRow("Trailing ROI (activation / callback)", if (eff.trailingEnabled) "${eff.trailingActivationRoi} / ${eff.trailingCallbackRoi}" else "Disabled")
             addSummaryRow("Averaging trigger ROI", if (eff.averagingEnabled) "${fmtNum(eff.averagingTriggerRoi)}% (margin ${fmtNum(eff.averagingMargin)})" else "Disabled")
             addSummaryRow("Opposite-side trigger ROI / callback", if (eff.oppositeEnabled) "${fmtNum(eff.oppositeTriggerRoi)}% / ${fmtNum(eff.oppositeCallbackRoi)}% (margin ${fmtNum(eff.oppositeMargin)})" else "Disabled")
-            addSummaryRow("Re-entry ROI (Activation/2)", if (eff.reentryEnabled) "${fmtNum(eff.reentryRoi)}%" else "Disabled")
+            addSummaryRow("Re-entry ROI (of booked ROI)", if (eff.reentryEnabled) "50% same / 100% opposite" else "Disabled")
             addSummaryRow("Estimated Qty", if (qty != null) PriceFormatter.formatQty(qty) else "--")
             addSummaryRow("Long: Trailing activation / cycle SL", "${PriceFormatter.formatPrice(actLong)} / ${PriceFormatter.formatPrice(slLong)}", green)
             addSummaryRow("Short: Trailing activation / cycle SL", "${PriceFormatter.formatPrice(actShort)} / ${PriceFormatter.formatPrice(slShort)}", red)
@@ -647,10 +647,13 @@ class MainActivity : AppCompatActivity() {
                     val cycleById = cyclesAll.associateBy { it.id }
                     val openEntryOrders = allOrders.filter { it.orderType == "ENTRY_LIMIT" }
                     val protectiveOrders = allOrders.filter { it.orderType == "CYCLE_TRAILING" || it.orderType == "CYCLE_SL" || it.orderType == "OPPOSITE_TRAIL" }
-                    val reentries = dao.getPendingReentryPlans(sid).filter { it.status !in listOf("EXECUTED","CANCELLED","FAILED") }
+                    val reentries = dao.getPendingReentryPlans(sid).filter { it.status in listOf("WAITING","TRIGGERED") } // ORDER_PLACED plans are shown through their real entry order
                     val history = dao.getHistoryCloses(sid, 500)
                     // Conditional opposite triggers (awaiting averaging execution) - pending trigger, shown in Conditional
                     val conditionalOpposites = emptyList<PaperCycleEntity>() // opposite-side entries are ordinary pending entries (Basic) since they are placed right after the source fill
+                    val kindLabels = HashMap<String, String>()
+                    for (o in openEntryOrders) kindLabels["O${o.id}"] = engine().entryKindLabel(o)
+                    for (r in reentries) kindLabels["R${r.id}"] = engine().reentryKindLabel(r)
                     val basicCount = openEntryOrders.size + reentries.size
                     val conditionalCount = protectiveOrders.groupBy { it.cycleId }.size + conditionalOpposites.size
                     val activeIds = active.map { it.cycle.id }.toSet()
@@ -663,7 +666,7 @@ class MainActivity : AppCompatActivity() {
                     body.removeAllViews()
                     when (primaryTab) {
                         0 -> if (positionSub == 0) renderPositionsOpen(body, openPositions, prices, priceState) else renderPositionsClosed(body, history)
-                        1 -> if (orderSub == 0) renderOrdersBasic(body, openEntryOrders, reentries, prices, priceState) else renderOrdersConditional(body, protectiveOrders, conditionalOpposites, cycleById, prices, priceState)
+                        1 -> if (orderSub == 0) renderOrdersBasic(body, openEntryOrders, reentries, prices, priceState, kindLabels) else renderOrdersConditional(body, protectiveOrders, conditionalOpposites, cycleById, prices, priceState)
                         2 -> if (historySub == 0) renderHistoryOpen(body, openEvents) else renderHistoryPrimary(body, history)
                     }
                 } catch (e: Exception) {
@@ -762,21 +765,17 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun renderOrdersBasic(body: LinearLayout, entryOrders: List<PaperOrderEntity>, reentries: List<PaperReentryPlanEntity>, prices: Map<String, Ticker>, priceState: String) {
+    private fun renderOrdersBasic(body: LinearLayout, entryOrders: List<PaperOrderEntity>, reentries: List<PaperReentryPlanEntity>, prices: Map<String, Ticker>, priceState: String, kindLabels: Map<String, String>) {
         var any = false
         for (o in entryOrders.sortedByDescending { it.createdAt }) {
             any = true
             val box = makeItemCard(body)
-            val tag = when {
-                o.clientOrderId.contains("-avg-") || o.clientOrderId.startsWith("avg-") -> "Averaging"
-                o.clientOrderId.contains("-initial-") || o.clientOrderId.startsWith("init-") -> "Initial"
-                o.clientOrderId.contains("opp") -> "Opposite"
-                else -> "Entry"
-            }
+            val tag = kindLabels["O${o.id}"] ?: "Entry"
             val header = row()
             header.addView(text("${o.symbol} ${o.direction}", 15f, if (o.direction == "LONG") green else red, true), LinearLayout.LayoutParams(0, -2, 1f))
             header.addView(text(tag, 12f, yellow, true)); box.addView(header)
             addLabel(box, "Order Price", PriceFormatter.formatPrice(o.triggerPrice), white, true)
+            addLabel(box, "Type · Cycle", "LIMIT · cycle #${o.cycleId} · ${o.status}", white, true)
             addLabel(box, "Current Price", currentPriceText(prices, o.symbol, priceState), white, true)
             addCancelButton(box, "Cancel order") { engine().cancelEntryOrder(o.id) }
         }
@@ -785,8 +784,9 @@ class MainActivity : AppCompatActivity() {
             val box = makeItemCard(body)
             val header = row()
             header.addView(text("${r.symbol} ${r.direction}", 15f, if (r.direction == "LONG") green else red, true), LinearLayout.LayoutParams(0, -2, 1f))
-            header.addView(text("Re-entry", 12f, yellow, true)); box.addView(header)
+            header.addView(text(kindLabels["R${r.id}"] ?: "Re-entry", 12f, yellow, true)); box.addView(header)
             addLabel(box, "Order Price", PriceFormatter.formatPrice(r.triggerPrice), white, true)
+            addLabel(box, "Type · Cycle", "LIMIT · from cycle #${r.sourceCycleId} · ${r.status}", white, true)
             addLabel(box, "Current Price", currentPriceText(prices, r.symbol, priceState), white, true)
             addCancelButton(box, "Cancel re-entry") { engine().cancelReentryOrder(r.id) }
         }
@@ -1066,8 +1066,8 @@ class MainActivity : AppCompatActivity() {
             }
 
             tile("Dual-Side Re-entry", false, SettingKeys.REENTRY_ENABLED, listOf(SettingKeys.REENTRY_ENABLED),
-                "After a profitable trailing-stop close, a LONG (below the close) and a SHORT (above the close) re-entry LIMIT are prepared. The two orders are independent: a fill starts a NEW cycle and does NOT cancel the other order, which stays pending until it fills or you cancel it manually (Open Orders → Cancel). Re-entry ROI = Activation ROI / 2 (automatic).",
-                { big, cap -> big.text = "${f(numOf(SettingKeys.TRAILING_ACTIVATION_ROI)?.div(2.0))}%"; cap.text = "Re-entry ROI (Activation / 2)" }
+                "After a profitable trailing-stop close, a LONG (below the close) and a SHORT (above the close) re-entry LIMIT are prepared. The two orders are independent: a fill starts a NEW cycle and does NOT cancel the other order, which stays pending until it fills or you cancel it manually (Open Orders → Cancel). Re-entry ROI is automatic: Same-Side = 50% and Opposite-Side = 100% of the ACTUAL booked ROI of the closed cycle (leverage-aware). Only the best-priced pending entry per symbol+direction is kept (LONG lowest, SHORT highest).",
+                { big, cap -> big.text = "50% / 100%"; cap.text = "Same / Opposite of booked ROI" }
             ) { _ -> }
 
             tile("Averaging", false, SettingKeys.AVERAGING_ENABLED, listOf(SettingKeys.AVERAGING_ENABLED, SettingKeys.AVERAGING_MARGIN, SettingKeys.AVERAGING_TRIGGER_ROI),
@@ -1183,7 +1183,7 @@ class MainActivity : AppCompatActivity() {
                     addLabel(box, "Opposite-Side Margin", "${fmtNum(eff.oppositeMargin)} USDT${tag(SettingKeys.OPPOSITE_MARGIN)}")
                     addLabel(box, "Opposite-Side Trigger ROI", "${fmtNum(eff.oppositeTriggerRoi)}%${tag(SettingKeys.OPPOSITE_TRIGGER_ROI)}")
                     addLabel(box, "Trailing Stop", if (eff.trailingEnabled) "ON  (activation ${fmtNum(eff.trailingActivationRoi)}% / callback ${fmtNum(eff.trailingCallbackRoi)}% ROI)${tag(SettingKeys.TRAILING_ACTIVATION_ROI)}" else "OFF${tag(SettingKeys.TRAILING_ENABLED)}")
-                    addLabel(box, "Re-entry", onOff(eff.reentryEnabled) + " (ROI ${fmtNum(eff.reentryRoi)}% = Activation/2)" + tag(SettingKeys.REENTRY_ENABLED), if (eff.reentryEnabled) green else lockedColor)
+                    addLabel(box, "Re-entry", onOff(eff.reentryEnabled) + " (50% same / 100% opposite of booked ROI)" + tag(SettingKeys.REENTRY_ENABLED), if (eff.reentryEnabled) green else lockedColor)
                     addLabel(box, "Stop Loss", (if (eff.stopLossEnabled) "ON, -${fmtNum(eff.stopLossRoi)}% ROI" else "OFF") + tag(SettingKeys.STOP_LOSS_ENABLED), if (eff.stopLossEnabled) green else lockedColor)
                     addLabel(box, "Opposite Callback ROI", "${fmtNum(eff.oppositeCallbackRoi)}%${tag(SettingKeys.OPPOSITE_CALLBACK_ROI)}")
                     if (lock != null) { box.addView(text(lock, 12f, yellow, true)); addSpace(box, 4) }

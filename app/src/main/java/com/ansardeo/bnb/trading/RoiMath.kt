@@ -51,15 +51,9 @@ object RoiMath {
         }
     }
 
-    /** Re-entry ROI = Trailing Activation ROI / 2 (calculated automatically, never entered by hand). */
-    fun reentryRoi(activationRoi: BigDecimal): BigDecimal {
-        require(activationRoi.signum() > 0) { "Activation ROI must be greater than 0" }
-        return activationRoi.divide(TWO, MC)
-    }
-
     /**
      * Re-entry LIMIT price after a profitable cycle closed at [closePrice]:
-     * LONG entry BELOW the close, SHORT entry ABOVE the close, each at [reentryRoi] Position ROI distance.
+     * LONG entry BELOW the close, SHORT entry ABOVE the close, each at the given Position ROI distance (leverage included); see [ReentryFormula] for the ROI basis (actual booked ROI).
      */
     fun reentryPrice(newSide: TrailSide, closePrice: BigDecimal, leverage: Int, reentryRoi: BigDecimal): BigDecimal {
         require(closePrice.signum() > 0) { "Close price must be greater than 0" }

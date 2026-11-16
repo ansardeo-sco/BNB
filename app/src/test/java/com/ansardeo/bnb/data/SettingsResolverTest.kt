@@ -67,10 +67,6 @@ class SettingsResolverTest {
         try { LocalCoinSettings(symbol = "X", oppositeCallbackRoi = 0.0); fail() } catch (_: IllegalArgumentException) {}
     }
 
-    @Test fun reentryRoiIsHalfOfActivationRoi() {
-        assertEquals(12.0, LocalCoinSettings.sanitized("X", trailingActivationRoi = 24.0).reentryRoi, 1e-9)
-        assertEquals(16.5, LocalCoinSettings.sanitized("X").reentryRoi, 1e-9)
-    }
 
     @Test fun triggerDefaultsAreMinus60AndMinus50() {
         val s = LocalCoinSettings.sanitized("X")
