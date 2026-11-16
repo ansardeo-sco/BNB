@@ -175,12 +175,12 @@ class DemoCompatibilityProbe(private val api: DemoTradeClient, private val symbo
 
     private suspend fun cleanLeftovers(c: DemoCredentials) {
         val oo = api.openOrders(c, symbol)
-        if (oo.ok) forEachObj(oo.body) { o ->
-            if (o.optString("clientOrderId").startsWith(PREFIX)) { val r = api.cancelOrder(c, symbol, o.getLong("orderId")); step("Leftover probe order cancelled", r.ok, if (r.ok) "ok" else r.describe()) }
+        if (oo.ok) for (id in probeIds(oo.body, "orderId", "clientOrderId")) {
+            val r = api.cancelOrder(c, symbol, id); step("Leftover probe order cancelled", r.ok, if (r.ok) "ok" else r.describe())
         }
         val ao = api.openAlgoOrders(c, symbol)
-        if (ao.ok) forEachObj(ao.body) { o ->
-            if (o.optString("clientAlgoId").startsWith(PREFIX)) { val r = api.cancelAlgo(c, o.getLong("algoId")); step("Leftover probe Stop Loss cancelled", r.ok, if (r.ok) "ok" else r.describe()) }
+        if (ao.ok) for (id in probeIds(ao.body, "algoId", "clientAlgoId")) {
+            val r = api.cancelAlgo(c, id); step("Leftover probe Stop Loss cancelled", r.ok, if (r.ok) "ok" else r.describe())
         }
     }
 
@@ -192,12 +192,12 @@ class DemoCompatibilityProbe(private val api: DemoTradeClient, private val symbo
             algoId?.let { api.cancelAlgo(c, it) }
             var clean = true
             val oo = api.openOrders(c, symbol)
-            if (!oo.ok) clean = false else forEachObj(oo.body) { o ->
-                if (o.optString("clientOrderId").startsWith(PREFIX)) { val r = api.cancelOrder(c, symbol, o.getLong("orderId")); if (!r.ok) clean = false }
+            if (!oo.ok) clean = false else for (id in probeIds(oo.body, "orderId", "clientOrderId")) {
+                if (!api.cancelOrder(c, symbol, id).ok) clean = false
             }
             val ao = api.openAlgoOrders(c, symbol)
-            if (!ao.ok) clean = false else forEachObj(ao.body) { o ->
-                if (o.optString("clientAlgoId").startsWith(PREFIX)) { val r = api.cancelAlgo(c, o.getLong("algoId")); if (!r.ok) clean = false }
+            if (!ao.ok) clean = false else for (id in probeIds(ao.body, "algoId", "clientAlgoId")) {
+                if (!api.cancelAlgo(c, id).ok) clean = false
             }
             // verify
             val oo2 = api.openOrders(c, symbol); val ao2 = api.openAlgoOrders(c, symbol)
@@ -222,6 +222,12 @@ class DemoCompatibilityProbe(private val api: DemoTradeClient, private val symbo
         if (t.startsWith("[")) JSONArray(t) else JSONObject(t).let { o -> o.optJSONArray("orders") ?: o.optJSONArray("data") ?: o.optJSONArray("algoOrders") }
     }.getOrNull()
     private fun forEachObj(body: String, f: (JSONObject) -> Unit) { val a = arrayOf(body) ?: return; for (i in 0 until a.length()) a.optJSONObject(i)?.let(f) }
+    /** Ids of open orders whose client id carries the probe prefix (plain, non-suspend: the cancel calls are made by the caller's loop). */
+    private fun probeIds(body: String, idKey: String, cidKey: String): List<Long> {
+        val out = ArrayList<Long>()
+        forEachObj(body) { if (it.optString(cidKey).startsWith(PREFIX) && it.has(idKey)) out += it.getLong(idKey) }
+        return out
+    }
     private fun containsId(body: String, key: String, id: Long): Boolean { var found = false; forEachObj(body) { if (it.optLong(key, -1) == id) found = true }; return found }
     private fun usdtBalance(body: String): String {
         var out = "USDT not listed"
