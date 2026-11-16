@@ -112,4 +112,19 @@ class DemoTradeClientTest {
         val r = prodLike.balance(creds)
         assertFalse(r.ok); assertEquals(-1, r.httpCode); assertTrue(seen.isEmpty())
     }
+
+    @Test fun exchangeInfoRetriesOnceAfterANetworkFailure() = runBlocking {
+        var n = 0
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse { seen.add(request); return if (n++ == 0) MockResponse().setSocketPolicy(okhttp3.mockwebserver.SocketPolicy.DISCONNECT_AT_START) else MockResponse().setBody("""{"symbols":[]}""") }
+        }
+        val r = api().exchangeInfo("BTCUSDT")
+        assertTrue(r.ok); assertEquals(2, seen.size)
+    }
+
+    @Test fun exchangeInfoWithLongTimeoutsStillCannotReachANonDemoHost() = runBlocking {
+        val prodLike = DemoTradeClient(DemoHttp.newClient(), server.url("/"), { System.currentTimeMillis() })
+        val r = prodLike.exchangeInfo("BTCUSDT")
+        assertFalse(r.ok); assertEquals(-1, r.httpCode); assertTrue(seen.isEmpty())
+    }
 }

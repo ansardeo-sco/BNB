@@ -47,7 +47,7 @@ class DemoTradeClient internal constructor(
 
     @Volatile private var skewMs: Long = 0L
 
-    private suspend fun call(ep: Endpoint, params: List<Pair<String, String>>, creds: DemoCredentials?): TradeResponse = withContext(Dispatchers.IO) {
+    private suspend fun call(ep: Endpoint, params: List<Pair<String, String>>, creds: DemoCredentials?, slow: Boolean = false): TradeResponse = withContext(Dispatchers.IO) {
         require(ep.signed == (creds != null)) { "Endpoint ${ep.name} signed=${ep.signed}" }
         val secrets = creds?.let { listOf(it.apiKey, it.secret) } ?: emptyList()
         try {
@@ -62,7 +62,9 @@ class DemoTradeClient internal constructor(
                 HttpVerb.POST -> b.post(ByteArray(0).toRequestBody(null))
                 HttpVerb.DELETE -> b.delete()
             }
-            client.newCall(b.build()).execute().use { r -> TradeResponse(r.code, r.body?.string().orEmpty(), null, secrets) }
+            // newBuilder() keeps both host-guard interceptors and the no-redirect settings; only the timeouts are longer.
+            val http = if (slow) client.newBuilder().readTimeout(60, java.util.concurrent.TimeUnit.SECONDS).callTimeout(90, java.util.concurrent.TimeUnit.SECONDS).build() else client
+            http.newCall(b.build()).execute().use { r -> TradeResponse(r.code, r.body?.string().orEmpty(), null, secrets) }
         } catch (e: DemoHostViolation) {
             TradeResponse(-1, "", e, secrets)
         } catch (e: IOException) {
@@ -78,7 +80,11 @@ class DemoTradeClient internal constructor(
         return r
     }
     val clockSkewMs: Long get() = skewMs
-    suspend fun exchangeInfo(symbol: String) = call(Endpoint.EXCHANGE_INFO, listOf("symbol" to symbol), null)
+    /** The exchange-info answer covers every symbol (large), so it gets longer timeouts and one retry after a network failure. */
+    suspend fun exchangeInfo(symbol: String): TradeResponse {
+        val first = call(Endpoint.EXCHANGE_INFO, listOf("symbol" to symbol), null, slow = true)
+        return if (first.error != null && first.error !is DemoHostViolation) call(Endpoint.EXCHANGE_INFO, listOf("symbol" to symbol), null, slow = true) else first
+    }
     suspend fun markPrice(symbol: String) = call(Endpoint.MARK_PRICE, listOf("symbol" to symbol), null)
 
     // ---- account (read-only) ----
