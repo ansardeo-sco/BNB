@@ -79,3 +79,20 @@ Unit tests (plain JVM) cover the ROI maths, opposite-side trigger, statistics wi
 
 ## Settings Dashboard layout
 Compact tiles instead of long forms: Default Trading Settings (full width), Stop Loss | Trailing Stop, Re-entry | Averaging, Opposite-Side (full width). Each tile shows its Enable switch and a live summary of the key values (dimmed when disabled; ● = custom value for the selected symbol). Tapping a tile expands its editor inline (the tile becomes full width), with the explanatory text, the per-field source tag ([Global]/[Custom]) and RESET. Values keep their content when a tile is collapsed. Saved Coin Settings is a collapsed list at the bottom. All rules (validation, lock, snapshots, delete confirmation) are unchanged.
+
+## Stage 1 — characterization tests (no behaviour change)
+`app/src/engineTest/java/.../paper/engine/EngineCharacterizationTest.kt` records how the CURRENT Stage 1 (virtual) `PaperEngine` behaves (Robolectric + in-memory Room): placement/cancel, Last-vs-Mark fills, fill → trailing/SL/averaging orders, averaging WAP, trailing exit + booked-ROI re-entry plans (same 50 % / opposite 100 %), independent re-entry fills, cycle Stop Loss (current behaviour, to be replaced by per-entry SL in a later approved stage), opposite-side trigger, global entry price priority, pause, Stage 2/3 blocked.
+These tests are compiled/run only with `-PengineTests` (so the normal build is untouched):
+`gradle testDebugUnitTest -PengineTests --tests 'com.ansardeo.bnb.paper.engine.*'` — the CI workflow runs this as a separate, informational step. Expected values were derived by hand and have NOT been executed yet (no build tooling in the authoring environment); the first CI run is the real verification.
+
+## Stage 2 — Binance Demo API configuration (More tab) — NO orders
+- **More → "BINANCE DEMO API"**: Save / Replace keys, Test connection (read-only), Delete keys, status + step-by-step result.
+- **Storage**: API Key and Secret are AES-256-GCM encrypted with a non-exportable Android Keystore key; only a masked hint (first 4 / last 4) is readable. The secret is never shown, logged or returned to the UI; the key dialog blocks screenshots (FLAG_SECURE). Delete removes the data and the Keystore key. `allowBackup=false`.
+- **Demo only**: `demo/DemoHost.kt` allows only `demo-fapi.binance.com` / `demo-fstream.binance.com` (https, port 443, no user-info) in an OkHttp application AND network interceptor, redirects disabled. There is no setting for another host and no Live code. Static tests fail the build if the demo package references a Live/testnet host or any order/state-changing endpoint.
+- **Read-only test** (`BinanceDemoApi`): `GET /fapi/v1/time`, `GET /fapi/v2/balance` (signed), `GET /fapi/v1/positionSide/dual` (signed, informational). Timestamps are corrected by the measured clock skew. Nothing else is called; no orders, no leverage/margin/mode changes, no listen key.
+- Whether Binance Demo supports each of these endpoints is **not yet proven**; the Test Connection result on your phone is the first real evidence.
+
+## Phase 3A — Binance Demo execution (steps 1–2: Trade API foundation + Compatibility Probe)
+- `demo/trade/` : approved-endpoint catalog, Demo-only signed trade client (LIMIT/GTC and STOP_MARKET-on-mark only), exchange rules, Compatibility Probe.
+- More tab → "BINANCE DEMO COMPATIBILITY PROBE": places a far LIMIT order and a far Stop Loss order on Demo (BTCUSDT), cancels both, opens no position, changes no account setting, produces a copyable sanitized report.
+- Trading stays on Virtual. Strategy automation on Demo (Phase 3B) is not part of this step.
