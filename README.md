@@ -114,3 +114,6 @@ These tests are compiled/run only with `-PengineTests` (so the normal build is u
 - Positions tab gets a Virtual/Demo toggle (display only — it never changes what the Virtual engine does, and does not enable any Demo strategy automation). Demo view: open entries with CANCEL ORDER / CLOSE POSITION, closed history, and the event log.
 - `TradingModeStore` / `TradingModePrefs`: the Demo view is locked until Demo API keys are saved AND the Compatibility Probe passed (Stop Loss confirmed supported + cleaned up). Virtual stays the default and switching back to Virtual is always allowed.
 - Sync: the existing start/5s poll (`startDemoPoll`) already resolves unknown orders, tracks fills, places/verifies Stop Losses and checks for a lost Stop Loss; it runs again whenever the app is foregrounded (onStart), covering "sync on start/reconnect" for everything the app itself placed. A position opened directly on Binance (not through this app) is outside this app's tracking, as before.
+
+### Fix — cancel confirmation retried (Binance Demo real-device finding)
+Binance Demo can answer a Stop Loss / order cancel as accepted before its status actually flips; the Compatibility Probe and `closeEntryAtMarket` now re-check up to 4 times (short backoff) before concluding a cancel was not confirmed, instead of failing on the first stale read.

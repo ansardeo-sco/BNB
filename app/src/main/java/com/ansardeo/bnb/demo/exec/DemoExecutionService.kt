@@ -91,10 +91,15 @@ class DemoExecutionService(
             if (e.openQuantity.signum() <= 0) {
                 val algoId = e.slAlgoId
                 if (algoId != null && (e.slState == "VERIFIED")) {
-                    val cx = api.cancelAlgo(c, algoId)
-                    var gone = !cx.ok // if cancel itself failed, fall through to a direct check below
-                    val q = api.queryAlgo(c, algoId)
-                    if (q.ok) { val st = runCatching { JSONObject(q.body).getString("algoStatus") }.getOrNull(); gone = st != "NEW" && st != "WORKING" }
+                    api.cancelAlgo(c, algoId)
+                    // Binance Demo can answer "cancel accepted" before the status is actually updated: re-check a few times before giving up.
+                    var gone = false
+                    for (attempt in 1..4) {
+                        val q = api.queryAlgo(c, algoId)
+                        if (q.ok) gone = runCatching { JSONObject(q.body).getString("algoStatus") }.getOrNull().let { it != "NEW" && it != "WORKING" }
+                        if (gone) break
+                        if (attempt < 4) kotlinx.coroutines.delay(400L * attempt)
+                    }
                     e = save(e.copy(status = EntryStatus.CLOSED, slState = if (gone) "NONE" else e.slState, note = if (gone) "" else "Stop Loss cleanup not confirmed — check Binance Demo"))
                     ev("${e.id}: position closed; Stop Loss cleanup ${if (gone) "confirmed" else "NOT confirmed — check Binance Demo"}")
                 } else {
