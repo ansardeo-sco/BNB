@@ -19,6 +19,18 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import com.ansardeo.bnb.BuildConfig
 import com.ansardeo.bnb.data.*
+import com.ansardeo.bnb.demo.BinanceDemoApi
+import com.ansardeo.bnb.demo.CredentialState
+import com.ansardeo.bnb.demo.DemoConnectionStatusStore
+import com.ansardeo.bnb.demo.DemoCredentialStore
+import com.ansardeo.bnb.demo.exec.DemoEntry
+import com.ansardeo.bnb.demo.exec.DemoExecutionProvider
+import com.ansardeo.bnb.demo.exec.DemoExecutionService
+import com.ansardeo.bnb.demo.trade.DemoCompatibilityProbe
+import com.ansardeo.bnb.demo.trade.DemoProbeStore
+import com.ansardeo.bnb.demo.trade.DemoSymbolSetup
+import com.ansardeo.bnb.demo.trade.DemoSymbolSetupStore
+import com.ansardeo.bnb.demo.trade.DemoTradeClient
 import com.ansardeo.bnb.paper.PaperEngine
 import com.ansardeo.bnb.paper.PaperEngineProvider
 import com.ansardeo.bnb.paper.TradingControlStore
@@ -1246,6 +1258,11 @@ class MainActivity : AppCompatActivity() {
         addLabel(info, "Bot", if (paused) "PAUSED" else "Running", if (paused) yellow else green)
         addLabel(info, "Market data", "Binance public USDⓈ-M endpoints (read-only)", muted)
 
+        addDemoApiCard(root)
+        addDemoProbeCard(root)
+        addDemoSetupCard(root)
+        addDemoOrdersCard(root)
+
         val mon = addCard(root, "BACKGROUND MONITORING (FOREGROUND SERVICE)")
         mon.addView(Switch(this).apply {
             text = "Keep monitoring when the screen is off or the app is closed"; isChecked = TradingControlStore.isMonitoringEnabled(this@MainActivity); setTextColor(white)
@@ -1312,6 +1329,278 @@ class MainActivity : AppCompatActivity() {
             val tf = java.text.SimpleDateFormat("MM-dd HH:mm:ss", Locale.US)
             ev.forEach { logs.addView(text("${tf.format(java.util.Date(it.createdAt))}  ${it.type}  ${it.message}", 11f, muted)); addSpace(logs, 4) }
         }
+    }
+
+    // ---------------- Binance Demo API configuration (Stage 2: credentials + read-only connection test; NO orders) ----------------
+    private fun addDemoApiCard(root: LinearLayout) {
+        val card = addCard(root, "BINANCE DEMO API (USDⓈ-M FUTURES — DEMO ONLY)",
+            "Demo environment only (demo-fapi.binance.com). Live keys are never accepted or used. This screen only stores your Demo keys and tests the connection with read-only requests: it places NO orders.")
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        card.addView(box)
+        val repo = DemoCredentialStore.repository(this)
+        val fmt = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
+
+        fun refresh() {
+            box.removeAllViews()
+            when (val st = repo.state()) {
+                is CredentialState.None -> addLabel(box, "Keys", "Not saved", lockedColor)
+                is CredentialState.Saved -> addLabel(box, "API Key", st.maskedKey + "  (Secret hidden)", green)
+                is CredentialState.Unreadable -> addLabel(box, "Keys", "Stored keys cannot be read — please Replace them", red)
+            }
+            val last = DemoConnectionStatusStore.load(this)
+            if (last == null) addLabel(box, "Connection", "Not tested", muted)
+            else {
+                addLabel(box, "Connection", (if (last.ok) "CONNECTED" else "FAILED") + "  ·  " + fmt.format(Date(last.atMillis)), if (last.ok) green else red)
+                box.addView(text(last.summary, 12f, if (last.ok) white else red))
+                last.steps.forEach { box.addView(text(it, 11f, muted)) }
+            }
+        }
+
+        fun showKeyDialog() {
+            val form = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(20), dp(8), dp(20), 0) }
+            val keyField = EditText(this).apply {
+                hint = "Demo API Key"; inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+                setSingleLine(true); setTextColor(white); setHintTextColor(muted)
+            }
+            val secretField = EditText(this).apply {
+                hint = "Demo Secret Key"; inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD
+                setSingleLine(true); setTextColor(white); setHintTextColor(muted)
+            }
+            if (android.os.Build.VERSION.SDK_INT >= 26) {
+                keyField.importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO
+                secretField.importantForAutofill = View.IMPORTANT_FOR_AUTOFILL_NO
+            }
+            form.addView(keyField); form.addView(secretField)
+            val dialog = AlertDialog.Builder(this).setTitle(if (repo.hasCredentials()) "Replace Demo API keys" else "Save Demo API keys")
+                .setMessage("Paste the keys created in Binance DEMO Trading (not Live). They are encrypted with the Android Keystore on this device.")
+                .setView(form)
+                .setPositiveButton("SAVE", null)
+                .setNegativeButton("CANCEL", null).create()
+            dialog.window?.addFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE) // no screenshots / recents preview of the keys
+            dialog.setOnShowListener {
+                dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                    val err = repo.save(keyField.text.toString(), secretField.text.toString())
+                    if (err != null) { toast(err); return@setOnClickListener }
+                    keyField.setText(""); secretField.setText("")
+                    DemoConnectionStatusStore.clear(this) // a new key has not been tested yet
+                    toast("Demo keys saved securely."); dialog.dismiss(); refresh()
+                }
+            }
+            dialog.show()
+        }
+
+        addButton(card, "SAVE / REPLACE KEYS", inputBg).setOnClickListener { showKeyDialog() }
+        val testBtn = addButton(card, "TEST CONNECTION (read-only)", yellow)
+        testBtn.setOnClickListener {
+            val creds = repo.load()
+            if (creds == null) { toast(if (repo.hasCredentials()) "Stored keys cannot be read. Replace them." else "Save your Demo keys first."); return@setOnClickListener }
+            testBtn.isEnabled = false; testBtn.text = "Testing…"
+            lifecycleScope.launch {
+                val report = BinanceDemoApi.create().testConnection(creds.apiKey, creds.secret)
+                DemoConnectionStatusStore.save(this@MainActivity, report)
+                testBtn.isEnabled = true; testBtn.text = "TEST CONNECTION (read-only)"
+                refresh(); toast(if (report.ok) "Connected to Binance Demo" else "Connection failed")
+            }
+        }
+        addButton(card, "DELETE KEYS", 0xFF5A1E1E.toInt()).setOnClickListener {
+            if (!repo.hasCredentials()) { toast("No keys are saved."); return@setOnClickListener }
+            AlertDialog.Builder(this).setTitle("Delete Demo API keys?")
+                .setMessage("The saved keys and the encryption key are removed from this device. Nothing else (positions, settings, history) is changed.")
+                .setPositiveButton("DELETE") { _, _ -> repo.delete(); DemoConnectionStatusStore.clear(this); toast("Demo keys deleted."); refresh() }
+                .setNegativeButton("CANCEL", null).show()
+        }
+        refresh()
+    }
+
+    // ---------------- Binance Demo Compatibility Probe (Phase 3A step 2: tiny Demo orders that are always cancelled; opens NO position) ----------------
+    private fun addDemoProbeCard(root: LinearLayout) {
+        val card = addCard(root, "BINANCE DEMO COMPATIBILITY PROBE",
+            "Checks, on Binance DEMO only, that LIMIT orders and an exchange-side Stop Loss can be placed, verified and cancelled. It places a far-away LIMIT order and a far-away Stop Loss order (BTCUSDT), cancels both, and opens NO position. It changes no account setting. Trading stays on Virtual.")
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        card.addView(box)
+        val repo = DemoCredentialStore.repository(this)
+        val fmt = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
+        fun refresh() {
+            box.removeAllViews()
+            val t = DemoProbeStore.text(this)
+            if (t == null) addLabel(box, "Probe", "Not run", muted)
+            else {
+                val ok = DemoProbeStore.stopLossSupported(this)
+                addLabel(box, "Last probe", (if (ok) "PASSED" else "NOT PASSED") + "  ·  " + fmt.format(Date(DemoProbeStore.at(this))), if (ok) green else red)
+                t.lines().forEach { if (it.isNotBlank()) box.addView(text(it, 11f, muted)) }
+            }
+        }
+        val runBtn = addButton(card, "RUN PROBE (Demo, cancels its own orders)", yellow)
+        runBtn.setOnClickListener {
+            val creds = repo.load()
+            if (creds == null) { toast(if (repo.hasCredentials()) "Stored keys cannot be read. Replace them." else "Save your Demo keys first."); return@setOnClickListener }
+            AlertDialog.Builder(this).setTitle("Run Demo probe?")
+                .setMessage("This sends two tiny test orders to Binance DEMO (BTCUSDT), far from the market, and cancels them. No position is opened and no setting is changed.")
+                .setPositiveButton("RUN") { _, _ ->
+                    runBtn.isEnabled = false
+                    lifecycleScope.launch {
+                        val report = DemoCompatibilityProbe(DemoTradeClient.create()).run(creds) { msg -> runBtn.text = msg }
+                        DemoProbeStore.save(this@MainActivity, report)
+                        runBtn.isEnabled = true; runBtn.text = "RUN PROBE (Demo, cancels its own orders)"
+                        refresh(); toast(if (report.stopLossSupported && report.cleanupOk) "Probe passed" else "Probe finished — see report")
+                    }
+                }
+                .setNegativeButton("CANCEL", null).show()
+        }
+        addButton(card, "COPY REPORT", inputBg).setOnClickListener {
+            val t = DemoProbeStore.text(this)
+            if (t == null) { toast("Run the probe first."); return@setOnClickListener }
+            (getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager).setPrimaryClip(android.content.ClipData.newPlainText("BNB probe report", t))
+            toast("Report copied")
+        }
+        refresh()
+    }
+
+    // ---------------- Binance Demo Safety Setup (Phase 3A step 3: ISOLATED margin + leverage for one symbol; NO orders) ----------------
+    private fun addDemoSetupCard(root: LinearLayout) {
+        val symbol = "BTCUSDT"
+        val card = addCard(root, "BINANCE DEMO SAFETY SETUP ($symbol)",
+            "Makes $symbol safe on Binance DEMO: checks Hedge Mode (never changed by the app), sets ISOLATED margin and your configured leverage, then reads both back from Binance. Nothing is changed while the symbol has a position or any order. Places NO orders. Trading stays on Virtual.")
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        card.addView(box)
+        val repo = DemoCredentialStore.repository(this)
+        val fmt = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
+        fun refresh() {
+            box.removeAllViews()
+            val t = DemoSymbolSetupStore.text(this)
+            if (t == null) addLabel(box, "Setup", "Not run", muted)
+            else {
+                val ok = DemoSymbolSetupStore.ready(this)
+                addLabel(box, "Last setup", (if (ok) "READY" else "NOT READY") + "  ·  " + fmt.format(Date(DemoSymbolSetupStore.at(this))), if (ok) green else red)
+                t.lines().forEach { if (it.isNotBlank()) box.addView(text(it, 11f, muted)) }
+            }
+        }
+        val runBtn = addButton(card, "RUN SAFETY SETUP (Demo)", yellow)
+        runBtn.setOnClickListener {
+            val creds = repo.load()
+            if (creds == null) { toast(if (repo.hasCredentials()) "Stored keys cannot be read. Replace them." else "Save your Demo keys first."); return@setOnClickListener }
+            val lev = LocalCoinSettingsStore.load(this, symbol).leverage
+            AlertDialog.Builder(this).setTitle("Run Demo safety setup?")
+                .setMessage("On Binance DEMO this will set $symbol to ISOLATED margin and ${lev}x leverage (your configured leverage) if it is not already, and read them back. No order is placed. Nothing is changed if $symbol has a position or any order.")
+                .setPositiveButton("RUN") { _, _ ->
+                    runBtn.isEnabled = false
+                    lifecycleScope.launch {
+                        val report = DemoSymbolSetup(DemoTradeClient.create(), symbol, lev).run(creds) { msg -> runBtn.text = msg }
+                        DemoSymbolSetupStore.save(this@MainActivity, report)
+                        runBtn.isEnabled = true; runBtn.text = "RUN SAFETY SETUP (Demo)"
+                        refresh(); toast(if (report.ready) "Setup confirmed" else "Setup not ready — see report")
+                    }
+                }
+                .setNegativeButton("CANCEL", null).show()
+        }
+        addButton(card, "COPY REPORT", inputBg).setOnClickListener {
+            val t = DemoSymbolSetupStore.text(this)
+            if (t == null) { toast("Run the setup first."); return@setOnClickListener }
+            (getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager).setPrimaryClip(android.content.ClipData.newPlainText("BNB setup report", t))
+            toast("Report copied")
+        }
+        refresh()
+    }
+
+    // ---------------- Binance Demo Orders (Phase 3A steps 4+5: manual LIMIT entry with its own exchange-side Stop Loss; Virtual stays default) ----------------
+    private var demoOrdersRefresh: (() -> Unit)? = null
+    private var demoPollJob: kotlinx.coroutines.Job? = null
+
+    override fun onStart() { super.onStart(); startDemoPoll() }
+    override fun onStop() { demoPollJob?.cancel(); demoPollJob = null; super.onStop() }
+
+    /** Tracks fills, places/verifies Stop Losses and resolves unknown orders: once at app start, then every 5 seconds while the app is open and there is work. */
+    private fun startDemoPoll() {
+        demoPollJob?.cancel()
+        val svc = DemoExecutionProvider.get(this); val repo = DemoCredentialStore.repository(this)
+        demoPollJob = lifecycleScope.launch {
+            while (true) {
+                try {
+                    val creds = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { if (svc.hasWork()) repo.load() else null }
+                    if (creds != null) { svc.refresh(creds); demoOrdersRefresh?.invoke() }
+                } catch (e: kotlin.coroutines.cancellation.CancellationException) { throw e } catch (e: Exception) { /* the next round retries */ }
+                kotlinx.coroutines.delay(5000)
+            }
+        }
+    }
+
+    private fun addDemoOrdersCard(root: LinearLayout) {
+        val symbol = "BTCUSDT"
+        val card = addCard(root, "BINANCE DEMO ORDERS ($symbol)",
+            "Manual LIMIT entry on Binance DEMO. Every filled entry gets its own exchange-side Stop Loss (from its actual fill price, your Stop Loss ROI setting). A Stop Loss is shown as ACTIVE only after Binance Demo confirmed it. If it cannot be confirmed, the unprotected quantity is closed at market and new entries are halted. Run the Safety Setup first. Trading stays on Virtual.")
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val form = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        card.addView(form); card.addView(box)
+        val repo = DemoCredentialStore.repository(this)
+        val svc = DemoExecutionProvider.get(this)
+        val fmt = SimpleDateFormat("HH:mm:ss", Locale.US)
+
+        val dirSpinner = Spinner(this).apply { adapter = createDarkSpinnerAdapter(listOf("LONG", "SHORT")) }
+        val priceField = EditText(this).apply { hint = "Limit price"; inputType = android.text.InputType.TYPE_CLASS_NUMBER or android.text.InputType.TYPE_NUMBER_FLAG_DECIMAL; setSingleLine(true); setTextColor(white); setHintTextColor(muted) }
+        val marginField = EditText(this).apply { hint = "Margin (USDT)"; inputType = android.text.InputType.TYPE_CLASS_NUMBER or android.text.InputType.TYPE_NUMBER_FLAG_DECIMAL; setSingleLine(true); setTextColor(white); setHintTextColor(muted) }
+        marginField.setText(LocalCoinSettingsStore.load(this, symbol).marginAmount.toString())
+        form.addView(dirSpinner); form.addView(priceField); form.addView(marginField)
+
+        fun statusLine(e: DemoEntry): String {
+            val sl = when (e.slState) { "VERIFIED" -> "Stop Loss ACTIVE @ ${e.slTrigger} (qty ${e.protectedQty})"; "DONE" -> "Stop Loss triggered/finished"; "LOST" -> "Stop Loss LOST"; else -> "no Stop Loss" }
+            return "${e.direction} ${e.quantity} @ ${e.limitPrice} · ${e.status} · filled ${e.executedQty}" + (e.avgPrice?.let { " @ $it" } ?: "") + " · $sl" + (if (e.note.isNotBlank()) " · ${e.note}" else "")
+        }
+
+        fun refresh() {
+            box.removeAllViews()
+            svc.haltReason()?.let { r -> box.addView(text("HALTED: $r", 12f, red)) }
+            val list = svc.entries().take(8)
+            if (list.isEmpty()) addLabel(box, "Entries", "None yet", muted)
+            list.forEach { e ->
+                box.addView(text(statusLine(e), 11f, if (e.status == com.ansardeo.bnb.demo.exec.EntryStatus.UNPROTECTED) red else white))
+                if (e.orderActive) addButton(box, "CANCEL ORDER", inputBg).setOnClickListener {
+                    val creds = repo.load() ?: return@setOnClickListener toast("Stored keys cannot be read.")
+                    lifecycleScope.launch { toast(svc.cancelEntry(creds, e.id)); refresh() }
+                }
+            }
+            svc.events(8).forEach { (t, s) -> box.addView(text(fmt.format(Date(t)) + "  " + s, 10f, muted)) }
+        }
+        demoOrdersRefresh = { runOnUiThread { if (box.isAttachedToWindow) refresh() } }
+
+        val placeBtn = addButton(card, "PLACE DEMO ENTRY (LIMIT + Stop Loss)", yellow)
+        placeBtn.setOnClickListener {
+            val creds = repo.load()
+            if (creds == null) { toast(if (repo.hasCredentials()) "Stored keys cannot be read. Replace them." else "Save your Demo keys first."); return@setOnClickListener }
+            val price = priceField.text.toString().toBigDecimalOrNull(); val margin = marginField.text.toString().toBigDecimalOrNull()
+            if (price == null || margin == null || price.signum() <= 0 || margin.signum() <= 0) { toast("Enter a valid price and margin."); return@setOnClickListener }
+            val s = LocalCoinSettingsStore.load(this, symbol)
+            val dir = dirSpinner.selectedItem.toString()
+            val request = DemoExecutionService.EntryRequest(symbol, dir, price, margin, s.leverage, s.stopLossRoi, s.stopLossEnabled)
+            AlertDialog.Builder(this).setTitle("Place Demo order?")
+                .setMessage("Binance DEMO: $dir LIMIT $symbol @ ${price.toPlainString()}, margin ${margin.toPlainString()} USDT at ${s.leverage}x. After a fill it gets its own Stop Loss at -${s.stopLossRoi}% Position ROI from the actual fill price. If any part fills, the rest of the order is cancelled.")
+                .setPositiveButton("PLACE") { _, _ ->
+                    placeBtn.isEnabled = false
+                    lifecycleScope.launch {
+                        val res = svc.placeEntry(creds, request)
+                        placeBtn.isEnabled = true; refresh()
+                        toast(when (res) { is DemoExecutionService.PlaceResult.Placed -> "Order sent: ${res.entry.status}"; is DemoExecutionService.PlaceResult.Refused -> res.reason; is DemoExecutionService.PlaceResult.Unknown -> res.reason })
+                    }
+                }.setNegativeButton("CANCEL", null).show()
+        }
+        addButton(card, "REFRESH NOW", inputBg).setOnClickListener {
+            val creds = repo.load() ?: return@setOnClickListener toast("Save your Demo keys first.")
+            lifecycleScope.launch { svc.refresh(creds); refresh() }
+        }
+        addButton(card, "CLEAR HALT (after checking Binance Demo)", 0xFF5A1E1E.toInt()).setOnClickListener {
+            if (svc.haltReason() == null) return@setOnClickListener toast("Not halted.")
+            AlertDialog.Builder(this).setTitle("Clear halt?")
+                .setMessage("Only clear this after you checked the positions and orders on Binance Demo. New Demo entries will be allowed again.")
+                .setPositiveButton("CLEAR") { _, _ -> svc.clearHalt(); refresh() }.setNegativeButton("CANCEL", null).show()
+        }
+        addButton(card, "COPY REPORT", inputBg).setOnClickListener {
+            val t = buildString {
+                appendLine("BNB DEMO ORDERS REPORT"); svc.haltReason()?.let { appendLine("HALTED: $it") }
+                appendLine("--- Entries ---"); svc.entries().forEach { appendLine(it.id + " " + statusLine(it)) }
+                appendLine("--- Events ---"); svc.events(40).forEach { appendLine(fmt.format(Date(it.first)) + " " + it.second) }
+            }
+            (getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager).setPrimaryClip(android.content.ClipData.newPlainText("BNB orders report", t)); toast("Report copied")
+        }
+        refresh()
     }
 
     // ---------------- helpers ----------------
