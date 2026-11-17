@@ -63,3 +63,41 @@ object ProbeMath {
         return Plan(price, qty, trigger)
     }
 }
+
+/** Prepares an order's price and quantity for the exchange: rounding that is never more aggressive than requested, plus the exchange's limits. */
+object OrderPrep {
+    sealed class Result {
+        data class Ok(val price: BigDecimal, val quantity: BigDecimal) : Result() {
+            val priceText: String get() = ExchangeRules.plain(price)
+            val quantityText: String get() = ExchangeRules.plain(quantity)
+        }
+        data class Rejected(val reason: String) : Result()
+    }
+
+    /** BUY prices round DOWN and SELL prices round UP to the tick; quantity rounds DOWN to the step. [mark] enables the PERCENT_PRICE band check. */
+    fun prepare(rules: SymbolRules, side: String, rawPrice: BigDecimal, rawQty: BigDecimal, mark: BigDecimal?): Result {
+        require(side == "BUY" || side == "SELL") { "side" }
+        if (rules.status != null && rules.status != "TRADING") return Result.Rejected("Symbol is not trading (${rules.status}).")
+        if (rawPrice.signum() <= 0 || rawQty.signum() <= 0) return Result.Rejected("Price and quantity must be positive.")
+        val price = if (side == "BUY") ExchangeRules.floorToStep(rawPrice, rules.tickSize) else ExchangeRules.ceilToStep(rawPrice, rules.tickSize)
+        val qty = ExchangeRules.floorToStep(rawQty, rules.stepSize)
+        if (price.signum() <= 0) return Result.Rejected("Price is below one tick.")
+        if (qty < rules.minQty) return Result.Rejected("Quantity ${ExchangeRules.plain(qty)} is below the minimum ${ExchangeRules.plain(rules.minQty)}.")
+        if (price.multiply(qty) < rules.minNotional) return Result.Rejected("Order value ${ExchangeRules.plain(price.multiply(qty))} is below the minimum ${ExchangeRules.plain(rules.minNotional)}.")
+        if (mark != null) {
+            val up = rules.percentUp?.let { mark.multiply(it) }; val down = rules.percentDown?.let { mark.multiply(it) }
+            if (up != null && price > up) return Result.Rejected("Price is above the exchange's allowed band.")
+            if (down != null && price < down) return Result.Rejected("Price is below the exchange's allowed band.")
+        }
+        return Result.Ok(price, qty)
+    }
+}
+
+/** Small in-memory time-limited cache of exchange rules. */
+class RulesCache(private val ttlMs: Long = 6 * 60 * 60 * 1000L, private val clock: () -> Long = { System.currentTimeMillis() }) {
+    private class Entry(val rules: SymbolRules, val at: Long)
+    private val map = HashMap<String, Entry>()
+    @Synchronized fun put(rules: SymbolRules) { map[rules.symbol] = Entry(rules, clock()) }
+    @Synchronized fun get(symbol: String): SymbolRules? = map[symbol]?.takeIf { clock() - it.at <= ttlMs }?.rules
+    @Synchronized fun clear() = map.clear()
+}

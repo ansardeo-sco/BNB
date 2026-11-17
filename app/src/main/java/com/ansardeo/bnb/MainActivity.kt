@@ -25,6 +25,8 @@ import com.ansardeo.bnb.demo.DemoConnectionStatusStore
 import com.ansardeo.bnb.demo.DemoCredentialStore
 import com.ansardeo.bnb.demo.trade.DemoCompatibilityProbe
 import com.ansardeo.bnb.demo.trade.DemoProbeStore
+import com.ansardeo.bnb.demo.trade.DemoSymbolSetup
+import com.ansardeo.bnb.demo.trade.DemoSymbolSetupStore
 import com.ansardeo.bnb.demo.trade.DemoTradeClient
 import com.ansardeo.bnb.paper.PaperEngine
 import com.ansardeo.bnb.paper.PaperEngineProvider
@@ -1255,6 +1257,7 @@ class MainActivity : AppCompatActivity() {
 
         addDemoApiCard(root)
         addDemoProbeCard(root)
+        addDemoSetupCard(root)
 
         val mon = addCard(root, "BACKGROUND MONITORING (FOREGROUND SERVICE)")
         mon.addView(Switch(this).apply {
@@ -1444,6 +1447,52 @@ class MainActivity : AppCompatActivity() {
             val t = DemoProbeStore.text(this)
             if (t == null) { toast("Run the probe first."); return@setOnClickListener }
             (getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager).setPrimaryClip(android.content.ClipData.newPlainText("BNB probe report", t))
+            toast("Report copied")
+        }
+        refresh()
+    }
+
+    // ---------------- Binance Demo Safety Setup (Phase 3A step 3: ISOLATED margin + leverage for one symbol; NO orders) ----------------
+    private fun addDemoSetupCard(root: LinearLayout) {
+        val symbol = "BTCUSDT"
+        val card = addCard(root, "BINANCE DEMO SAFETY SETUP ($symbol)",
+            "Makes $symbol safe on Binance DEMO: checks Hedge Mode (never changed by the app), sets ISOLATED margin and your configured leverage, then reads both back from Binance. Nothing is changed while the symbol has a position or any order. Places NO orders. Trading stays on Virtual.")
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        card.addView(box)
+        val repo = DemoCredentialStore.repository(this)
+        val fmt = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
+        fun refresh() {
+            box.removeAllViews()
+            val t = DemoSymbolSetupStore.text(this)
+            if (t == null) addLabel(box, "Setup", "Not run", muted)
+            else {
+                val ok = DemoSymbolSetupStore.ready(this)
+                addLabel(box, "Last setup", (if (ok) "READY" else "NOT READY") + "  ·  " + fmt.format(Date(DemoSymbolSetupStore.at(this))), if (ok) green else red)
+                t.lines().forEach { if (it.isNotBlank()) box.addView(text(it, 11f, muted)) }
+            }
+        }
+        val runBtn = addButton(card, "RUN SAFETY SETUP (Demo)", yellow)
+        runBtn.setOnClickListener {
+            val creds = repo.load()
+            if (creds == null) { toast(if (repo.hasCredentials()) "Stored keys cannot be read. Replace them." else "Save your Demo keys first."); return@setOnClickListener }
+            val lev = LocalCoinSettingsStore.load(this, symbol).leverage
+            AlertDialog.Builder(this).setTitle("Run Demo safety setup?")
+                .setMessage("On Binance DEMO this will set $symbol to ISOLATED margin and ${lev}x leverage (your configured leverage) if it is not already, and read them back. No order is placed. Nothing is changed if $symbol has a position or any order.")
+                .setPositiveButton("RUN") { _, _ ->
+                    runBtn.isEnabled = false
+                    lifecycleScope.launch {
+                        val report = DemoSymbolSetup(DemoTradeClient.create(), symbol, lev).run(creds) { msg -> runBtn.text = msg }
+                        DemoSymbolSetupStore.save(this@MainActivity, report)
+                        runBtn.isEnabled = true; runBtn.text = "RUN SAFETY SETUP (Demo)"
+                        refresh(); toast(if (report.ready) "Setup confirmed" else "Setup not ready — see report")
+                    }
+                }
+                .setNegativeButton("CANCEL", null).show()
+        }
+        addButton(card, "COPY REPORT", inputBg).setOnClickListener {
+            val t = DemoSymbolSetupStore.text(this)
+            if (t == null) { toast("Run the setup first."); return@setOnClickListener }
+            (getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager).setPrimaryClip(android.content.ClipData.newPlainText("BNB setup report", t))
             toast("Report copied")
         }
         refresh()

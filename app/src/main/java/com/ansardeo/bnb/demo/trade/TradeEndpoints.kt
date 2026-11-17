@@ -6,8 +6,9 @@ enum class HttpVerb { GET, POST, DELETE }
  * The COMPLETE list of Binance Demo endpoints this app may call in the Trade layer (steps 1-2 of the Demo execution phase).
  * Anything not listed here cannot be called: [DemoTradeClient] only exposes typed methods built on these entries.
  *
- * Deliberately NOT present (each needs a later, separate approval): leverage / margin-type / position-mode CHANGES,
- * batch orders, cancel-all, MARKET orders, listen key, take-profit or trailing algo orders.
+ * Step 3 (approved) added exactly two account-setting changes: margin type (ISOLATED only) and leverage, plus the read of the symbol config.
+ * Deliberately NOT present (each needs a separate approval): position-mode CHANGE, batch orders, cancel-all, MARKET orders,
+ * listen key, take-profit or trailing algo orders.
  */
 enum class Endpoint(val verb: HttpVerb, val path: String, val signed: Boolean) {
     TIME(HttpVerb.GET, "/fapi/v1/time", false),
@@ -24,4 +25,7 @@ enum class Endpoint(val verb: HttpVerb, val path: String, val signed: Boolean) {
     ALGO_QUERY(HttpVerb.GET, "/fapi/v1/algoOrder", true),
     ALGO_CANCEL(HttpVerb.DELETE, "/fapi/v1/algoOrder", true),
     ALGO_OPEN(HttpVerb.GET, "/fapi/v1/openAlgoOrders", true),
+    SYMBOL_CONFIG(HttpVerb.GET, "/fapi/v1/symbolConfig", true),
+    MARGIN_TYPE_SET(HttpVerb.POST, "/fapi/v1/marginType", true),
+    LEVERAGE_SET(HttpVerb.POST, "/fapi/v1/leverage", true),
 }

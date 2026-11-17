@@ -92,6 +92,16 @@ class DemoTradeClient internal constructor(
     suspend fun positionMode(c: DemoCredentials) = call(Endpoint.POSITION_MODE_READ, emptyList(), c)
     suspend fun positionRisk(c: DemoCredentials, symbol: String) = call(Endpoint.POSITION_RISK, listOf("symbol" to symbol), c)
 
+    // ---- per-symbol account settings (Step 3) ----
+    suspend fun symbolConfig(c: DemoCredentials, symbol: String) = call(Endpoint.SYMBOL_CONFIG, listOf("symbol" to symbol), c)
+    /** Margin type can only be set to ISOLATED (the approved strategy setting); CROSS can never be requested. */
+    suspend fun setMarginTypeIsolated(c: DemoCredentials, symbol: String) = call(Endpoint.MARGIN_TYPE_SET, listOf("symbol" to symbol, "marginType" to "ISOLATED"), c)
+    /** Leverage is limited to the app's supported range (3x-20x) before anything is sent. */
+    suspend fun setLeverage(c: DemoCredentials, symbol: String, leverage: Int): TradeResponse {
+        require(com.ansardeo.bnb.data.LeverageConfig.isSupported(leverage)) { "leverage" }
+        return call(Endpoint.LEVERAGE_SET, listOf("symbol" to symbol, "leverage" to leverage.toString()), c)
+    }
+
     // ---- LIMIT orders ----
     /** LIMIT + GTC only. [quantity]/[price] are exchange-formatted plain decimals. [positionSide] = LONG/SHORT in Hedge Mode, null in One-way. */
     suspend fun newLimitOrder(c: DemoCredentials, symbol: String, side: String, positionSide: String?, quantity: String, price: String, clientOrderId: String): TradeResponse {

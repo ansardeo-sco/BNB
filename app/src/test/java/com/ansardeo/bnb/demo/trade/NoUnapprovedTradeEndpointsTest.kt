@@ -13,8 +13,23 @@ class NoUnapprovedTradeEndpointsTest {
     private fun code(f: File) = f.readText().lines().filterNot { it.trim().startsWith("*") || it.trim().startsWith("/*") || it.trim().startsWith("//") }.joinToString("\n")
 
     @Test fun noUnapprovedOrderTypesOrParameters() {
-        val banned = listOf("TAKE_PROFIT", "TRAILING_STOP", "closePosition", "reduceOnly", "callbackRate", "activationPrice", "/fapi/v1/leverage", "\"marginType\" to", "\"leverage\" to", "batchOrders", "allOpenOrders", "listenKey")
+        val banned = listOf("TAKE_PROFIT", "TRAILING_STOP", "closePosition", "reduceOnly", "callbackRate", "activationPrice", "batchOrders", "allOpenOrders", "listenKey")
         for (f in sources()) { val t = code(f); banned.forEach { assertFalse("${f.name} contains $it", t.contains(it)) } }
+        // Step 3 approval: margin-type / leverage CHANGES may be requested only by the typed methods of the trade client (and listed in the catalog), nowhere else.
+        val settingChange = listOf("/fapi/v1/leverage", "\"marginType\" to", "\"leverage\" to")
+        for (f in sources().filter { it.name != "DemoTradeClient.kt" && it.name != "TradeEndpoints.kt" }) { val t = code(f); settingChange.forEach { assertFalse("${f.name} must not change account settings ($it)", t.contains(it)) } }
+    }
+
+    @Test fun marginTypeCanOnlyBeIsolated() {
+        val t = code(sources().first { it.name == "DemoTradeClient.kt" })
+        val values = Regex("\"marginType\" to \"([A-Z]+)\"").findAll(t).map { it.groupValues[1] }.toSet()
+        assertEquals(setOf("ISOLATED"), values)
+    }
+
+    @Test fun positionModeIsNeverChanged() {
+        val t = sources().joinToString("\n") { code(it) }
+        assertFalse(t.contains("\"dualSidePosition\" to"))
+        assertFalse(Regex("Endpoint\\.POSITION_MODE[A-Z_]*").findAll(t).any { !it.value.endsWith("READ") })
     }
 
     @Test fun noMarketOrderTypeAndNoPositionModeChange() {
