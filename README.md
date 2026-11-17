@@ -101,3 +101,10 @@ These tests are compiled/run only with `-PengineTests` (so the normal build is u
 - `demo/trade/SymbolSetup.kt`: reads Hedge Mode (never changed), exchange rules, idle state; sets ISOLATED margin and the configured leverage (3x-20x) only while the symbol has no position/order/Stop Loss; reads both back from Binance Demo. Reports READY only after Binance confirms.
 - `ExchangeRules.kt`: `OrderPrep` (tick/step rounding that is never more aggressive, min qty / min notional / price band) and `RulesCache`.
 - More tab → "BINANCE DEMO SAFETY SETUP (BTCUSDT)". No orders are placed in this step.
+
+### Phase 3A steps 4+5 (Round A) — Demo LIMIT orders with their own Stop Loss
+- `demo/exec/`: `DemoExecutionService` (place LIMIT, track fills, cancel, per-entry Stop Loss placed + verified, fail-safe, halt), `DemoEntry`, `DemoExecStore` (own SQLite file `bnb_demo_exec.db`; the Virtual database is untouched).
+- A Stop Loss is shown ACTIVE only after Binance Demo confirmed it (queried back, status NEW). One retry, then the unprotected quantity is closed at market and new entries are halted until the user clears the halt.
+- First fill ends the order (rest cancelled), so one Stop Loss covers a fixed quantity. MARKET orders exist only as a closing-only method (SELL on LONG / BUY on SHORT).
+- Known gap (unchanged): an entry that fills while the app is closed is protected only when the app next runs (start-up refresh).
+- More tab → "BINANCE DEMO ORDERS (BTCUSDT)". No strategy automation; Virtual stays the default.

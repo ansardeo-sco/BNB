@@ -116,8 +116,26 @@ class DemoTradeClient internal constructor(
         return call(Endpoint.ORDER_NEW_LIMIT, p, c)
     }
     suspend fun queryOrder(c: DemoCredentials, symbol: String, orderId: Long) = call(Endpoint.ORDER_QUERY, listOf("symbol" to symbol, "orderId" to orderId.toString()), c)
+    /** Looks an order up by the client id the app generated (used after an ambiguous network failure). */
+    suspend fun queryOrderByClientId(c: DemoCredentials, symbol: String, clientOrderId: String): TradeResponse {
+        require(clientOrderId.matches(Regex("[.A-Za-z0-9:/_-]{1,36}"))) { "clientOrderId" }
+        return call(Endpoint.ORDER_QUERY, listOf("symbol" to symbol, "origClientOrderId" to clientOrderId), c)
+    }
     suspend fun openOrders(c: DemoCredentials, symbol: String) = call(Endpoint.OPEN_ORDERS, listOf("symbol" to symbol), c)
     suspend fun cancelOrder(c: DemoCredentials, symbol: String, orderId: Long) = call(Endpoint.ORDER_CANCEL, listOf("symbol" to symbol, "orderId" to orderId.toString()), c)
+
+    /**
+     * MARKET order that can only CLOSE a Hedge-Mode position: SELL on the LONG side or BUY on the SHORT side. Used by the fail-safe
+     * (Stop Loss could not be placed) and by closing a position. A MARKET order that opens a position cannot be built here.
+     */
+    suspend fun newMarketCloseOrder(c: DemoCredentials, symbol: String, side: String, positionSide: String, quantity: String, clientOrderId: String): TradeResponse {
+        require((positionSide == "LONG" && side == "SELL") || (positionSide == "SHORT" && side == "BUY")) { "market orders may only close a position" }
+        require(clientOrderId.matches(Regex("[.A-Za-z0-9:/_-]{1,36}"))) { "clientOrderId" }
+        val p = ArrayList<Pair<String, String>>()
+        p += "symbol" to symbol; p += "side" to side; p += "positionSide" to positionSide
+        p += "type" to "MARKET"; p += "quantity" to quantity; p += "newClientOrderId" to clientOrderId; p += "newOrderRespType" to "RESULT"
+        return call(Endpoint.ORDER_NEW_LIMIT, p, c) // same catalog entry: POST /fapi/v1/order
+    }
 
     // ---- conditional (algo) Stop Loss ----
     /** STOP_MARKET with a quantity, triggered on MARK_PRICE. No closePosition, no reduceOnly (not allowed in Hedge Mode). */

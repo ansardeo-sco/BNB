@@ -32,18 +32,22 @@ class NoUnapprovedTradeEndpointsTest {
         assertFalse(Regex("Endpoint\\.POSITION_MODE[A-Z_]*").findAll(t).any { !it.value.endsWith("READ") })
     }
 
-    @Test fun noMarketOrderTypeAndNoPositionModeChange() {
-        for (f in sources()) {
-            val t = code(f)
-            assertFalse("${f.name}: MARKET order type", t.contains("\"MARKET\""))
-            assertFalse("${f.name}: position mode change", t.contains("dualSidePosition\" to"))
-        }
+    @Test fun marketOrdersExistOnlyAsTheClosingOnlyMethod() {
+        // Round A approval: MARKET only for closing / fail-safe. It is built in exactly one place, which accepts only SELL+LONG or BUY+SHORT.
+        for (f in sources().filter { it.name != "DemoTradeClient.kt" }) assertFalse("${f.name}: MARKET order type", code(f).contains("\"MARKET\""))
+        val t = code(sources().first { it.name == "DemoTradeClient.kt" })
+        assertEquals(1, Regex("\"type\" to \"MARKET\"").findAll(t).count())
+        assertTrue(t.contains("require((positionSide == \"LONG\" && side == \"SELL\") || (positionSide == \"SHORT\" && side == \"BUY\"))"))
+    }
+
+    @Test fun noPositionModeChange() {
+        for (f in sources()) assertFalse("${f.name}: position mode change", code(f).contains("dualSidePosition\" to"))
     }
 
     @Test fun onlyApprovedOrderTypesAreSent() {
         val t = sources().joinToString("\n") { code(it) }
         val types = Regex("\"type\" to \"([A-Z_]+)\"").findAll(t).map { it.groupValues[1] }.toSet()
-        assertEquals(setOf("LIMIT", "STOP_MARKET"), types)
+        assertEquals(setOf("LIMIT", "STOP_MARKET", "MARKET"), types)
     }
 
     @Test fun onlyTheGuardedFactoryAndNoLiveHost() {
