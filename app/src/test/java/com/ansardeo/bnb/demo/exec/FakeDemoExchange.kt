@@ -17,6 +17,8 @@ class FakeDemoExchange {
     var hedge = true; var margin = "ISOLATED"; var leverage = 6; var mark = "60000.00"
     var limitFill = "none"            // none | full | partial
     var partialQty = "0.004"; var fillPrice: String? = null
+    /** normal | postZero (new-order answer shows avgPrice 0, queries are correct) | cumQuoteOnly (avgPrice always 0, cumQuote correct) | none (no price at all) */
+    var avgMode = "normal"
     var algoFailures = 0; var marketFailures = 0; var unverifiedQueries = 0
     private var next = 1000L
 
@@ -25,7 +27,16 @@ class FakeDemoExchange {
         {"filterType":"MIN_NOTIONAL","notional":"50"},{"filterType":"PERCENT_PRICE","multiplierUp":"1.05","multiplierDown":"0.95"}]}]}"""
 
     private fun err(code: Int, msg: String) = MockResponse().setResponseCode(400).setBody("""{"code":$code,"msg":"$msg"}""")
-    private fun json(o: Ord) = """{"orderId":${o.id},"clientOrderId":"${o.cid}","status":"${o.status}","origQty":"${o.origQty}","executedQty":"${o.execQty}","avgPrice":"${o.avg}","price":"${o.price}","type":"${o.type}"}"""
+    private fun json(o: Ord, isPostAnswer: Boolean = false): String {
+        val quote = java.math.BigDecimal(o.execQty).multiply(java.math.BigDecimal(o.avg)).toPlainString()
+        val (avg, cq) = when {
+            avgMode == "none" -> "0.00000" to "0"
+            avgMode == "cumQuoteOnly" -> "0.00000" to quote
+            avgMode == "postZero" && isPostAnswer -> "0.00000" to "0"
+            else -> o.avg to quote
+        }
+        return """{"orderId":${o.id},"clientOrderId":"${o.cid}","status":"${o.status}","origQty":"${o.origQty}","executedQty":"${o.execQty}","avgPrice":"$avg","cumQuote":"$cq","price":"${o.price}","type":"${o.type}"}"""
+    }
 
     fun start(): FakeDemoExchange {
         server.dispatcher = object : Dispatcher() {
@@ -47,7 +58,7 @@ class FakeDemoExchange {
                                 "partial" -> Ord(next++, p("newClientOrderId")!!, p("side")!!, p("positionSide"), "LIMIT", "PARTIALLY_FILLED", q, partialQty, fillPrice ?: px, px)
                                 else -> Ord(next++, p("newClientOrderId")!!, p("side")!!, p("positionSide"), "LIMIT", "NEW", q, "0", "0.00000", px)
                             }
-                            orders[o.id] = o; MockResponse().setBody(json(o))
+                            orders[o.id] = o; MockResponse().setBody(json(o, isPostAnswer = true))
                         }
                         "MARKET" -> if (marketFailures > 0) { marketFailures--; err(-2019, "Margin is insufficient") } else {
                             val q = p("quantity")!!

@@ -206,4 +206,24 @@ class DemoExecutionServiceTest {
         assertEquals("LIMIT", q(p, "type")); assertEquals("GTC", q(p, "timeInForce")); assertEquals("LONG", q(p, "positionSide")); assertTrue(q(p, "newClientOrderId")!!.startsWith("bnb"))
         assertEquals("0.01", q(p, "quantity")); assertEquals("60000", q(p, "price"))
     }
+
+    // Real-device finding: an order that fills at once can come back with avgPrice 0 in the new-order answer.
+    @Test fun immediateFillWithZeroAvgPriceInTheAnswerIsResolvedByQueryingTheOrder() {
+        ex.limitFill = "full"; ex.fillPrice = "59900"; ex.avgMode = "postZero"
+        val e = placed(place(service()))
+        assertEquals("VERIFIED", e.slState); assertEquals("59900", e.avgPrice); assertNull(store.halt())
+        assertTrue(ex.posts("/fapi/v1/order").none { q(it, "type") == "MARKET" })
+    }
+
+    @Test fun fillPriceFallsBackToExecutedQuoteDividedByQuantity() {
+        ex.limitFill = "full"; ex.fillPrice = "65100"; ex.avgMode = "cumQuoteOnly"; ex.mark = "65000.00"
+        val e = placed(place(service(), req(price = "65150")))
+        assertEquals("VERIFIED", e.slState); assertEquals(0, BigDecimal("65100").compareTo(BigDecimal(e.avgPrice!!))); assertNull(store.halt())
+    }
+
+    @Test fun noFillPriceAnywhereStillTriggersTheFailSafe() {
+        ex.limitFill = "full"; ex.avgMode = "none"
+        val e = placed(place(service()))
+        assertEquals(EntryStatus.FAILSAFE_CLOSED, e.status); assertNotNull(store.halt())
+    }
 }

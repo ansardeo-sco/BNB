@@ -159,6 +159,12 @@ class DemoExecutionService(
 
     private suspend fun protect(c: DemoCredentials, e0: DemoEntry): DemoEntry {
         var e = e0
+        // The new-order answer can report avgPrice 0 for an order that filled at once: ask Binance again before giving up.
+        var lookups = 0
+        while (e.average == null && e.orderId != null && lookups++ < 2) {
+            val q = api.queryOrder(c, e.symbol, e.orderId!!)
+            if (q.ok) e = save(applyOrder(e, q.body, e.status))
+        }
         val avg = e.average ?: return failSafe(c, e, "no fill price is known")
         val rules = rulesFor(e.symbol) ?: return failSafe(c, e, "exchange rules unavailable")
         val trigger = stopTrigger(e.direction, avg, e.leverage, e.slRoi, rules) ?: return failSafe(c, e, "the Stop Loss price is not valid for fill price ${ExchangeRules.plain(avg)}")
@@ -261,7 +267,12 @@ class DemoExecutionService(
         val raw = o.optString("status")
         val st = when (raw) { "EXPIRED_IN_MATCH" -> EntryStatus.EXPIRED; "" -> fallback; else -> runCatching { EntryStatus.valueOf(raw) }.getOrDefault(e.status) }
         val exec = o.optString("executedQty", e.executedQty).ifBlank { e.executedQty }
-        val avg = o.optString("avgPrice", "0")
+        var avg = o.optString("avgPrice", "0")
+        if (DemoEntry.bd(avg).signum() <= 0) {
+            // Fallback: executed quote amount / executed quantity (both reported by Binance)
+            val quote = DemoEntry.bd(o.optString("cumQuote", "0")); val qty = DemoEntry.bd(exec)
+            if (quote.signum() > 0 && qty.signum() > 0) avg = quote.divide(qty, 8, RoundingMode.HALF_UP).toPlainString()
+        }
         return e.copy(
             orderId = if (o.has("orderId")) o.optLong("orderId") else e.orderId,
             status = if (st == EntryStatus.SENDING || st == EntryStatus.UNKNOWN) EntryStatus.NEW else st,
