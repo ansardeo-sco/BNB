@@ -120,3 +120,24 @@ Binance Demo can answer a Stop Loss / order cancel as accepted before its status
 
 ### Fix — Demo Positions tab now uses the same Position / Open Order / History layout as Virtual
 The Demo panel previously showed a flat text list; it now shares the exact tab structure Virtual uses (Position → Open/Closed, Open Order → Basic/Conditional, History → Open events/Closed), with the same per-item card layout (symbol, direction, fill price, quantity, Stop Loss line, Close/Cancel buttons). Virtual's own rendering and data were not changed.
+
+## Phase 3A status (Step 8 — hardening + final review)
+
+**Done and confirmed on a real Binance Demo account by the user (not just unit tests):**
+- Stage 2: Demo API keys saved (Android Keystore AES‑256‑GCM), read-only connection test.
+- Step 1–2: Demo trade client (approved-endpoint-only) + Compatibility Probe — LIMIT place/query/list/cancel and Stop Loss (algo STOP_MARKET) place/query/list/cancel all confirmed SUPPORTED, no position opened.
+- Step 3: Safety Setup — ISOLATED margin + configured leverage set and read back from Binance Demo; Hedge Mode only ever read, never changed.
+- Steps 4–5: Demo LIMIT entries; a fill gets its own exchange-side Stop Loss computed from the actual fill price, placed and verified as ACTIVE only after Binance Demo confirms it; fail-safe (market-close + halt) exercised live after a real failure (avgPrice 0 in the new-order answer) and fixed.
+- Steps 6–7: CLOSE POSITION (market, closing-only) + Stop Loss cleanup; Positions tab now shows Demo the same way as Virtual (Position/Open Order/History, same per-item cards); mode toggle locked until keys are saved and the probe passed.
+- Real-device fixes applied during this phase: coroutine-in-lambda compile error, `exchangeInfo` timeout on a large response, flaky retry test, a method name (`closePosition`) that collided with a banned-string security test, fill price sometimes reported as 0 by Binance (now falls back to a re-query / cumQuote), and cancel status needing a short retry before Binance Demo reflects it.
+
+**Verified by static/unit tests (listed in this README's earlier sections); not independently re-run in this review beyond re-checking their banned-string/endpoint-catalog logic by hand against the current source.**
+
+**Known limitations (by design / deferred, not bugs):**
+1. If the app is closed at the moment an entry order fills, its Stop Loss is placed only when the app is next opened (the poll loop). The user has decided to leave this as-is for Phase 3A and revisit it at the real-money/server stage.
+2. Several Demo entries on the same symbol and direction each get their own Stop Loss sized to their own quantity; if their quantities overlap on the exchange's single net position, the Stop Losses are not merged into one. This matches the approved per-entry-SL design.
+3. The app only tracks orders/positions it placed itself. An order or position opened directly on Binance (outside the app) is not shown or managed here.
+4. Demo strategy automation (priority, averaging, opposite entries, re-entry, trailing exit) is **not implemented** — every Demo order in Phase 3A is placed manually from the app. That is Phase 3B and needs separate approval.
+5. Live (real-money) trading is **not implemented and not reachable from this app** — Stage 3 has not been started.
+
+**Not changed in Phase 3A:** the Virtual engine, the trading strategy rules, the Dashboard, and Settings.
