@@ -57,6 +57,55 @@ class DemoExecutionService(
         }
     }
 
+    /**
+     * Step 6: closes the open quantity of one entry at market (the position-closing method only; a position-opening MARKET order
+     * cannot be built), then removes that entry's Stop Loss once nothing is left to protect. Serialized by the same mutex as
+     * every other state change, so it can never race a fill, a fail-safe or another close.
+     */
+    suspend fun closePosition(c: DemoCredentials, id: String): String = withContext(Dispatchers.IO) {
+        mutex.withLock {
+            var e = store.get(id) ?: return@withLock "Entry not found."
+            if (e.orderActive && e.orderId != null) {
+                val cx = api.cancelOrder(c, e.symbol, e.orderId!!)
+                ev("${e.id}: cancelling the open order before closing (${if (cx.ok) "accepted" else cx.describe()})")
+                val q = api.queryOrder(c, e.symbol, e.orderId!!); if (q.ok) e = save(applyOrder(e, q.body, e.status))
+                if (e.orderActive) return@withLock "Could not cancel the open order yet; try again."
+            }
+            val qty = e.openQuantity
+            if (qty.signum() <= 0) return@withLock "Nothing to close for this entry."
+            val qtyText = ExchangeRules.plain(qty)
+            ev("${e.id}: closing $qtyText at market")
+            var filled = false
+            for (attempt in 1..2) {
+                val r = api.newMarketCloseOrder(c, e.symbol, e.closeSide, e.direction, qtyText, e.id + "C" + attempt)
+                val oid = if (r.ok) runCatching { JSONObject(r.body).getLong("orderId") }.getOrNull() else null
+                if (oid == null) { ev("${e.id}: close attempt $attempt failed — ${r.describe()}"); continue }
+                var st = runCatching { JSONObject(r.body).getString("status") }.getOrNull()
+                if (st != "FILLED") { val q = api.queryOrder(c, e.symbol, oid); if (q.ok) st = runCatching { JSONObject(q.body).getString("status") }.getOrNull() }
+                if (st == "FILLED") { filled = true; break }
+                ev("${e.id}: close attempt $attempt not confirmed filled (status $st)")
+            }
+            if (!filled) return@withLock "Market close was not confirmed. Check Binance Demo and try again."
+            e = save(e.copy(closedQty = ExchangeRules.plain(e.closedQuantity.add(qty))))
+            ev("${e.id}: $qtyText closed at market")
+            if (e.openQuantity.signum() <= 0) {
+                val algoId = e.slAlgoId
+                if (algoId != null && (e.slState == "VERIFIED")) {
+                    val cx = api.cancelAlgo(c, algoId)
+                    var gone = !cx.ok // if cancel itself failed, fall through to a direct check below
+                    val q = api.queryAlgo(c, algoId)
+                    if (q.ok) { val st = runCatching { JSONObject(q.body).getString("algoStatus") }.getOrNull(); gone = st != "NEW" && st != "WORKING" }
+                    e = save(e.copy(status = EntryStatus.CLOSED, slState = if (gone) "NONE" else e.slState, note = if (gone) "" else "Stop Loss cleanup not confirmed — check Binance Demo"))
+                    ev("${e.id}: position closed; Stop Loss cleanup ${if (gone) "confirmed" else "NOT confirmed — check Binance Demo"}")
+                } else {
+                    e = save(e.copy(status = EntryStatus.CLOSED))
+                    ev("${e.id}: position closed")
+                }
+            }
+            "Closed $qtyText. ${if (e.status == EntryStatus.CLOSED) "Entry fully closed." else "Entry partially closed; re-check protection."}"
+        }
+    }
+
     suspend fun cancelEntry(c: DemoCredentials, id: String): String = withContext(Dispatchers.IO) {
         mutex.withLock {
             val e = store.get(id) ?: return@withLock "Entry not found."

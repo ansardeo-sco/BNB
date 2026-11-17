@@ -108,3 +108,9 @@ These tests are compiled/run only with `-PengineTests` (so the normal build is u
 - First fill ends the order (rest cancelled), so one Stop Loss covers a fixed quantity. MARKET orders exist only as a closing-only method (SELL on LONG / BUY on SHORT).
 - Known gap (unchanged): an entry that fills while the app is closed is protected only when the app next runs (start-up refresh).
 - More tab → "BINANCE DEMO ORDERS (BTCUSDT)". No strategy automation; Virtual stays the default.
+
+### Phase 3A Round B (steps 6+7) — close position, sync, Positions tab, mode toggle
+- `DemoExecutionService.closePosition()`: closes an entry's open quantity at market (closing-only method, same restriction as the fail-safe), then removes its Stop Loss once nothing is left to protect. Serialized by the same mutex as every other state change.
+- Positions tab gets a Virtual/Demo toggle (display only — it never changes what the Virtual engine does, and does not enable any Demo strategy automation). Demo view: open entries with CANCEL ORDER / CLOSE POSITION, closed history, and the event log.
+- `TradingModeStore` / `TradingModePrefs`: the Demo view is locked until Demo API keys are saved AND the Compatibility Probe passed (Stop Loss confirmed supported + cleaned up). Virtual stays the default and switching back to Virtual is always allowed.
+- Sync: the existing start/5s poll (`startDemoPoll`) already resolves unknown orders, tracks fills, places/verifies Stop Losses and checks for a lost Stop Loss; it runs again whenever the app is foregrounded (onStart), covering "sync on start/reconnect" for everything the app itself placed. A position opened directly on Binance (not through this app) is outside this app's tracking, as before.

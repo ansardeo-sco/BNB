@@ -21,11 +21,14 @@ import com.ansardeo.bnb.BuildConfig
 import com.ansardeo.bnb.data.*
 import com.ansardeo.bnb.demo.BinanceDemoApi
 import com.ansardeo.bnb.demo.CredentialState
+import com.ansardeo.bnb.demo.TradingMode
+import com.ansardeo.bnb.demo.TradingModeStore
 import com.ansardeo.bnb.demo.DemoConnectionStatusStore
 import com.ansardeo.bnb.demo.DemoCredentialStore
 import com.ansardeo.bnb.demo.exec.DemoEntry
 import com.ansardeo.bnb.demo.exec.DemoExecutionProvider
 import com.ansardeo.bnb.demo.exec.DemoExecutionService
+import com.ansardeo.bnb.demo.exec.EntryStatus
 import com.ansardeo.bnb.demo.trade.DemoCompatibilityProbe
 import com.ansardeo.bnb.demo.trade.DemoProbeStore
 import com.ansardeo.bnb.demo.trade.DemoSymbolSetup
@@ -601,6 +604,31 @@ class MainActivity : AppCompatActivity() {
     private fun positionsPage() /* Future tab */ {
         stopRefresh(); updateTopStatus()
         val root = pageContainer()
+
+        // Display-only toggle: which panel this tab shows. Never changes what the Virtual engine does; Demo strategy automation is not implemented.
+        val modeBar = row().apply { background = rounded(card, 12); setPadding(dp(6), dp(6), dp(6), dp(6)) }
+        root.addView(modeBar); addSpace(root, 8)
+        val virtualTab = TextView(this).apply { gravity = Gravity.CENTER; setPadding(dp(8), dp(10), dp(8), dp(10)); textSize = 12f }
+        val demoTab = TextView(this).apply { gravity = Gravity.CENTER; setPadding(dp(8), dp(10), dp(8), dp(10)); textSize = 12f }
+        modeBar.addView(virtualTab, LinearLayout.LayoutParams(0, -2, 1f)); modeBar.addView(demoTab, LinearLayout.LayoutParams(0, -2, 1f))
+        val demoBody = column()
+        lateinit var styleModeTabs: () -> Unit
+        lateinit var showVirtual: () -> Unit
+        lateinit var showDemo: () -> Unit
+        styleModeTabs = {
+            val mode = TradingModeStore.get(this)
+            virtualTab.text = "Virtual"; demoTab.text = "Demo"
+            virtualTab.setTextColor(if (mode == TradingMode.VIRTUAL) yellow else muted); virtualTab.setTypeface(null, if (mode == TradingMode.VIRTUAL) Typeface.BOLD else Typeface.NORMAL)
+            virtualTab.background = if (mode == TradingMode.VIRTUAL) rounded(inputBg, 10) else null
+            demoTab.setTextColor(if (mode == TradingMode.DEMO) yellow else muted); demoTab.setTypeface(null, if (mode == TradingMode.DEMO) Typeface.BOLD else Typeface.NORMAL)
+            demoTab.background = if (mode == TradingMode.DEMO) rounded(inputBg, 10) else null
+        }
+        virtualTab.setOnClickListener { TradingModeStore.trySet(this, TradingMode.VIRTUAL); styleModeTabs(); showVirtual() }
+        demoTab.setOnClickListener {
+            val err = TradingModeStore.trySet(this, TradingMode.DEMO)
+            if (err != null) toast(err) else { styleModeTabs(); showDemo() }
+        }
+
         val tabBar = row().apply { background = rounded(card, 12); setPadding(dp(6), dp(6), dp(6), dp(6)) }
         root.addView(tabBar); addSpace(root, 8)
         val subBar = row().apply { background = rounded(card, 10); setPadding(dp(4), dp(4), dp(4), dp(4)) }
@@ -686,6 +714,13 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
+        showVirtual = { tabBar.visibility = View.VISIBLE; demoBody.visibility = View.GONE; render() }
+        showDemo = {
+            tabBar.visibility = View.GONE; subBar.visibility = View.GONE; body.removeAllViews(); demoBody.visibility = View.VISIBLE
+            renderDemoPositions(demoBody)
+        }
+        root.addView(demoBody); demoBody.visibility = View.GONE
+
         primaryViews = listOf("Position","Open Order","History").mapIndexed { i, _ ->
             TextView(this).apply { gravity = Gravity.CENTER; setPadding(dp(8), dp(10), dp(8), dp(10)); textSize = 12f; setOnClickListener { if (primaryTab != i) { primaryTab = i; render() } } }
                 .also { tabBar.addView(it, LinearLayout.LayoutParams(0, -2, 1f)) }
@@ -695,7 +730,43 @@ class MainActivity : AppCompatActivity() {
                 if (primaryTab == 0) { if (positionSub != i) { positionSub = i; render() } } else if (primaryTab == 1) { if (orderSub != i) { orderSub = i; render() } } else { if (historySub != i) { historySub = i; render() } }
             } }.also { subBar.addView(it, LinearLayout.LayoutParams(0, -2, 1f)) }
         }
-        stylePrimary(0,0,0); styleSub("Open","Closed"); render()
+        stylePrimary(0,0,0); styleSub("Open","Closed")
+        styleModeTabs(); if (TradingModeStore.get(this) == TradingMode.DEMO) showDemo() else showVirtual()
+    }
+
+    private fun renderDemoPositions(body: LinearLayout) {
+        body.removeAllViews()
+        demoOrdersRefresh = { runOnUiThread { if (body.isAttachedToWindow) renderDemoPositions(body) } }
+        val svc = DemoExecutionProvider.get(this)
+        val repo = DemoCredentialStore.repository(this)
+        val fmt = SimpleDateFormat("HH:mm:ss", Locale.US)
+        svc.haltReason()?.let { r -> body.addView(text("HALTED: $r", 12f, red)) }
+        val all = svc.entries()
+        val open = all.filter { it.status != EntryStatus.CLOSED && it.status != EntryStatus.CANCELED && it.status != EntryStatus.REJECTED }
+        val closed = all.filter { it.status == EntryStatus.CLOSED || it.status == EntryStatus.CANCELED || it.status == EntryStatus.REJECTED }
+        body.addView(text("Open (${open.size})", 13f, yellow, bold = true)); addSpace(body, 4)
+        if (open.isEmpty()) body.addView(text("None", 12f, muted))
+        open.forEach { e ->
+            val sl = when (e.slState) { "VERIFIED" -> "Stop Loss ACTIVE @ ${e.slTrigger}"; "DONE" -> "Stop Loss triggered/finished"; "LOST" -> "Stop Loss LOST"; else -> "no Stop Loss" }
+            body.addView(text("${e.symbol} ${e.direction} ${e.quantity} @ ${e.limitPrice} · ${e.status} · filled ${e.executedQty}" + (e.avgPrice?.let { " @ $it" } ?: "") + " · $sl", 11f, if (e.status == EntryStatus.UNPROTECTED) red else white))
+            if (e.orderActive) addButton(body, "CANCEL ORDER", inputBg).setOnClickListener { val c = repo.load() ?: return@setOnClickListener toast("Save Demo keys first."); lifecycleScope.launch { toast(svc.cancelEntry(c, e.id)); renderDemoPositions(body) } }
+            if (e.closable) addButton(body, "CLOSE POSITION (market)", 0xFF5A1E1E.toInt()).setOnClickListener {
+                val c = repo.load() ?: return@setOnClickListener toast("Save Demo keys first.")
+                AlertDialog.Builder(this).setTitle("Close on Binance Demo?").setMessage("Closes ${e.openQuantity.toPlainString()} ${e.symbol} ${e.direction} at market and removes its Stop Loss once fully closed.")
+                    .setPositiveButton("CLOSE") { _, _ -> lifecycleScope.launch { toast(svc.closePosition(c, e.id)); renderDemoPositions(body) } }.setNegativeButton("CANCEL", null).show()
+            }
+        }
+        addSpace(body, 10)
+        body.addView(text("History (${closed.size})", 13f, yellow, bold = true)); addSpace(body, 4)
+        if (closed.isEmpty()) body.addView(text("None", 12f, muted))
+        closed.takeLast(20).reversed().forEach { e -> body.addView(text("${e.symbol} ${e.direction} ${e.quantity} @ ${e.limitPrice} · ${e.status}" + (e.note.takeIf { it.isNotBlank() }?.let { " · $it" } ?: ""), 11f, muted)) }
+        addSpace(body, 10)
+        body.addView(text("Events", 13f, yellow, bold = true)); addSpace(body, 4)
+        svc.events(15).forEach { (t, s) -> body.addView(text(fmt.format(Date(t)) + "  " + s, 10f, muted)) }
+        addButton(body, "REFRESH NOW", inputBg).setOnClickListener {
+            val c = repo.load() ?: return@setOnClickListener toast("Save Demo keys first.")
+            lifecycleScope.launch { svc.refresh(c); renderDemoPositions(body) }
+        }
     }
 
     /** One-line description of a cycle's trailing-stop state for the Positions / Open Orders screens. */
