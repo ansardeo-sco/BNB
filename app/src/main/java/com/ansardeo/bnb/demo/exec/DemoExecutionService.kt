@@ -62,7 +62,7 @@ class DemoExecutionService(
      * cannot be built), then removes that entry's Stop Loss once nothing is left to protect. Serialized by the same mutex as
      * every other state change, so it can never race a fill, a fail-safe or another close.
      */
-    suspend fun closePosition(c: DemoCredentials, id: String): String = withContext(Dispatchers.IO) {
+    suspend fun closeEntryAtMarket(c: DemoCredentials, id: String): String = withContext(Dispatchers.IO) {
         mutex.withLock {
             var e = store.get(id) ?: return@withLock "Entry not found."
             if (e.orderActive && e.orderId != null) {

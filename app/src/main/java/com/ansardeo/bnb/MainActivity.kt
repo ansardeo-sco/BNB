@@ -753,7 +753,7 @@ class MainActivity : AppCompatActivity() {
             if (e.closable) addButton(body, "CLOSE POSITION (market)", 0xFF5A1E1E.toInt()).setOnClickListener {
                 val c = repo.load() ?: return@setOnClickListener toast("Save Demo keys first.")
                 AlertDialog.Builder(this).setTitle("Close on Binance Demo?").setMessage("Closes ${e.openQuantity.toPlainString()} ${e.symbol} ${e.direction} at market and removes its Stop Loss once fully closed.")
-                    .setPositiveButton("CLOSE") { _, _ -> lifecycleScope.launch { toast(svc.closePosition(c, e.id)); renderDemoPositions(body) } }.setNegativeButton("CANCEL", null).show()
+                    .setPositiveButton("CLOSE") { _, _ -> lifecycleScope.launch { toast(svc.closeEntryAtMarket(c, e.id)); renderDemoPositions(body) } }.setNegativeButton("CANCEL", null).show()
             }
         }
         addSpace(body, 10)
