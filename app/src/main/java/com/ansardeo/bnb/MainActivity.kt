@@ -611,23 +611,6 @@ class MainActivity : AppCompatActivity() {
         val virtualTab = TextView(this).apply { gravity = Gravity.CENTER; setPadding(dp(8), dp(10), dp(8), dp(10)); textSize = 12f }
         val demoTab = TextView(this).apply { gravity = Gravity.CENTER; setPadding(dp(8), dp(10), dp(8), dp(10)); textSize = 12f }
         modeBar.addView(virtualTab, LinearLayout.LayoutParams(0, -2, 1f)); modeBar.addView(demoTab, LinearLayout.LayoutParams(0, -2, 1f))
-        val demoBody = column()
-        lateinit var styleModeTabs: () -> Unit
-        lateinit var showVirtual: () -> Unit
-        lateinit var showDemo: () -> Unit
-        styleModeTabs = {
-            val mode = TradingModeStore.get(this)
-            virtualTab.text = "Virtual"; demoTab.text = "Demo"
-            virtualTab.setTextColor(if (mode == TradingMode.VIRTUAL) yellow else muted); virtualTab.setTypeface(null, if (mode == TradingMode.VIRTUAL) Typeface.BOLD else Typeface.NORMAL)
-            virtualTab.background = if (mode == TradingMode.VIRTUAL) rounded(inputBg, 10) else null
-            demoTab.setTextColor(if (mode == TradingMode.DEMO) yellow else muted); demoTab.setTypeface(null, if (mode == TradingMode.DEMO) Typeface.BOLD else Typeface.NORMAL)
-            demoTab.background = if (mode == TradingMode.DEMO) rounded(inputBg, 10) else null
-        }
-        virtualTab.setOnClickListener { TradingModeStore.trySet(this, TradingMode.VIRTUAL); styleModeTabs(); showVirtual() }
-        demoTab.setOnClickListener {
-            val err = TradingModeStore.trySet(this, TradingMode.DEMO)
-            if (err != null) toast(err) else { styleModeTabs(); showDemo() }
-        }
 
         val tabBar = row().apply { background = rounded(card, 12); setPadding(dp(6), dp(6), dp(6), dp(6)) }
         root.addView(tabBar); addSpace(root, 8)
@@ -635,12 +618,27 @@ class MainActivity : AppCompatActivity() {
         root.addView(subBar); addSpace(root, 8)
         val body = column(); root.addView(body)
 
+        var mode = TradingModeStore.get(this)
         var primaryTab = 0 // 0 Position, 1 Open Order, 2 History
         var positionSub = 0 // 0 Open, 1 Closed
         var orderSub = 0 // 0 Basic, 1 Conditional
-        var historySub = 0 // 0 Open (events of open cycles), 1 Closed (closed entries)
+        var historySub = 0 // 0 Open (events), 1 Closed (history)
         lateinit var primaryViews: List<TextView>
         lateinit var subViews: List<TextView>
+        lateinit var render: () -> Unit
+
+        fun styleModeTabs() {
+            virtualTab.text = "Virtual"; demoTab.text = "Demo"
+            virtualTab.setTextColor(if (mode == TradingMode.VIRTUAL) yellow else muted); virtualTab.setTypeface(null, if (mode == TradingMode.VIRTUAL) Typeface.BOLD else Typeface.NORMAL)
+            virtualTab.background = if (mode == TradingMode.VIRTUAL) rounded(inputBg, 10) else null
+            demoTab.setTextColor(if (mode == TradingMode.DEMO) yellow else muted); demoTab.setTypeface(null, if (mode == TradingMode.DEMO) Typeface.BOLD else Typeface.NORMAL)
+            demoTab.background = if (mode == TradingMode.DEMO) rounded(inputBg, 10) else null
+        }
+        virtualTab.setOnClickListener { TradingModeStore.trySet(this, TradingMode.VIRTUAL); mode = TradingMode.VIRTUAL; styleModeTabs(); render() }
+        demoTab.setOnClickListener {
+            val err = TradingModeStore.trySet(this, TradingMode.DEMO)
+            if (err != null) toast(err) else { mode = TradingMode.DEMO; styleModeTabs(); render() }
+        }
 
         fun stylePrimary(posCount: Int, openCount: Int, histCount: Int) {
             val labels = listOf("Position ($posCount)", "Open Order ($openCount)", "History ($histCount)")
@@ -661,7 +659,7 @@ class MainActivity : AppCompatActivity() {
                 tv.background = if (sel) rounded(inputBg, 8) else null
             }
         }
-        fun render() {
+        fun renderVirtual() {
             lifecycleScope.launch {
                 try {
                     val dao = paperDb.dao(); val sid = stageId()
@@ -699,7 +697,6 @@ class MainActivity : AppCompatActivity() {
                     val activeIds = active.map { it.cycle.id }.toSet()
                     val openEvents = dao.getEvents(sid, 300).filter { e -> e.cycleId != null && e.cycleId in activeIds }
                     stylePrimary(openPositions.size, basicCount, history.size)
-                    subBar.visibility = View.VISIBLE
                     if (primaryTab == 0) styleSub("Open (${openPositions.size})", "Closed (${history.size})")
                     else if (primaryTab == 1) styleSub("Basic ($basicCount)", "Conditional ($conditionalCount)")
                     else styleSub("Open (${openEvents.size})", "Closed (${history.size})")
@@ -714,12 +711,28 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
-        showVirtual = { tabBar.visibility = View.VISIBLE; demoBody.visibility = View.GONE; render() }
-        showDemo = {
-            tabBar.visibility = View.GONE; subBar.visibility = View.GONE; body.removeAllViews(); demoBody.visibility = View.VISIBLE
-            renderDemoPositions(demoBody)
+        fun renderDemo() {
+            demoOrdersRefresh = { runOnUiThread { if (body.isAttachedToWindow && mode == TradingMode.DEMO) render() } }
+            val svc = DemoExecutionProvider.get(this)
+            val all = svc.entries()
+            val open = all.filter { it.status != EntryStatus.CLOSED && it.status != EntryStatus.CANCELED && it.status != EntryStatus.REJECTED }
+            val closed = all.filter { it.status == EntryStatus.CLOSED || it.status == EntryStatus.CANCELED || it.status == EntryStatus.REJECTED }
+            val basic = open.filter { it.orderActive }
+            val conditional = open.filter { it.slState == "VERIFIED" }
+            val events = svc.events(200)
+            stylePrimary(open.count { it.executed.signum() > 0 }, basic.size, closed.size)
+            if (primaryTab == 0) styleSub("Open (${open.count { it.executed.signum() > 0 }})", "Closed (${closed.size})")
+            else if (primaryTab == 1) styleSub("Basic (${basic.size})", "Conditional (${conditional.size})")
+            else styleSub("Open (${events.size})", "Closed (${closed.size})")
+            body.removeAllViews()
+            svc.haltReason()?.let { r -> body.addView(text("HALTED: $r", 12f, red)); addSpace(body, 8) }
+            when (primaryTab) {
+                0 -> if (positionSub == 0) renderDemoPositionsOpen(body, open.filter { it.executed.signum() > 0 }) else renderDemoHistory(body, closed)
+                1 -> if (orderSub == 0) renderDemoOrdersBasic(body, basic) else renderDemoOrdersConditional(body, conditional)
+                2 -> if (historySub == 0) renderDemoHistoryOpen(body, events) else renderDemoHistory(body, closed)
+            }
         }
-        root.addView(demoBody); demoBody.visibility = View.GONE
+        render = { if (mode == TradingMode.DEMO) renderDemo() else renderVirtual() }
 
         primaryViews = listOf("Position","Open Order","History").mapIndexed { i, _ ->
             TextView(this).apply { gravity = Gravity.CENTER; setPadding(dp(8), dp(10), dp(8), dp(10)); textSize = 12f; setOnClickListener { if (primaryTab != i) { primaryTab = i; render() } } }
@@ -730,44 +743,101 @@ class MainActivity : AppCompatActivity() {
                 if (primaryTab == 0) { if (positionSub != i) { positionSub = i; render() } } else if (primaryTab == 1) { if (orderSub != i) { orderSub = i; render() } } else { if (historySub != i) { historySub = i; render() } }
             } }.also { subBar.addView(it, LinearLayout.LayoutParams(0, -2, 1f)) }
         }
-        stylePrimary(0,0,0); styleSub("Open","Closed")
-        styleModeTabs(); if (TradingModeStore.get(this) == TradingMode.DEMO) showDemo() else showVirtual()
+        stylePrimary(0,0,0); styleSub("Open","Closed"); styleModeTabs(); render()
     }
 
-    private fun renderDemoPositions(body: LinearLayout) {
-        body.removeAllViews()
-        demoOrdersRefresh = { runOnUiThread { if (body.isAttachedToWindow) renderDemoPositions(body) } }
-        val svc = DemoExecutionProvider.get(this)
-        val repo = DemoCredentialStore.repository(this)
-        val fmt = SimpleDateFormat("HH:mm:ss", Locale.US)
-        svc.haltReason()?.let { r -> body.addView(text("HALTED: $r", 12f, red)) }
-        val all = svc.entries()
-        val open = all.filter { it.status != EntryStatus.CLOSED && it.status != EntryStatus.CANCELED && it.status != EntryStatus.REJECTED }
-        val closed = all.filter { it.status == EntryStatus.CLOSED || it.status == EntryStatus.CANCELED || it.status == EntryStatus.REJECTED }
-        body.addView(text("Open (${open.size})", 13f, yellow, bold = true)); addSpace(body, 4)
-        if (open.isEmpty()) body.addView(text("None", 12f, muted))
-        open.forEach { e ->
-            val sl = when (e.slState) { "VERIFIED" -> "Stop Loss ACTIVE @ ${e.slTrigger}"; "DONE" -> "Stop Loss triggered/finished"; "LOST" -> "Stop Loss LOST"; else -> "no Stop Loss" }
-            body.addView(text("${e.symbol} ${e.direction} ${e.quantity} @ ${e.limitPrice} · ${e.status} · filled ${e.executedQty}" + (e.avgPrice?.let { " @ $it" } ?: "") + " · $sl", 11f, if (e.status == EntryStatus.UNPROTECTED) red else white))
-            if (e.orderActive) addButton(body, "CANCEL ORDER", inputBg).setOnClickListener { val c = repo.load() ?: return@setOnClickListener toast("Save Demo keys first."); lifecycleScope.launch { toast(svc.cancelEntry(c, e.id)); renderDemoPositions(body) } }
-            if (e.closable) addButton(body, "CLOSE POSITION (market)", 0xFF5A1E1E.toInt()).setOnClickListener {
-                val c = repo.load() ?: return@setOnClickListener toast("Save Demo keys first.")
-                AlertDialog.Builder(this).setTitle("Close on Binance Demo?").setMessage("Closes ${e.openQuantity.toPlainString()} ${e.symbol} ${e.direction} at market and removes its Stop Loss once fully closed.")
-                    .setPositiveButton("CLOSE") { _, _ -> lifecycleScope.launch { toast(svc.closeEntryAtMarket(c, e.id)); renderDemoPositions(body) } }.setNegativeButton("CANCEL", null).show()
+    // ---------------- Demo panel renderers (same Position / Open Order / History layout as Virtual) ----------------
+    private fun demoSlLine(e: DemoEntry): String = when (e.slState) {
+        "VERIFIED" -> "Stop Loss ACTIVE @ ${e.slTrigger}"
+        "DONE" -> "Stop Loss triggered/finished"
+        "LOST" -> "Stop Loss LOST"
+        else -> "No Stop Loss"
+    }
+
+    private fun renderDemoPositionsOpen(body: LinearLayout, open: List<DemoEntry>) {
+        if (open.isEmpty()) { body.addView(text("No open positions.", 13f, muted)); return }
+        val repo = DemoCredentialStore.repository(this); val svc = DemoExecutionProvider.get(this)
+        for (e in open) {
+            val box = makeItemCard(body)
+            val header = row()
+            header.addView(text("${e.symbol}  ${e.direction}", 15f, if (e.direction == "LONG") green else red, true), LinearLayout.LayoutParams(0, -2, 1f))
+            header.addView(text("${e.leverage}x", 12f, muted, true)); box.addView(header)
+            addLabel(box, "Fill Price", e.avgPrice?.let { PriceFormatter.formatPrice(it.toDouble()) } ?: "--", white, true)
+            addLabel(box, "Quantity", e.executedQty, white, true)
+            addLabel(box, "Status", e.status.name, white, true)
+            addLabel(box, "Stop Loss", demoSlLine(e), if (e.status == EntryStatus.UNPROTECTED) red else if (e.slState == "VERIFIED") green else yellow, true)
+            if (e.note.isNotBlank()) addLabel(box, "Note", e.note, red, true)
+            if (e.closable) {
+                val b = Button(this).apply { text = "CLOSE POSITION (market)"; isAllCaps = false; setTextColor(white); background = rounded(0xFF5A1E1E.toInt(), 12) }
+                box.addView(b, LinearLayout.LayoutParams(-1, dp(40)).apply { topMargin = dp(8) })
+                b.setOnClickListener {
+                    val c = repo.load() ?: return@setOnClickListener toast("Save Demo keys first.")
+                    AlertDialog.Builder(this).setTitle("Close on Binance Demo?").setMessage("Closes ${e.openQuantity.toPlainString()} ${e.symbol} ${e.direction} at market and removes its Stop Loss once fully closed.")
+                        .setPositiveButton("CLOSE") { _, _ -> lifecycleScope.launch { toast(svc.closeEntryAtMarket(c, e.id)); demoOrdersRefresh?.invoke() } }.setNegativeButton("CANCEL", null).show()
+                }
             }
         }
-        addSpace(body, 10)
-        body.addView(text("History (${closed.size})", 13f, yellow, bold = true)); addSpace(body, 4)
-        if (closed.isEmpty()) body.addView(text("None", 12f, muted))
-        closed.takeLast(20).reversed().forEach { e -> body.addView(text("${e.symbol} ${e.direction} ${e.quantity} @ ${e.limitPrice} · ${e.status}" + (e.note.takeIf { it.isNotBlank() }?.let { " · $it" } ?: ""), 11f, muted)) }
-        addSpace(body, 10)
-        body.addView(text("Events", 13f, yellow, bold = true)); addSpace(body, 4)
-        svc.events(15).forEach { (t, s) -> body.addView(text(fmt.format(Date(t)) + "  " + s, 10f, muted)) }
-        addButton(body, "REFRESH NOW", inputBg).setOnClickListener {
-            val c = repo.load() ?: return@setOnClickListener toast("Save Demo keys first.")
-            lifecycleScope.launch { svc.refresh(c); renderDemoPositions(body) }
+    }
+
+    private fun renderDemoOrdersBasic(body: LinearLayout, basic: List<DemoEntry>) {
+        if (basic.isEmpty()) { body.addView(text("No open orders.", 13f, muted)); return }
+        val repo = DemoCredentialStore.repository(this); val svc = DemoExecutionProvider.get(this)
+        for (e in basic) {
+            val box = makeItemCard(body)
+            val header = row()
+            header.addView(text("${e.symbol} ${e.direction}", 15f, if (e.direction == "LONG") green else red, true), LinearLayout.LayoutParams(0, -2, 1f))
+            header.addView(text("Entry", 12f, yellow, true)); box.addView(header)
+            addLabel(box, "Order Price", PriceFormatter.formatPrice(e.limitPrice.toDoubleOrNull()), white, true)
+            addLabel(box, "Type · Status", "LIMIT · ${e.status}" + (if (e.executedQty.toDoubleOrNull() ?: 0.0 > 0.0) " · part-filled ${e.executedQty}" else ""), white, true)
+            addLabel(box, "Quantity", e.quantity, white, true)
+            addCancelButton(box, "Cancel order") {
+                val c = repo.load() ?: return@addCancelButton PaperEngine.EngineResult(false, "Save Demo keys first.")
+                PaperEngine.EngineResult(true, svc.cancelEntry(c, e.id))
+            }
         }
     }
+
+    private fun renderDemoOrdersConditional(body: LinearLayout, conditional: List<DemoEntry>) {
+        if (conditional.isEmpty()) { body.addView(text("No conditional orders.", 13f, muted)); return }
+        for (e in conditional) {
+            val box = makeItemCard(body)
+            val header = row()
+            header.addView(text("${e.symbol} ${e.direction}", 15f, if (e.direction == "SHORT") red else green, true), LinearLayout.LayoutParams(0, -2, 1f))
+            box.addView(header)
+            addLabel(box, "Protected Quantity", e.protectedQty, white, true)
+            addLabel(box, "Stop Loss Trigger", PriceFormatter.formatPrice(e.slTrigger?.toDoubleOrNull()), red, true)
+        }
+    }
+
+    /** History > Open: the event trail (sending, fills, Stop Loss confirmed, close, fail-safe) for the Demo panel. */
+    private fun renderDemoHistoryOpen(body: LinearLayout, events: List<Pair<Long, String>>) {
+        if (events.isEmpty()) { body.addView(text("No events.", 13f, muted)); return }
+        val tf = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
+        for ((t, msg) in events) {
+            val box = makeItemCard(body)
+            box.addView(text(msg, 12f, if (msg.contains("FAIL-SAFE") || msg.contains("HALT") || msg.contains("UNPROTECTED")) red else white))
+            box.addView(text(tf.format(Date(t)), 11f, muted))
+        }
+    }
+
+    private fun renderDemoHistory(body: LinearLayout, closed: List<DemoEntry>) {
+        if (closed.isEmpty()) { body.addView(text("No closed positions.", 13f, muted)); return }
+        val tf = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US)
+        for (e in closed.asReversed()) {
+            val box = makeItemCard(body)
+            val header = row()
+            header.addView(text("${e.symbol} ${e.direction}", 15f, if (e.direction == "LONG") green else red, true), LinearLayout.LayoutParams(0, -2, 1f))
+            header.addView(text(e.status.name, 12f, when (e.status) { EntryStatus.UNPROTECTED -> red; EntryStatus.FAILSAFE_CLOSED -> red; EntryStatus.CLOSED -> white; else -> muted }, true))
+            box.addView(header)
+            addLabel(box, "Order Price", PriceFormatter.formatPrice(e.limitPrice.toDoubleOrNull()), white, true)
+            if (e.avgPrice != null) addLabel(box, "Fill Price", PriceFormatter.formatPrice(e.avgPrice.toDoubleOrNull()), white, true)
+            addLabel(box, "Qty", e.executedQty)
+            addLabel(box, "Leverage", "${e.leverage}x")
+            if (e.note.isNotBlank()) addLabel(box, "Note", e.note, muted)
+            addLabel(box, "Updated", tf.format(Date(e.updatedAt)))
+        }
+    }
+
 
     /** One-line description of a cycle's trailing-stop state for the Positions / Open Orders screens. */
     private fun trailingText(c: PaperCycleEntity): String = when {

@@ -117,3 +117,6 @@ These tests are compiled/run only with `-PengineTests` (so the normal build is u
 
 ### Fix — cancel confirmation retried (Binance Demo real-device finding)
 Binance Demo can answer a Stop Loss / order cancel as accepted before its status actually flips; the Compatibility Probe and `closeEntryAtMarket` now re-check up to 4 times (short backoff) before concluding a cancel was not confirmed, instead of failing on the first stale read.
+
+### Fix — Demo Positions tab now uses the same Position / Open Order / History layout as Virtual
+The Demo panel previously showed a flat text list; it now shares the exact tab structure Virtual uses (Position → Open/Closed, Open Order → Basic/Conditional, History → Open events/Closed), with the same per-item card layout (symbol, direction, fill price, quantity, Stop Loss line, Close/Cancel buttons). Virtual's own rendering and data were not changed.
