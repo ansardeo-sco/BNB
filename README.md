@@ -96,3 +96,8 @@ These tests are compiled/run only with `-PengineTests` (so the normal build is u
 - `demo/trade/` : approved-endpoint catalog, Demo-only signed trade client (LIMIT/GTC and STOP_MARKET-on-mark only), exchange rules, Compatibility Probe.
 - More tab → "BINANCE DEMO COMPATIBILITY PROBE": places a far LIMIT order and a far Stop Loss order on Demo (BTCUSDT), cancels both, opens no position, changes no account setting, produces a copyable sanitized report.
 - Trading stays on Virtual. Strategy automation on Demo (Phase 3B) is not part of this step.
+
+### Phase 3A step 3 — Demo safety setup (per symbol)
+- `demo/trade/SymbolSetup.kt`: reads Hedge Mode (never changed), exchange rules, idle state; sets ISOLATED margin and the configured leverage (3x-20x) only while the symbol has no position/order/Stop Loss; reads both back from Binance Demo. Reports READY only after Binance confirms.
+- `ExchangeRules.kt`: `OrderPrep` (tick/step rounding that is never more aggressive, min qty / min notional / price band) and `RulesCache`.
+- More tab → "BINANCE DEMO SAFETY SETUP (BTCUSDT)". No orders are placed in this step.
