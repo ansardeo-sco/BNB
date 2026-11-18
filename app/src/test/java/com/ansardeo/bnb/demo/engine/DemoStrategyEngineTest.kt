@@ -295,7 +295,7 @@ class DemoStrategyEngineTest {
         tick()
         val after = store.get(e.id)!!
         assertEquals(EntryStatus.CLOSED, after.status); assertEquals("NONE", after.slState)
-        assertNull(store.haltReason()); assertEquals(CycleStatus.CLOSED, store.getCycle(e.cycleId)!!.status)
+        assertNull(svc.haltReason()); assertEquals(CycleStatus.CLOSED, store.getCycle(e.cycleId)!!.status)
         assertEquals(0, marketPosts().size)
     }
 
@@ -303,7 +303,7 @@ class DemoStrategyEngineTest {
         val e = filledEntry(); ex.limitFill = "none"
         ex.algos[store.get(e.id)!!.slAlgoId!!]!!.status = "CANCELED"; ex.longAmt = "0.01"
         tick()
-        assertEquals("LOST", store.get(e.id)!!.slState); assertNotNull(store.haltReason()); assertEquals(EntryStatus.FILLED, store.get(e.id)!!.status)
+        assertEquals("LOST", store.get(e.id)!!.slState); assertNotNull(svc.haltReason()); assertEquals(EntryStatus.FILLED, store.get(e.id)!!.status)
     }
 
     @Test fun closeFailingBecauseThereIsNoPositionRecordsTheEntryAsClosedOutsideTheApp() {
