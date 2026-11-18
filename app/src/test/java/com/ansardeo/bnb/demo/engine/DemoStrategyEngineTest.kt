@@ -282,6 +282,11 @@ class DemoStrategyEngineTest {
         assertEquals(c, DemoCycle.fromJson(c.toJson()))
     }
 
+    @Test fun theMarginTypedInTheOrdersCardIsUsedWhenAutoTradingRoutesTheEntry() {
+        val r = runBlocking { engine.submitEntry(creds, "BTCUSDT", "LONG", BigDecimal("59000"), marginOverride = BigDecimal("50")) } as EngineSubmit.Placed
+        assertEquals(0, BigDecimal("0.0050").compareTo(BigDecimal(r.entry.quantity))) // 50 USDT x 6 / 59000 = 0.00508 -> 0.0050
+    }
+
     // ---------------- position closed outside the app ----------------
     private fun filledEntry(): DemoEntry {
         settings = settings.copy(averagingEnabled = false, oppositeEnabled = false, trailingEnabled = false)

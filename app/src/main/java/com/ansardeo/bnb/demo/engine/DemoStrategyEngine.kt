@@ -111,8 +111,8 @@ class DemoStrategyEngine(
     private var counter = 0
 
     // ------------------------------------------------------------------ public API
-    suspend fun submitEntry(c: DemoCredentials, symbol: String, direction: String, price: BigDecimal, kind: EntryKind = EntryKind.MANUAL): EngineSubmit =
-        mutex.withLock { submitLocked(c, symbol, direction, price, kind, null) }
+    suspend fun submitEntry(c: DemoCredentials, symbol: String, direction: String, price: BigDecimal, kind: EntryKind = EntryKind.MANUAL, marginOverride: BigDecimal? = null): EngineSubmit =
+        mutex.withLock { submitLocked(c, symbol, direction, price, kind, null, marginOverride) }
 
     /** One strategy pass over every open cycle. Never throws (except cancellation); a failure is logged and retried on the next pass. */
     suspend fun tick(c: DemoCredentials) = mutex.withLock {
@@ -143,9 +143,9 @@ class DemoStrategyEngine(
     fun hasOpenCycles(): Boolean = store.cycles().any { it.status != CycleStatus.CLOSED }
 
     // ------------------------------------------------------------------ entries
-    private suspend fun submitLocked(c: DemoCredentials, symbol: String, direction: String, price: BigDecimal, kind: EntryKind, cycleId: String?): EngineSubmit {
+    private suspend fun submitLocked(c: DemoCredentials, symbol: String, direction: String, price: BigDecimal, kind: EntryKind, cycleId: String?, marginOverride: BigDecimal? = null): EngineSubmit {
         val s = settingsOf(symbol)
-        val margin = when (kind) { EntryKind.AVERAGING -> s.averagingMargin; EntryKind.OPPOSITE_SIDE -> s.oppositeMargin; else -> s.marginAmount }
+        val margin = when (kind) { EntryKind.AVERAGING -> s.averagingMargin; EntryKind.OPPOSITE_SIDE -> s.oppositeMargin; else -> marginOverride?.toDouble() ?: s.marginAmount }
         val cid = cycleId ?: newCycleId()
         if (cycleId == null) store.putCycle(DemoCycle(cid, symbol, direction, s.leverage, kind.name, createdAt = clock(), updatedAt = clock()))
         book.creds = c

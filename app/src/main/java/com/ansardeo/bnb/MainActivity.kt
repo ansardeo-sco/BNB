@@ -1649,22 +1649,42 @@ class MainActivity : AppCompatActivity() {
         refresh()
     }
 
+    /** Coin picker for the Binance Demo cards (type or choose; the list is the Binance USDⓈ-M symbol list). [onPicked] runs when a coin is chosen from the list. */
+    private fun demoSymbolField(initial: String, onPicked: () -> Unit): AutoCompleteTextView {
+        val f = AutoCompleteTextView(this).apply {
+            hint = "Coin (e.g. ETHUSDT)"; setText(initial); setSingleLine(true); setTextColor(white); setHintTextColor(muted); threshold = 1
+            inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS
+        }
+        lifecycleScope.launch {
+            val list = marketRepo.getUsdmSymbols().getOrElse { listOf("BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT") }
+            f.setAdapter(ArrayAdapter(this@MainActivity, android.R.layout.simple_dropdown_item_1line, list))
+        }
+        f.setOnItemClickListener { _, _, _, _ -> onPicked() }
+        f.setOnFocusChangeListener { _, has -> if (!has) onPicked() }
+        return f
+    }
+    private fun pickedSymbol(f: AutoCompleteTextView): String? = f.text.toString().trim().uppercase().takeIf { Regex("[A-Z0-9]{2,20}USDT").matches(it) }
+
     // ---------------- Binance Demo Safety Setup (Phase 3A step 3: ISOLATED margin + leverage for one symbol; NO orders) ----------------
     private fun addDemoSetupCard(root: LinearLayout) {
-        val symbol = "BTCUSDT"
-        val card = addCard(root, "BINANCE DEMO SAFETY SETUP ($symbol)",
-            "Makes $symbol safe on Binance DEMO: checks Hedge Mode (never changed by the app), sets ISOLATED margin and your configured leverage, then reads both back from Binance. Nothing is changed while the symbol has a position or any order. Places NO orders. Trading stays on Virtual.")
+        val card = addCard(root, "BINANCE DEMO SAFETY SETUP",
+            "Pick the coin, then make it safe on Binance DEMO (do this once per coin before its first entry): checks Hedge Mode (never changed by the app), sets ISOLATED margin and your configured leverage, then reads both back from Binance. Nothing is changed while the symbol has a position or any order. Places NO orders. Trading stays on Virtual.")
+        lateinit var refresh: () -> Unit
+        val symField = demoSymbolField("BTCUSDT") { refresh() }
+        card.addView(symField)
         val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         card.addView(box)
         val repo = DemoCredentialStore.repository(this)
         val fmt = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
-        fun refresh() {
+        refresh = {
             box.removeAllViews()
-            val t = DemoSymbolSetupStore.text(this)
-            if (t == null) addLabel(box, "Setup", "Not run", muted)
+            val sym = pickedSymbol(symField)
+            val t = sym?.let { DemoSymbolSetupStore.text(this, it) }
+            if (sym == null) addLabel(box, "Coin", "Enter a valid USDT coin, e.g. ETHUSDT", red)
+            else if (t == null) addLabel(box, "Setup $sym", "Not run", muted)
             else {
-                val ok = DemoSymbolSetupStore.ready(this)
-                addLabel(box, "Last setup", (if (ok) "READY" else "NOT READY") + "  ·  " + fmt.format(Date(DemoSymbolSetupStore.at(this))), if (ok) green else red)
+                val ok = DemoSymbolSetupStore.ready(this, sym)
+                addLabel(box, "Last setup $sym", (if (ok) "READY" else "NOT READY") + "  ·  " + fmt.format(Date(DemoSymbolSetupStore.at(this, sym))), if (ok) green else red)
                 t.lines().forEach { if (it.isNotBlank()) box.addView(text(it, 11f, muted)) }
             }
         }
@@ -1672,6 +1692,7 @@ class MainActivity : AppCompatActivity() {
         runBtn.setOnClickListener {
             val creds = repo.load()
             if (creds == null) { toast(if (repo.hasCredentials()) "Stored keys cannot be read. Replace them." else "Save your Demo keys first."); return@setOnClickListener }
+            val symbol = pickedSymbol(symField) ?: return@setOnClickListener toast("Enter a valid USDT coin, e.g. ETHUSDT.")
             val lev = LocalCoinSettingsStore.load(this, symbol).leverage
             AlertDialog.Builder(this).setTitle("Run Demo safety setup?")
                 .setMessage("On Binance DEMO this will set $symbol to ISOLATED margin and ${lev}x leverage (your configured leverage) if it is not already, and read them back. No order is placed. Nothing is changed if $symbol has a position or any order.")
@@ -1681,14 +1702,14 @@ class MainActivity : AppCompatActivity() {
                         val report = DemoSymbolSetup(DemoTradeClient.create(), symbol, lev).run(creds) { msg -> runBtn.text = msg }
                         DemoSymbolSetupStore.save(this@MainActivity, report)
                         runBtn.isEnabled = true; runBtn.text = "RUN SAFETY SETUP (Demo)"
-                        refresh(); toast(if (report.ready) "Setup confirmed" else "Setup not ready — see report")
+                        refresh(); toast(if (report.ready) "Setup confirmed for $symbol" else "Setup not ready — see report")
                     }
                 }
                 .setNegativeButton("CANCEL", null).show()
         }
         addButton(card, "COPY REPORT", inputBg).setOnClickListener {
-            val t = DemoSymbolSetupStore.text(this)
-            if (t == null) { toast("Run the setup first."); return@setOnClickListener }
+            val t = pickedSymbol(symField)?.let { DemoSymbolSetupStore.text(this, it) }
+            if (t == null) { toast("Run the setup for this coin first."); return@setOnClickListener }
             (getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager).setPrimaryClip(android.content.ClipData.newPlainText("BNB setup report", t))
             toast("Report copied")
         }
@@ -1725,8 +1746,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun addDemoOrdersCard(root: LinearLayout) {
-        val symbol = "BTCUSDT"
-        val card = addCard(root, "BINANCE DEMO ORDERS ($symbol)",
+        val card = addCard(root, "BINANCE DEMO ORDERS",
             "Manual LIMIT entry on Binance DEMO. Every filled entry gets its own exchange-side Stop Loss (from its actual fill price, your Stop Loss ROI setting). A Stop Loss is shown as ACTIVE only after Binance Demo confirmed it. If it cannot be confirmed, the unprotected quantity is closed at market and new entries are halted. Run the Safety Setup first. Trading stays on Virtual.")
         val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         val form = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
@@ -1739,12 +1759,14 @@ class MainActivity : AppCompatActivity() {
         val dirSpinner = Spinner(this).apply { adapter = createDarkSpinnerAdapter(listOf("LONG", "SHORT")) }
         val priceField = EditText(this).apply { hint = "Limit price"; inputType = android.text.InputType.TYPE_CLASS_NUMBER or android.text.InputType.TYPE_NUMBER_FLAG_DECIMAL; setSingleLine(true); setTextColor(white); setHintTextColor(muted) }
         val marginField = EditText(this).apply { hint = "Margin (USDT)"; inputType = android.text.InputType.TYPE_CLASS_NUMBER or android.text.InputType.TYPE_NUMBER_FLAG_DECIMAL; setSingleLine(true); setTextColor(white); setHintTextColor(muted) }
-        marginField.setText(LocalCoinSettingsStore.load(this, symbol).marginAmount.toString())
-        form.addView(dirSpinner); form.addView(priceField); form.addView(marginField)
+        marginField.setText(LocalCoinSettingsStore.load(this, "BTCUSDT").marginAmount.toString())
+        lateinit var symbolField: AutoCompleteTextView
+        symbolField = demoSymbolField("BTCUSDT") { pickedSymbol(symbolField)?.let { s0 -> marginField.setText(LocalCoinSettingsStore.load(this, s0).marginAmount.toString()) } }
+        form.addView(symbolField); form.addView(dirSpinner); form.addView(priceField); form.addView(marginField)
 
         fun statusLine(e: DemoEntry): String {
             val sl = when (e.slState) { "VERIFIED" -> "Stop Loss ACTIVE @ ${e.slTrigger} (qty ${e.protectedQty})"; "DONE" -> "Stop Loss triggered/finished"; "LOST" -> "Stop Loss LOST"; else -> "no Stop Loss" }
-            return "${e.direction} ${e.quantity} @ ${e.limitPrice} · ${e.status} · filled ${e.executedQty}" + (e.avgPrice?.let { " @ $it" } ?: "") + " · $sl" + (if (e.note.isNotBlank()) " · ${e.note}" else "")
+            return "${e.symbol} ${e.direction} ${e.quantity} @ ${e.limitPrice} · ${e.status} · filled ${e.executedQty}" + (e.avgPrice?.let { " @ $it" } ?: "") + " · $sl" + (if (e.note.isNotBlank()) " · ${e.note}" else "")
         }
 
         fun refresh() {
@@ -1780,6 +1802,7 @@ class MainActivity : AppCompatActivity() {
             if (creds == null) { toast(if (repo.hasCredentials()) "Stored keys cannot be read. Replace them." else "Save your Demo keys first."); return@setOnClickListener }
             val price = priceField.text.toString().toBigDecimalOrNull(); val margin = marginField.text.toString().toBigDecimalOrNull()
             if (price == null || margin == null || price.signum() <= 0 || margin.signum() <= 0) { toast("Enter a valid price and margin."); return@setOnClickListener }
+            val symbol = pickedSymbol(symbolField) ?: return@setOnClickListener toast("Enter a valid USDT coin, e.g. ETHUSDT.")
             val s = LocalCoinSettingsStore.load(this, symbol)
             val dir = dirSpinner.selectedItem.toString()
             val request = DemoExecutionService.EntryRequest(symbol, dir, price, margin, s.leverage, s.stopLossRoi, s.stopLossEnabled)
@@ -1790,7 +1813,7 @@ class MainActivity : AppCompatActivity() {
                     lifecycleScope.launch {
                         if (DemoAutoTradeStore.isOn(this@MainActivity)) {
                             // Auto-Trading ON: the entry starts a strategy cycle and goes through Global Best Entry Price Priority.
-                            val res = engine.submitEntry(creds, symbol, dir, price)
+                            val res = engine.submitEntry(creds, symbol, dir, price, marginOverride = margin)
                             placeBtn.isEnabled = true; refresh()
                             toast(when (res) { is EngineSubmit.Placed -> "Order sent: ${res.entry.status}"; is EngineSubmit.NotPlaced -> res.message })
                         } else {
