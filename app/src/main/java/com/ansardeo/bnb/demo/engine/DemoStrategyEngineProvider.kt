@@ -10,6 +10,6 @@ object DemoStrategyEngineProvider {
     @Volatile private var instance: DemoStrategyEngine? = null
     fun get(context: Context): DemoStrategyEngine = instance ?: synchronized(this) {
         val app = context.applicationContext
-        instance ?: DemoStrategyEngine(DemoTradeClient.create(), DemoExecutionProvider.get(app), DemoExecutionProvider.store(app)) { LocalCoinSettingsStore.load(app, it) }.also { instance = it }
+        instance ?: DemoStrategyEngine(DemoTradeClient.create(), DemoExecutionProvider.get(app), DemoExecutionProvider.store(app), settingsOf = { symbol -> LocalCoinSettingsStore.load(app, symbol) }).also { instance = it }
     }
 }
