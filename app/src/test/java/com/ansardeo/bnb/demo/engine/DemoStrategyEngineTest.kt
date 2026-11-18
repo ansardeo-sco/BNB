@@ -282,6 +282,42 @@ class DemoStrategyEngineTest {
         assertEquals(c, DemoCycle.fromJson(c.toJson()))
     }
 
+    // ---------------- position closed outside the app ----------------
+    private fun filledEntry(): DemoEntry {
+        settings = settings.copy(averagingEnabled = false, oppositeEnabled = false, trailingEnabled = false)
+        ex.limitFill = "full"; ex.fillPrice = "60000"
+        return (submit("LONG", "60000") as EngineSubmit.Placed).entry
+    }
+
+    @Test fun aPositionClosedOnBinanceWithItsStopLossCancelledIsRecordedAsClosedNotAsALostStopLoss() {
+        val e = filledEntry(); ex.limitFill = "none"
+        ex.algos[store.get(e.id)!!.slAlgoId!!]!!.status = "CANCELED"; ex.longAmt = "0"
+        tick()
+        val after = store.get(e.id)!!
+        assertEquals(EntryStatus.CLOSED, after.status); assertEquals("NONE", after.slState)
+        assertNull(store.haltReason()); assertEquals(CycleStatus.CLOSED, store.getCycle(e.cycleId)!!.status)
+        assertEquals(0, marketPosts().size)
+    }
+
+    @Test fun aCancelledStopLossWhileBinanceStillHoldsThePositionStaysALostStopLossAndHalts() {
+        val e = filledEntry(); ex.limitFill = "none"
+        ex.algos[store.get(e.id)!!.slAlgoId!!]!!.status = "CANCELED"; ex.longAmt = "0.01"
+        tick()
+        assertEquals("LOST", store.get(e.id)!!.slState); assertNotNull(store.haltReason()); assertEquals(EntryStatus.FILLED, store.get(e.id)!!.status)
+    }
+
+    @Test fun closeFailingBecauseThereIsNoPositionRecordsTheEntryAsClosedOutsideTheApp() {
+        val e = filledEntry(); ex.limitFill = "none"; ex.marketFailures = 10; ex.longAmt = "0"
+        val msg = runBlocking { svc.closeEntryAtMarket(creds, e.id) }
+        assertTrue(msg, msg.contains("closed outside the app")); assertEquals(EntryStatus.CLOSED, store.get(e.id)!!.status)
+    }
+
+    @Test fun closeFailingWhileThePositionIsStillOnBinanceKeepsTheEntryOpen() {
+        val e = filledEntry(); ex.limitFill = "none"; ex.marketFailures = 10; ex.longAmt = "0.01"
+        val msg = runBlocking { svc.closeEntryAtMarket(creds, e.id) }
+        assertTrue(msg, msg.contains("not confirmed")); assertEquals(EntryStatus.FILLED, store.get(e.id)!!.status)
+    }
+
     // ---------------- static guard ----------------
     @Test fun engineSourceHasNoHttpNoLogsNoSecretsNoTakeProfit() {
         val dir = listOf("src/main/java/com/ansardeo/bnb/demo/engine", "app/src/main/java/com/ansardeo/bnb/demo/engine").map { File(it) }.first { it.isDirectory }

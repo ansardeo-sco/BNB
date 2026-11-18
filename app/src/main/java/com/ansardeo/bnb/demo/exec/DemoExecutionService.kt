@@ -54,6 +54,8 @@ class DemoExecutionService(
     suspend fun refresh(c: DemoCredentials) = withContext(Dispatchers.IO) {
         mutex.withLock {
             for (e in store.all()) if (e.needsAttention || e.hasOpenProtection) progress(c, e)
+            // An entry whose Stop Loss is gone while Binance shows no position for it was closed outside the app (e.g. on the Binance app): record that.
+            for (e in store.all()) if (e.slState == "LOST" && e.closable) reconcileIfFlat(c, store.get(e.id) ?: e)
         }
     }
 
@@ -85,7 +87,10 @@ class DemoExecutionService(
                 if (st == "FILLED") { filled = true; break }
                 ev("${e.id}: close attempt $attempt not confirmed filled (status $st)")
             }
-            if (!filled) return@withLock "Market close was not confirmed. Check Binance Demo and try again."
+            if (!filled) {
+                if (reconcileIfFlat(c, e)) return@withLock "No open position was found on Binance Demo for this entry (it was closed outside the app). The entry is now recorded as closed."
+                return@withLock "Market close was not confirmed. Check Binance Demo and try again."
+            }
             e = save(e.copy(closedQty = ExchangeRules.plain(e.closedQuantity.add(qty))))
             ev("${e.id}: $qtyText closed at market")
             if (e.openQuantity.signum() <= 0) {
@@ -183,18 +188,38 @@ class DemoExecutionService(
 
     /** The open quantity Binance reports for one direction of a symbol (null = could not be read). */
     suspend fun exchangePositionAmount(c: DemoCredentials, symbol: String, direction: String): BigDecimal? = withContext(Dispatchers.IO) {
-        mutex.withLock {
-            val r = api.positionRisk(c, symbol)
-            if (!r.ok) return@withLock null
-            val a = jsonArray(r.body) ?: return@withLock null
-            var total = BigDecimal.ZERO; var seen = false
-            for (i in 0 until a.length()) {
-                val o = a.optJSONObject(i) ?: continue
-                if (o.optString("symbol", symbol) != symbol || o.optString("positionSide") != direction) continue
-                seen = true; total = total.add(DemoEntry.bd(o.optString("positionAmt", "0")).abs())
-            }
-            if (seen) total else null
+        mutex.withLock { readPosition(c, symbol, direction) }
+    }
+
+    private suspend fun readPosition(c: DemoCredentials, symbol: String, direction: String): BigDecimal? {
+        val r = api.positionRisk(c, symbol)
+        if (!r.ok) return null
+        val a = jsonArray(r.body) ?: return null
+        var total = BigDecimal.ZERO; var seen = false
+        for (i in 0 until a.length()) {
+            val o = a.optJSONObject(i) ?: continue
+            if (o.optString("symbol", symbol) != symbol || o.optString("positionSide") != direction) continue
+            seen = true; total = total.add(DemoEntry.bd(o.optString("positionAmt", "0")).abs())
         }
+        return if (seen) total else null
+    }
+
+    /**
+     * Records an entry as closed OUTSIDE the app, but only when Binance Demo was read successfully and shows no position left for this entry
+     * (the direction's position minus what the other open entries of the same symbol+direction account for). Sends no order. Called with the lock held.
+     */
+    private suspend fun reconcileIfFlat(c: DemoCredentials, e: DemoEntry): Boolean {
+        if (e.executed.signum() <= 0 || e.openQuantity.signum() <= 0 || e.orderActive) return false
+        val onExchange = readPosition(c, e.symbol, e.direction) ?: return false
+        val others = store.all().filter { it.id != e.id && it.symbol == e.symbol && it.direction == e.direction && it.executed.signum() > 0 && !it.orderActive &&
+            it.status != EntryStatus.CLOSED && it.status != EntryStatus.FAILSAFE_CLOSED && it.status != EntryStatus.REJECTED && it.slState != "DONE" }
+            .fold(BigDecimal.ZERO) { a, o -> a.add(o.openQuantity) }
+        if (onExchange.subtract(others).signum() > 0) return false
+        val algoId = e.slAlgoId
+        if (algoId != null && e.slState == "VERIFIED") api.cancelAlgo(c, algoId) // best effort; a LOST one is already gone
+        save(e.copy(closedQty = ExchangeRules.plain(e.executed), status = EntryStatus.CLOSED, slState = "NONE", note = "Closed outside the app (no position found on Binance Demo)"))
+        ev("${e.id}: no ${e.direction} position found on Binance Demo — recorded as closed outside the app")
+        return true
     }
 
     /**
@@ -352,6 +377,7 @@ class DemoExecutionService(
             "NEW", "WORKING" -> e
             "TRIGGERING", "TRIGGERED", "FINISHED" -> { ev("${e.id}: Stop Loss $st"); save(e.copy(slState = "DONE", note = "Stop Loss $st")) }
             else -> {
+                if (reconcileIfFlat(c, e)) return store.get(e.id) ?: e // the position itself is gone (closed on Binance): not a lost Stop Loss
                 ev("${e.id}: Stop Loss is no longer active (status $st) — NEW ENTRIES HALTED")
                 store.setHalt("The Stop Loss of ${e.id} (${e.symbol} ${e.direction}) is no longer active (status $st). Check the position on Binance Demo.")
                 save(e.copy(slState = "LOST", note = "Stop Loss no longer active ($st)"))
