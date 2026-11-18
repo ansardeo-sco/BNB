@@ -27,6 +27,11 @@ data class DemoCycle(
     /** Set when the Trailing Stop fired: the mark price at that moment and the cycle's weighted average entry price at that moment. */
     val closePrice: String? = null,
     val closeWap: String? = null,
+    /** How the cycle exit was triggered: "" (not yet), "APP" (app-side trailing, closed at market) or "EXCHANGE" (Binance Demo Trailing Stop order fired). */
+    val exitBy: String = "",
+    /** Phase 3C trailing mode: "" undecided, "EXCHANGE" (Trailing Stop order on Binance Demo) or "APP" (app-side trailing). */
+    val trMode: String = "",
+    val trAlgoId: Long? = null, val trQty: String = "", val trWap: String = "", val trActivation: String? = null, val trCallback: String? = null, val trFail: Int = 0,
     val bookedRoi: String? = null,
     val note: String = "",
     val createdAt: Long = 0L,
@@ -42,7 +47,8 @@ data class DemoCycle(
         put("trailActive", trailActive); trailExtreme?.let { put("trailExtreme", it) }; trailStop?.let { put("trailStop", it) }
         put("oppActive", oppActive); oppExtreme?.let { put("oppExtreme", it) }; oppStop?.let { put("oppStop", it) }
         put("avgDone", avgDone); put("oppDone", oppDone); put("reentryDone", reentryDone)
-        closePrice?.let { put("closePrice", it) }; closeWap?.let { put("closeWap", it) }; bookedRoi?.let { put("bookedRoi", it) }
+        closePrice?.let { put("closePrice", it) }; closeWap?.let { put("closeWap", it) }
+        put("exitBy", exitBy); put("trMode", trMode); trAlgoId?.let { put("trAlgoId", it) }; put("trQty", trQty); put("trWap", trWap); trActivation?.let { put("trActivation", it) }; trCallback?.let { put("trCallback", it) }; put("trFail", trFail); bookedRoi?.let { put("bookedRoi", it) }
         put("note", note); put("createdAt", createdAt); put("updatedAt", updatedAt)
     }.toString()
 
@@ -56,7 +62,8 @@ data class DemoCycle(
                 trailActive = o.optBoolean("trailActive"), trailExtreme = s("trailExtreme"), trailStop = s("trailStop"),
                 oppActive = o.optBoolean("oppActive"), oppExtreme = s("oppExtreme"), oppStop = s("oppStop"),
                 avgDone = o.optBoolean("avgDone"), oppDone = o.optBoolean("oppDone"), reentryDone = o.optBoolean("reentryDone"),
-                closePrice = s("closePrice"), closeWap = s("closeWap"), bookedRoi = s("bookedRoi"),
+                closePrice = s("closePrice"), closeWap = s("closeWap"),
+                exitBy = o.optString("exitBy", ""), trMode = o.optString("trMode", ""), trAlgoId = if (o.has("trAlgoId")) o.getLong("trAlgoId") else null, trQty = o.optString("trQty", ""), trWap = o.optString("trWap", ""), trActivation = s("trActivation"), trCallback = s("trCallback"), trFail = o.optInt("trFail", 0), bookedRoi = s("bookedRoi"),
                 note = o.optString("note", ""), createdAt = o.optLong("createdAt", 0L), updatedAt = o.optLong("updatedAt", 0L),
             )
         }.getOrNull()

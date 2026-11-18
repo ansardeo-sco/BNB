@@ -28,6 +28,7 @@ import com.ansardeo.bnb.demo.DemoCredentialStore
 import com.ansardeo.bnb.demo.exec.DemoEntry
 import com.ansardeo.bnb.demo.engine.DemoAutoTradeStore
 import com.ansardeo.bnb.demo.engine.DemoStrategyEngineProvider
+import com.ansardeo.bnb.demo.engine.DemoMarkCache
 import com.ansardeo.bnb.demo.engine.EngineSubmit
 import com.ansardeo.bnb.demo.exec.DemoExecutionProvider
 import com.ansardeo.bnb.demo.exec.DemoExecutionService
@@ -37,6 +38,8 @@ import com.ansardeo.bnb.demo.trade.DemoProbeStore
 import com.ansardeo.bnb.demo.trade.DemoSymbolSetup
 import com.ansardeo.bnb.demo.trade.DemoSymbolSetupStore
 import com.ansardeo.bnb.demo.trade.DemoTradeClient
+import com.ansardeo.bnb.demo.trade.DemoTrailingProbe
+import com.ansardeo.bnb.demo.trade.DemoTrailingProbeStore
 import com.ansardeo.bnb.paper.PaperEngine
 import com.ansardeo.bnb.paper.PaperEngineProvider
 import com.ansardeo.bnb.paper.TradingControlStore
@@ -759,14 +762,19 @@ class MainActivity : AppCompatActivity() {
 
     private fun renderDemoPositionsOpen(body: LinearLayout, open: List<DemoEntry>) {
         if (open.isEmpty()) { body.addView(text("No open positions.", 13f, muted)); return }
-        val repo = DemoCredentialStore.repository(this); val svc = DemoExecutionProvider.get(this)
+        val repo = DemoCredentialStore.repository(this); val svc = DemoExecutionProvider.get(this); val engine = DemoStrategyEngineProvider.get(this)
         for (e in open) {
             val box = makeItemCard(body)
             val header = row()
             header.addView(text("${e.symbol}  ${e.direction}", 15f, if (e.direction == "LONG") green else red, true), LinearLayout.LayoutParams(0, -2, 1f))
             header.addView(text("${e.leverage}x", 12f, muted, true)); box.addView(header)
-            addLabel(box, "Fill Price", e.avgPrice?.let { PriceFormatter.formatPrice(it.toDouble()) } ?: "--", white, true)
-            addLabel(box, "Quantity", e.executedQty, white, true)
+            addLabel(box, "Current Price", DemoMarkCache.get(e.symbol)?.let { PriceFormatter.formatPrice(it.toDouble()) } ?: "--", white, true)
+            addLabel(box, "Entry Price", e.avgPrice?.let { PriceFormatter.formatPrice(it.toDouble()) } ?: "--", white, true)
+            addLabel(box, "Position Quantity", e.openQuantity.toPlainString(), white, true)
+            addLabel(box, "Margin", e.average?.let { a -> a.multiply(e.openQuantity).divide(java.math.BigDecimal(e.leverage), 2, java.math.RoundingMode.HALF_UP).toPlainString() + " USDT" } ?: "--", white, true)
+            val tr = engine.trailingInfo(e)
+            addLabel(box, "Trailing Stop Activation", tr?.activation?.let { PriceFormatter.formatPrice(it.toDouble()) } ?: "--", if (tr?.source?.startsWith("Binance") == true) green else yellow, true)
+            if (tr != null) box.addView(text(tr.source, 10f, muted))
             addLabel(box, "Status", e.status.name, white, true)
             addLabel(box, "Stop Loss", demoSlLine(e), if (e.status == EntryStatus.UNPROTECTED) red else if (e.slState == "VERIFIED") green else yellow, true)
             if (e.note.isNotBlank()) addLabel(box, "Note", e.note, red, true)
@@ -1404,6 +1412,7 @@ class MainActivity : AppCompatActivity() {
 
         addDemoApiCard(root)
         addDemoProbeCard(root)
+        addDemoTrailingProbeCard(root)
         addDemoSetupCard(root)
         addDemoOrdersCard(root)
 
@@ -1557,6 +1566,46 @@ class MainActivity : AppCompatActivity() {
     }
 
     // ---------------- Binance Demo Compatibility Probe (Phase 3A step 2: tiny Demo orders that are always cancelled; opens NO position) ----------------
+    private fun addDemoTrailingProbeCard(root: LinearLayout) {
+        val card = addCard(root, "BINANCE DEMO TRAILING STOP PROBE",
+            "Checks, on Binance DEMO only, that an exchange-side Trailing Stop order (closing only, with activation price and callback) is accepted in Hedge Mode, can be listed and cancelled. It places one far-away order (BTCUSDT), cancels it, and opens NO position. Until this passes the app keeps using its app-side Trailing Stop.")
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        card.addView(box)
+        val repo = DemoCredentialStore.repository(this)
+        val fmt = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
+        fun refresh() {
+            box.removeAllViews()
+            val t = DemoTrailingProbeStore.text(this)
+            if (t == null) addLabel(box, "Trailing probe", "Not run", muted)
+            else {
+                val ok = DemoTrailingProbeStore.supported(this)
+                addLabel(box, "Last trailing probe", (if (ok) "PASSED (exchange Trailing Stop in use)" else "NOT PASSED (app-side Trailing Stop in use)") + "  ·  " + fmt.format(Date(DemoTrailingProbeStore.at(this))), if (ok) green else red)
+                t.lines().forEach { if (it.isNotBlank()) box.addView(text(it, 11f, muted)) }
+            }
+        }
+        val runBtn = addButton(card, "RUN TRAILING PROBE (Demo, cancels its own order)", yellow)
+        runBtn.setOnClickListener {
+            val creds = repo.load()
+            if (creds == null) { toast(if (repo.hasCredentials()) "Stored keys cannot be read. Replace them." else "Save your Demo keys first."); return@setOnClickListener }
+            AlertDialog.Builder(this).setTitle("Run Trailing Stop probe?")
+                .setMessage("Sends one tiny Trailing Stop test order to Binance DEMO (BTCUSDT), 10% above the market so it cannot trigger, and cancels it. No position is opened and no setting is changed.")
+                .setPositiveButton("RUN") { _, _ ->
+                    runBtn.isEnabled = false
+                    lifecycleScope.launch {
+                        val r = DemoTrailingProbe(DemoTradeClient.create()).run(creds)
+                        DemoTrailingProbeStore.save(this@MainActivity, r, "BTCUSDT")
+                        runBtn.isEnabled = true; refresh(); toast(if (r.passed && r.cleanupOk) "Trailing probe passed" else "Trailing probe finished — see report")
+                    }
+                }.setNegativeButton("CANCEL", null).show()
+        }
+        addButton(card, "COPY REPORT", inputBg).setOnClickListener {
+            val t = DemoTrailingProbeStore.text(this)
+            if (t == null) { toast("Run the trailing probe first."); return@setOnClickListener }
+            (getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager).setPrimaryClip(android.content.ClipData.newPlainText("BNB trailing probe report", t)); toast("Report copied")
+        }
+        refresh()
+    }
+
     private fun addDemoProbeCard(root: LinearLayout) {
         val card = addCard(root, "BINANCE DEMO COMPATIBILITY PROBE",
             "Checks, on Binance DEMO only, that LIMIT orders and an exchange-side Stop Loss can be placed, verified and cancelled. It places a far-away LIMIT order and a far-away Stop Loss order (BTCUSDT), cancels both, and opens NO position. It changes no account setting. Trading stays on Virtual.")
@@ -1661,6 +1710,7 @@ class MainActivity : AppCompatActivity() {
         demoPollJob = lifecycleScope.launch {
             while (true) {
                 try {
+                    if (engine.hasLiveEntries()) { kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { engine.refreshMarks() }; demoOrdersRefresh?.invoke() }
                     val auto = DemoAutoTradeStore.isOn(this@MainActivity)
                     val creds = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { if (svc.hasWork() || (auto && engine.hasOpenCycles())) repo.load() else null }
                     if (creds != null) {

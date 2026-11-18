@@ -19,6 +19,7 @@ class FakeDemoExchange {
     var partialQty = "0.004"; var fillPrice: String? = null
     /** normal | postZero (new-order answer shows avgPrice 0, queries are correct) | cumQuoteOnly (avgPrice always 0, cumQuote correct) | none (no price at all) */
     var avgMode = "normal"
+    var longAmt = "0"; var shortAmt = "0"
     var algoFailures = 0; var marketFailures = 0; var unverifiedQueries = 0
     private var next = 1000L
 
@@ -48,6 +49,7 @@ class FakeDemoExchange {
                     path == "/fapi/v1/time" -> MockResponse().setBody("""{"serverTime":${System.currentTimeMillis()}}""")
                     path == "/fapi/v1/positionSide/dual" -> MockResponse().setBody("""{"dualSidePosition":$hedge}""")
                     path == "/fapi/v1/symbolConfig" -> MockResponse().setBody("""[{"symbol":"BTCUSDT","marginType":"$margin","leverage":$leverage}]""")
+                    path == "/fapi/v2/positionRisk" -> MockResponse().setBody("""[{"symbol":"BTCUSDT","positionSide":"LONG","positionAmt":"$longAmt"},{"symbol":"BTCUSDT","positionSide":"SHORT","positionAmt":"-$shortAmt"}]""")
                     path == "/fapi/v1/exchangeInfo" -> MockResponse().setBody(exchangeInfo)
                     path == "/fapi/v1/premiumIndex" -> MockResponse().setBody("""{"symbol":"BTCUSDT","markPrice":"$mark"}""")
                     path == "/fapi/v1/order" && m == "POST" -> when (p("type")) {
