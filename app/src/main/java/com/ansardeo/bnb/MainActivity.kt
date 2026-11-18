@@ -26,6 +26,9 @@ import com.ansardeo.bnb.demo.TradingModeStore
 import com.ansardeo.bnb.demo.DemoConnectionStatusStore
 import com.ansardeo.bnb.demo.DemoCredentialStore
 import com.ansardeo.bnb.demo.exec.DemoEntry
+import com.ansardeo.bnb.demo.engine.DemoAutoTradeStore
+import com.ansardeo.bnb.demo.engine.DemoStrategyEngineProvider
+import com.ansardeo.bnb.demo.engine.EngineSubmit
 import com.ansardeo.bnb.demo.exec.DemoExecutionProvider
 import com.ansardeo.bnb.demo.exec.DemoExecutionService
 import com.ansardeo.bnb.demo.exec.EntryStatus
@@ -1654,11 +1657,17 @@ class MainActivity : AppCompatActivity() {
     private fun startDemoPoll() {
         demoPollJob?.cancel()
         val svc = DemoExecutionProvider.get(this); val repo = DemoCredentialStore.repository(this)
+        val engine = DemoStrategyEngineProvider.get(this)
         demoPollJob = lifecycleScope.launch {
             while (true) {
                 try {
-                    val creds = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { if (svc.hasWork()) repo.load() else null }
-                    if (creds != null) { svc.refresh(creds); demoOrdersRefresh?.invoke() }
+                    val auto = DemoAutoTradeStore.isOn(this@MainActivity)
+                    val creds = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { if (svc.hasWork() || (auto && engine.hasOpenCycles())) repo.load() else null }
+                    if (creds != null) {
+                        svc.refresh(creds) // fills, Stop Loss placement/verification (always)
+                        if (auto) engine.tick(creds) // strategy decisions (only while Demo Auto-Trading is ON)
+                        demoOrdersRefresh?.invoke()
+                    }
                 } catch (e: kotlin.coroutines.cancellation.CancellationException) { throw e } catch (e: Exception) { /* the next round retries */ }
                 kotlinx.coroutines.delay(5000)
             }
@@ -1675,6 +1684,7 @@ class MainActivity : AppCompatActivity() {
         val repo = DemoCredentialStore.repository(this)
         val svc = DemoExecutionProvider.get(this)
         val fmt = SimpleDateFormat("HH:mm:ss", Locale.US)
+        val engine = DemoStrategyEngineProvider.get(this)
 
         val dirSpinner = Spinner(this).apply { adapter = createDarkSpinnerAdapter(listOf("LONG", "SHORT")) }
         val priceField = EditText(this).apply { hint = "Limit price"; inputType = android.text.InputType.TYPE_CLASS_NUMBER or android.text.InputType.TYPE_NUMBER_FLAG_DECIMAL; setSingleLine(true); setTextColor(white); setHintTextColor(muted) }
@@ -1690,6 +1700,8 @@ class MainActivity : AppCompatActivity() {
         fun refresh() {
             box.removeAllViews()
             svc.haltReason()?.let { r -> box.addView(text("HALTED: $r", 12f, red)) }
+            box.addView(text(if (DemoAutoTradeStore.isOn(this)) "Demo Auto-Trading: ON (only while this app is open)" else "Demo Auto-Trading: OFF (no automatic actions)", 12f, if (DemoAutoTradeStore.isOn(this)) green else muted))
+            engine.cycles().take(5).forEach { cy -> box.addView(text(cycleLine(cy), 11f, white)) }
             val list = svc.entries().take(8)
             if (list.isEmpty()) addLabel(box, "Entries", "None yet", muted)
             list.forEach { e ->
@@ -1703,6 +1715,15 @@ class MainActivity : AppCompatActivity() {
         }
         demoOrdersRefresh = { runOnUiThread { if (box.isAttachedToWindow) refresh() } }
 
+        val autoBtn = addButton(card, "", inputBg)
+        fun autoLabel() { autoBtn.text = if (DemoAutoTradeStore.isOn(this)) "DEMO AUTO-TRADING: ON  (tap to turn OFF)" else "DEMO AUTO-TRADING: OFF  (tap to turn ON)" }
+        autoLabel()
+        autoBtn.setOnClickListener {
+            if (DemoAutoTradeStore.isOn(this)) { DemoAutoTradeStore.set(this, false); autoLabel(); refresh(); toast("Auto-Trading OFF. Existing Stop Losses on Binance Demo stay active."); return@setOnClickListener }
+            AlertDialog.Builder(this).setTitle("Turn Demo Auto-Trading ON?")
+                .setMessage("Binance DEMO only. While this app is OPEN the strategy may place Averaging, Opposite-Side and Re-entry LIMIT orders and close a cycle at market when its ROI Trailing Stop triggers, using your Settings. Every entry still gets its own Stop Loss. When the app is closed nothing runs (Stop Losses stay on Binance). Real trading is not involved.")
+                .setPositiveButton("TURN ON") { _, _ -> DemoAutoTradeStore.set(this, true); autoLabel(); refresh() }.setNegativeButton("CANCEL", null).show()
+        }
         val placeBtn = addButton(card, "PLACE DEMO ENTRY (LIMIT + Stop Loss)", yellow)
         placeBtn.setOnClickListener {
             val creds = repo.load()
@@ -1717,9 +1738,16 @@ class MainActivity : AppCompatActivity() {
                 .setPositiveButton("PLACE") { _, _ ->
                     placeBtn.isEnabled = false
                     lifecycleScope.launch {
-                        val res = svc.placeEntry(creds, request)
-                        placeBtn.isEnabled = true; refresh()
-                        toast(when (res) { is DemoExecutionService.PlaceResult.Placed -> "Order sent: ${res.entry.status}"; is DemoExecutionService.PlaceResult.Refused -> res.reason; is DemoExecutionService.PlaceResult.Unknown -> res.reason })
+                        if (DemoAutoTradeStore.isOn(this@MainActivity)) {
+                            // Auto-Trading ON: the entry starts a strategy cycle and goes through Global Best Entry Price Priority.
+                            val res = engine.submitEntry(creds, symbol, dir, price)
+                            placeBtn.isEnabled = true; refresh()
+                            toast(when (res) { is EngineSubmit.Placed -> "Order sent: ${res.entry.status}"; is EngineSubmit.NotPlaced -> res.message })
+                        } else {
+                            val res = svc.placeEntry(creds, request)
+                            placeBtn.isEnabled = true; refresh()
+                            toast(when (res) { is DemoExecutionService.PlaceResult.Placed -> "Order sent: ${res.entry.status}"; is DemoExecutionService.PlaceResult.Refused -> res.reason; is DemoExecutionService.PlaceResult.Unknown -> res.reason })
+                        }
                     }
                 }.setNegativeButton("CANCEL", null).show()
         }
@@ -1736,6 +1764,8 @@ class MainActivity : AppCompatActivity() {
         addButton(card, "COPY REPORT", inputBg).setOnClickListener {
             val t = buildString {
                 appendLine("BNB DEMO ORDERS REPORT"); svc.haltReason()?.let { appendLine("HALTED: $it") }
+                appendLine("Auto-Trading: " + if (DemoAutoTradeStore.isOn(this@MainActivity)) "ON" else "OFF")
+                appendLine("--- Cycles ---"); engine.cycles().forEach { appendLine(it.id + " " + cycleLine(it)) }
                 appendLine("--- Entries ---"); svc.entries().forEach { appendLine(it.id + " " + statusLine(it)) }
                 appendLine("--- Events ---"); svc.events(40).forEach { appendLine(fmt.format(Date(it.first)) + " " + it.second) }
             }
@@ -1743,6 +1773,10 @@ class MainActivity : AppCompatActivity() {
         }
         refresh()
     }
+
+    private fun cycleLine(cy: com.ansardeo.bnb.demo.exec.DemoCycle): String =
+        "${cy.symbol} ${cy.direction} ${cy.leverage}x · ${cy.kind} · ${cy.status}" + (if (cy.avgDone) " · averaged" else "") + (if (cy.oppDone) " · opposite sent" else "") +
+            (if (cy.trailActive) " · trailing stop ${cy.trailStop?.take(10)}" else "") + (cy.bookedRoi?.let { " · booked ROI $it%" } ?: "") + (if (cy.note.isNotBlank()) " · ${cy.note}" else "")
 
     // ---------------- helpers ----------------
     private fun createDarkSpinnerAdapter(items: List<String>): ArrayAdapter<String> =

@@ -141,3 +141,20 @@ The Demo panel previously showed a flat text list; it now shares the exact tab s
 5. Live (real-money) trading is **not implemented and not reachable from this app** — Stage 3 has not been started.
 
 **Not changed in Phase 3A:** the Virtual engine, the trading strategy rules, the Dashboard, and Settings.
+
+## Phase 3B — Strategy automation on Binance Demo (one merged step)
+
+**Binance Demo only. Real trading is NOT part of this and is not authorized.** No Live endpoint, Live key or real-money code was added.
+
+What it does (only while the app is open AND the **Demo Auto-Trading** switch is ON; the switch defaults to OFF and is found on the Binance Demo Orders card):
+- **Entries** go through the approved Global Best Entry Price Priority (`EntryPriorityService`; LONG lowest wins, SHORT highest wins, per symbol + direction, safe replace sequence). Each entry starts or joins a *cycle* (`demo/exec/DemoCycle.kt`).
+- **Per-entry Stop Loss** is unchanged from Phase 3A (own SL from its own fill price, verified by Binance before it is called active, fail-safe + halt otherwise). There is no cycle-level Stop Loss and no fixed Take Profit.
+- **Averaging**: once per cycle when the cycle Position ROI (on its weighted average entry) reaches the Averaging trigger; one LIMIT entry at the current Demo mark price, with its own Stop Loss. The "done" flag is set before the order is sent, so it can never repeat.
+- **Opposite-Side**: ROI trigger + callback trail (`OppositeTrigger`), then one opposite LIMIT entry at the current mark that starts its own cycle.
+- **Profit exit**: cycle ROI Trailing Stop (`TrailingStopMath`) on the cycle WAP. When it fires, pending orders of the cycle are cancelled and every open entry is closed at market (closing method only), their Stop Losses are removed and verified.
+- **Re-entry**: after a Trailing close with a positive booked ROI: same side 50 %, opposite side 100 % of the booked ROI (`ReentryFormula`, `RoiMath.reentryPrice`). No automatic re-entry after a Stop Loss, fail-safe, manual close or cancel.
+- Switch OFF = the engine does nothing (Stop Losses already on Binance stay active). Switch ON/OFF does not affect plain manual entries made while it is OFF (Phase 3A behaviour).
+
+Interpretation decisions (please check): averaging and the opposite entry are LIMIT orders at the mark price when triggered (they may fill at once); booked ROI uses the Demo mark price at the moment the trailing stop fired as the close price; re-entry margin = the coin's Margin Amount; the priority feasibility check is always "feasible" (no balance-aware replacement); only entries placed by this app are known to the priority book; the engine's decisions use the 5-second foreground poll, so a fast move between polls is seen late (Stop Losses on Binance still protect each entry).
+
+Known limits: nothing runs while the app is closed (deferred to the server stage); several entries on the same symbol+direction share Binance's net position; the Virtual engine, Settings and Dashboard are untouched. Tests are written (`demo/engine/DemoStrategyEngineTest.kt`) but were not executed in the authoring environment; they run in the GitHub Actions build.

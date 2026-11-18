@@ -30,6 +30,9 @@ data class DemoEntry(
     val note: String = "",
     val createdAt: Long = 0L,
     val updatedAt: Long = 0L,
+    /** Phase 3B: the strategy cycle this entry belongs to ("" = a plain manual entry without automation) and its entry kind (EntryKind name). */
+    val cycleId: String = "",
+    val kind: String = "MANUAL",
 ) {
     val executed: BigDecimal get() = bd(executedQty)
     val protectedQuantity: BigDecimal get() = bd(protectedQty)
@@ -56,7 +59,7 @@ data class DemoEntry(
         put("limitPrice", limitPrice); put("quantity", quantity); orderId?.let { put("orderId", it) }; put("status", status.name)
         put("executedQty", executedQty); avgPrice?.let { put("avgPrice", it) }; put("protectedQty", protectedQty); put("closedQty", closedQty)
         slAlgoId?.let { put("slAlgoId", it) }; slTrigger?.let { put("slTrigger", it) }; put("slState", slState)
-        put("note", note); put("createdAt", createdAt); put("updatedAt", updatedAt)
+        put("note", note); put("createdAt", createdAt); put("updatedAt", updatedAt); put("cycleId", cycleId); put("kind", kind)
     }.toString()
 
     companion object {
@@ -69,6 +72,7 @@ data class DemoEntry(
                 status = EntryStatus.valueOf(o.getString("status")), executedQty = o.optString("executedQty", "0"), avgPrice = if (o.has("avgPrice")) o.getString("avgPrice") else null,
                 protectedQty = o.optString("protectedQty", "0"), closedQty = o.optString("closedQty", "0"), slAlgoId = if (o.has("slAlgoId")) o.getLong("slAlgoId") else null, slTrigger = if (o.has("slTrigger")) o.getString("slTrigger") else null,
                 slState = o.optString("slState", "NONE"), note = o.optString("note", ""), createdAt = o.optLong("createdAt", 0L), updatedAt = o.optLong("updatedAt", 0L),
+                cycleId = o.optString("cycleId", ""), kind = o.optString("kind", "MANUAL"),
             )
         }.getOrNull()
     }
