@@ -141,9 +141,10 @@ class DemoExecutionService(
         val pm = api.positionMode(c)
         val hedge = if (pm.ok) runCatching { JSONObject(pm.body).getBoolean("dualSidePosition") }.getOrNull() else null
         if (hedge != true) return PlaceResult.Refused(if (hedge == null) "Position mode could not be read: ${pm.describe()}" else "Hedge Mode is OFF. Turn it ON in Binance Demo.")
-        val sc = api.symbolConfig(c, req.symbol)
-        val cfg = if (sc.ok) configOf(sc.body, req.symbol) else null
-        if (cfg == null) return PlaceResult.Refused("Margin/leverage could not be read: ${sc.describe()}")
+        var sc = api.symbolConfig(c, req.symbol)
+        var cfg = if (sc.ok) configOf(sc.body, req.symbol) else null
+        if (cfg == null) { sc = api.symbolConfig(c, req.symbol); cfg = if (sc.ok) configOf(sc.body, req.symbol) else null } // one retry: Binance Demo sometimes answers with an incomplete body
+        if (cfg == null) return PlaceResult.Refused("Margin/leverage could not be read: ${sc.describe()} · Binance answered: ${sc.body.take(160).ifBlank { "(empty)" }}")
         if (!cfg.first.equals("ISOLATED", true)) return PlaceResult.Refused("${req.symbol} is ${cfg.first}, not ISOLATED. Run the Safety Setup first.")
         if (cfg.second != req.expectedLeverage) return PlaceResult.Refused("${req.symbol} leverage on Binance is ${cfg.second}x but Settings say ${req.expectedLeverage}x. Run the Safety Setup first.")
         val rules = rulesFor(req.symbol) ?: return PlaceResult.Refused("Exchange rules for ${req.symbol} are not available.")
