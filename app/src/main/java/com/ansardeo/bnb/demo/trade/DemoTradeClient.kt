@@ -89,6 +89,7 @@ class DemoTradeClient internal constructor(
 
     // ---- account (read-only) ----
     suspend fun balance(c: DemoCredentials) = call(Endpoint.BALANCE, emptyList(), c)
+    suspend fun userTrades(c: DemoCredentials, symbol: String, startTime: Long) = call(Endpoint.USER_TRADES, listOf("symbol" to symbol, "startTime" to startTime.toString(), "limit" to "1000"), c)
     suspend fun positionMode(c: DemoCredentials) = call(Endpoint.POSITION_MODE_READ, emptyList(), c)
     suspend fun positionRisk(c: DemoCredentials, symbol: String) = call(Endpoint.POSITION_RISK, listOf("symbol" to symbol), c)
 
@@ -148,6 +149,19 @@ class DemoTradeClient internal constructor(
         if (positionSide != null) p += "positionSide" to positionSide
         p += "type" to "STOP_MARKET"; p += "quantity" to quantity; p += "triggerPrice" to triggerPrice
         p += "workingType" to "MARK_PRICE"; p += "priceProtect" to "false"; p += "clientAlgoId" to clientAlgoId
+        return call(Endpoint.ALGO_NEW_STOP, p, c)
+    }
+    /**
+     * Phase 3C: exchange-side Trailing Stop for a cycle. Closing only (SELL+LONG or BUY+SHORT), a fixed quantity, MARK_PRICE trigger,
+     * activation price and callback rate in PRICE percent. No closePosition, no reduceOnly (not allowed in Hedge Mode).
+     */
+    suspend fun newTrailingStopAlgo(c: DemoCredentials, symbol: String, side: String, positionSide: String, quantity: String, activatePrice: String, callbackRate: String, clientAlgoId: String): TradeResponse {
+        require((positionSide == "LONG" && side == "SELL") || (positionSide == "SHORT" && side == "BUY")) { "closing side only" }
+        require(clientAlgoId.matches(Regex("[.A-Za-z0-9:/_-]{1,36}"))) { "clientAlgoId" }
+        val p = ArrayList<Pair<String, String>>()
+        p += "algoType" to "CONDITIONAL"; p += "symbol" to symbol; p += "side" to side; p += "positionSide" to positionSide
+        p += "type" to "TRAILING_STOP_MARKET"; p += "quantity" to quantity; p += "activatePrice" to activatePrice; p += "callbackRate" to callbackRate
+        p += "workingType" to "MARK_PRICE"; p += "clientAlgoId" to clientAlgoId
         return call(Endpoint.ALGO_NEW_STOP, p, c)
     }
     suspend fun queryAlgo(c: DemoCredentials, algoId: Long) = call(Endpoint.ALGO_QUERY, listOf("algoId" to algoId.toString()), c)

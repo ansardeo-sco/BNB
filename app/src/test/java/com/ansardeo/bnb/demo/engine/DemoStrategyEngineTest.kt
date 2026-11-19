@@ -11,6 +11,7 @@ import com.ansardeo.bnb.demo.exec.EntryStatus
 import com.ansardeo.bnb.demo.exec.FakeDemoExchange
 import com.ansardeo.bnb.demo.exec.InMemoryExecStore
 import com.ansardeo.bnb.demo.trade.DemoTradeClient
+import com.ansardeo.bnb.demo.trade.DemoTrailingProbe
 import com.ansardeo.bnb.demo.trade.RulesCache
 import com.ansardeo.bnb.trading.EntryKind
 import kotlinx.coroutines.runBlocking
@@ -29,13 +30,14 @@ class DemoStrategyEngineTest {
     private lateinit var svc: DemoExecutionService
     private lateinit var engine: DemoStrategyEngine
     private var now = 1_700_000_000_000L
+    private var trailingOk = false
     private var settings = LocalCoinSettings(symbol = "BTCUSDT", marginAmount = 100.0, averagingMargin = 100.0, oppositeMargin = 100.0)
 
     @Before fun setUp() {
         ex = FakeDemoExchange().start(); store = InMemoryExecStore()
         val api = DemoTradeClient(OkHttpClient(), ex.server.url("/"), { System.currentTimeMillis() })
         svc = DemoExecutionService(api, store, RulesCache(), { now++ })
-        engine = DemoStrategyEngine(api, svc, store, { settings }, { now++ })
+        engine = DemoStrategyEngine(api, svc, store, { settings }, { now++ }, { trailingOk })
     }
     @After fun tearDown() { ex.shutdown() }
 
@@ -181,6 +183,146 @@ class DemoStrategyEngineTest {
         assertTrue(types.all { it == "LIMIT" || it == "MARKET" || it == "STOP_MARKET" })
     }
 
+    // ---------------- Phase 3C: Trailing Stop order on Binance Demo ----------------
+    private fun trailPosts() = ex.posts("/fapi/v1/algoOrder").filter { it.requestUrl!!.queryParameter("type") == "TRAILING_STOP_MARKET" }
+    private fun marketPosts() = ex.posts("/fapi/v1/order").filter { it.requestUrl!!.queryParameter("type") == "MARKET" }
+    private fun filledLongWithTrailing(): DemoEntry {
+        trailingOk = true; settings = settings.copy(averagingEnabled = false, oppositeEnabled = false)
+        ex.limitFill = "full"; ex.fillPrice = "60000"
+        val e = (submit("LONG", "60000") as EngineSubmit.Placed).entry
+        ex.fillPrice = null; tick()
+        return store.get(e.id)!!
+    }
+
+    @Test fun theTrailingStopIsPlacedOnBinanceRightAfterTheFillAndOnlyCountedOnceConfirmed() {
+        val e = filledLongWithTrailing()
+        val t = trailPosts().single()
+        assertEquals("SELL", t.requestUrl!!.queryParameter("side")); assertEquals("LONG", t.requestUrl!!.queryParameter("positionSide"))
+        assertEquals("0.01", t.requestUrl!!.queryParameter("quantity")); assertEquals("MARK_PRICE", t.requestUrl!!.queryParameter("workingType"))
+        assertEquals(0, BigDecimal("63300").compareTo(BigDecimal(t.requestUrl!!.queryParameter("activatePrice")!!)))   // 60000 x (1 + 33/(100 x 6))
+        assertEquals(0, BigDecimal("0.5").compareTo(BigDecimal(t.requestUrl!!.queryParameter("callbackRate")!!)))       // 3 % ROI / 6x = 0.5 % price
+        assertNull(t.requestUrl!!.queryParameter("reduceOnly")); assertNull(t.requestUrl!!.queryParameter("closePosition"))
+        val cy = store.getCycle(e.cycleId)!!
+        assertEquals("EXCHANGE", cy.trMode); assertNotNull(cy.trAlgoId); assertEquals("0.01", cy.trQty)
+        assertEquals("VERIFIED", e.slState) // the entry's own Stop Loss is still there
+        assertTrue(events().any { it.contains("Trailing Stop order is ACTIVE on Binance Demo (confirmed)") })
+        tick(); assertEquals(1, trailPosts().size) // not placed again
+    }
+
+    @Test fun theAppDoesNotCloseAtMarketWhileTheBinanceTrailingStopIsActive() {
+        val e = filledLongWithTrailing()
+        ex.mark = "63300.00"; tick(); ex.mark = "62900.00"; tick()
+        assertEquals(0, marketPosts().size); assertEquals(CycleStatus.ACTIVE, store.getCycle(e.cycleId)!!.status)
+    }
+
+    @Test fun whenBinanceFiresTheTrailingStopTheAppOnlyRecordsItCleansTheStopLossAndStartsReentry() {
+        val e = filledLongWithTrailing()
+        val sl = store.get(e.id)!!.slAlgoId!!
+        ex.limitFill = "none"; ex.mark = "62900.00"
+        ex.algos[store.getCycle(e.cycleId)!!.trAlgoId!!]!!.status = "FINISHED"; ex.longAmt = "0"
+        tick()
+        val cy = store.getCycle(e.cycleId)!!
+        assertEquals(CycleStatus.CLOSED, cy.status); assertEquals("EXCHANGE", cy.exitBy)
+        assertEquals(EntryStatus.CLOSED, store.get(e.id)!!.status)
+        assertEquals(0, marketPosts().size)                       // no second close was sent
+        assertEquals("CANCELED", ex.algos[sl]!!.status)           // the entry's own Stop Loss was removed
+        assertTrue("booked ROI ${cy.bookedRoi}", cy.bookedRoi!!.startsWith("29.0"))
+        assertEquals(1, store.all().count { it.kind == "REENTRY_SAME" }); assertEquals(1, store.all().count { it.kind == "REENTRY_OPPOSITE" })
+    }
+
+    @Test fun ifBinanceStillShowsAnOpenQuantityItIsClosedAtMarketInsteadOfBeingRecordedAsClosed() {
+        val e = filledLongWithTrailing()
+        ex.limitFill = "none"; ex.mark = "62900.00"
+        ex.algos[store.getCycle(e.cycleId)!!.trAlgoId!!]!!.status = "FINISHED"; ex.longAmt = "0.01"
+        tick()
+        assertEquals(1, marketPosts().size); assertEquals(EntryStatus.CLOSED, store.get(e.id)!!.status)
+    }
+
+    @Test fun averagingReplacesTheNotYetActivatedBinanceTrailingStopWithTheNewTotalQuantity() {
+        trailingOk = true; settings = settings.copy(oppositeEnabled = false)
+        ex.limitFill = "full"; ex.fillPrice = "60000"; val first = (submit("LONG", "60000") as EngineSubmit.Placed).entry
+        ex.fillPrice = null; tick(); assertEquals(1, trailPosts().size)
+        ex.mark = "54000.00"; tick(); tick()
+        val posts = trailPosts(); assertEquals(2, posts.size)
+        val cy = store.getCycle(first.cycleId)!!
+        assertEquals("0.0211", cy.trQty); assertEquals("EXCHANGE", cy.trMode)
+        assertEquals("CANCELED", ex.algos.values.filter { it.params["type"] == "TRAILING_STOP_MARKET" }.first().status)
+        assertEquals("NEW", ex.algos[cy.trAlgoId!!]!!.status)
+    }
+
+    @Test fun ifTheTrailingOrderCannotBePlacedThreeTimesTheAppSideTrailingTakesOver() {
+        trailingOk = true; settings = settings.copy(averagingEnabled = false, oppositeEnabled = false)
+        ex.limitFill = "full"; ex.fillPrice = "60000"; val e = (submit("LONG", "60000") as EngineSubmit.Placed).entry
+        ex.fillPrice = null; ex.algoFailures = 99
+        tick(); tick(); tick()
+        assertEquals("APP", store.getCycle(e.cycleId)!!.trMode)
+        ex.algoFailures = 0; ex.limitFill = "none"
+        ex.mark = "63300.00"; tick(); ex.mark = "62900.00"; tick()
+        assertEquals(1, marketPosts().size); assertEquals("APP", store.getCycle(e.cycleId)!!.exitBy)
+    }
+
+    @Test fun withoutAPassedProbeNoTrailingOrderIsEverSent() {
+        trailingOk = false
+        ex.limitFill = "full"; ex.fillPrice = "60000"; submit("LONG", "60000"); ex.fillPrice = null; tick(); tick()
+        assertEquals(0, trailPosts().size)
+    }
+
+    @Test fun theTrailingProbeSendsOneFarOrderConfirmsAndCancelsIt() {
+        val api = DemoTradeClient(OkHttpClient(), ex.server.url("/"), { System.currentTimeMillis() })
+        val r = runBlocking { DemoTrailingProbe(api).run(creds) }
+        assertTrue(r.toText("BTCUSDT"), r.passed && r.cleanupOk)
+        val t = trailPosts().single()
+        assertTrue(BigDecimal(t.requestUrl!!.queryParameter("activatePrice")!!) > BigDecimal(ex.mark)) // far above the market: cannot trigger
+        assertTrue(ex.algos.values.none { it.status == "NEW" })
+        assertEquals(0, ex.posts("/fapi/v1/order").size) // no position opened
+    }
+
+    @Test fun cycleJsonKeepsTheTrailingOrderFields() {
+        val c = DemoCycle("cy2", "BTCUSDT", "SHORT", 6, "MANUAL", trMode = "EXCHANGE", trAlgoId = 77L, trQty = "0.01", trWap = "60000.00000000", trActivation = "56700.0", trCallback = "0.5", trFail = 1, exitBy = "EXCHANGE")
+        assertEquals(c, DemoCycle.fromJson(c.toJson()))
+    }
+
+    @Test fun theMarginTypedInTheOrdersCardIsUsedWhenAutoTradingRoutesTheEntry() {
+        val r = runBlocking { engine.submitEntry(creds, "BTCUSDT", "LONG", BigDecimal("59000"), marginOverride = BigDecimal("50")) } as EngineSubmit.Placed
+        assertEquals(0, BigDecimal("0.0050").compareTo(BigDecimal(r.entry.quantity))) // 50 USDT x 6 / 59000 = 0.00508 -> 0.0050
+    }
+
+    // ---------------- position closed outside the app ----------------
+    private fun filledEntry(): DemoEntry {
+        settings = settings.copy(averagingEnabled = false, oppositeEnabled = false, trailingEnabled = false)
+        ex.limitFill = "full"; ex.fillPrice = "60000"
+        return (submit("LONG", "60000") as EngineSubmit.Placed).entry
+    }
+
+    @Test fun aPositionClosedOnBinanceWithItsStopLossCancelledIsRecordedAsClosedNotAsALostStopLoss() {
+        val e = filledEntry(); ex.limitFill = "none"
+        ex.algos[store.get(e.id)!!.slAlgoId!!]!!.status = "CANCELED"; ex.longAmt = "0"
+        tick()
+        val after = store.get(e.id)!!
+        assertEquals(EntryStatus.CLOSED, after.status); assertEquals("NONE", after.slState)
+        assertNull(svc.haltReason()); assertEquals(CycleStatus.CLOSED, store.getCycle(e.cycleId)!!.status)
+        assertEquals(0, marketPosts().size)
+    }
+
+    @Test fun aCancelledStopLossWhileBinanceStillHoldsThePositionStaysALostStopLossAndHalts() {
+        val e = filledEntry(); ex.limitFill = "none"
+        ex.algos[store.get(e.id)!!.slAlgoId!!]!!.status = "CANCELED"; ex.longAmt = "0.01"
+        tick()
+        assertEquals("LOST", store.get(e.id)!!.slState); assertNotNull(svc.haltReason()); assertEquals(EntryStatus.FILLED, store.get(e.id)!!.status)
+    }
+
+    @Test fun closeFailingBecauseThereIsNoPositionRecordsTheEntryAsClosedOutsideTheApp() {
+        val e = filledEntry(); ex.limitFill = "none"; ex.marketFailures = 10; ex.longAmt = "0"
+        val msg = runBlocking { svc.closeEntryAtMarket(creds, e.id) }
+        assertTrue(msg, msg.contains("closed outside the app")); assertEquals(EntryStatus.CLOSED, store.get(e.id)!!.status)
+    }
+
+    @Test fun closeFailingWhileThePositionIsStillOnBinanceKeepsTheEntryOpen() {
+        val e = filledEntry(); ex.limitFill = "none"; ex.marketFailures = 10; ex.longAmt = "0.01"
+        val msg = runBlocking { svc.closeEntryAtMarket(creds, e.id) }
+        assertTrue(msg, msg.contains("not confirmed")); assertEquals(EntryStatus.FILLED, store.get(e.id)!!.status)
+    }
+
     // ---------------- static guard ----------------
     @Test fun engineSourceHasNoHttpNoLogsNoSecretsNoTakeProfit() {
         val dir = listOf("src/main/java/com/ansardeo/bnb/demo/engine", "app/src/main/java/com/ansardeo/bnb/demo/engine").map { File(it) }.first { it.isDirectory }
@@ -189,5 +331,28 @@ class DemoStrategyEngineTest {
             val t = f.readText().lines().filterNot { it.trim().startsWith("*") || it.trim().startsWith("/*") || it.trim().startsWith("//") }.joinToString("\n")
             banned.forEach { assertFalse("${f.name} contains $it", t.contains(it)) }
         }
+    }
+
+    // ---------------- Round 1: Demo safety controls ----------------
+    @Test fun cancelAllPendingCancelsOnlyUnfilledOrdersAndKeepsPositions() {
+        ex.limitFill = "full"; ex.fillPrice = "60000"; val filled = (submit("LONG", "60000") as EngineSubmit.Placed).entry
+        ex.limitFill = "none"; val pending = (submit("SHORT", "61000") as EngineSubmit.Placed).entry
+        val msg = runBlocking { engine.cancelAllPending(creds) }
+        assertTrue(msg, msg.startsWith("Cancelled 1"))
+        assertEquals(EntryStatus.CANCELED, store.get(pending.id)!!.status)
+        assertEquals("VERIFIED", store.get(filled.id)!!.slState)
+        assertTrue(ex.posts("/fapi/v1/order").none { it.requestUrl!!.queryParameter("type") == "MARKET" })
+    }
+
+    @Test fun panicCloseClosesPositionsCancelsPendingAndEndsCyclesWithoutReentry() {
+        ex.limitFill = "full"; ex.fillPrice = "60000"; val filled = (submit("LONG", "60000") as EngineSubmit.Placed).entry
+        ex.limitFill = "none"; val pending = (submit("SHORT", "61000") as EngineSubmit.Placed).entry
+        val limitsBefore = limitPosts().size
+        runBlocking { engine.panicCloseAll(creds) }
+        assertEquals(EntryStatus.CANCELED, store.get(pending.id)!!.status)
+        assertEquals(EntryStatus.CLOSED, store.get(filled.id)!!.status)
+        assertEquals(1, ex.posts("/fapi/v1/order").count { it.requestUrl!!.queryParameter("type") == "MARKET" })
+        assertTrue(store.cycles().all { it.status == CycleStatus.CLOSED })
+        assertEquals("no re-entry order after a panic close", limitsBefore, limitPosts().size)
     }
 }

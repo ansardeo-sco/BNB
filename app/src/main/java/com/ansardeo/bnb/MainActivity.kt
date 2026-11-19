@@ -28,6 +28,7 @@ import com.ansardeo.bnb.demo.DemoCredentialStore
 import com.ansardeo.bnb.demo.exec.DemoEntry
 import com.ansardeo.bnb.demo.engine.DemoAutoTradeStore
 import com.ansardeo.bnb.demo.engine.DemoStrategyEngineProvider
+import com.ansardeo.bnb.demo.engine.DemoMarkCache
 import com.ansardeo.bnb.demo.engine.EngineSubmit
 import com.ansardeo.bnb.demo.exec.DemoExecutionProvider
 import com.ansardeo.bnb.demo.exec.DemoExecutionService
@@ -37,6 +38,8 @@ import com.ansardeo.bnb.demo.trade.DemoProbeStore
 import com.ansardeo.bnb.demo.trade.DemoSymbolSetup
 import com.ansardeo.bnb.demo.trade.DemoSymbolSetupStore
 import com.ansardeo.bnb.demo.trade.DemoTradeClient
+import com.ansardeo.bnb.demo.trade.DemoTrailingProbe
+import com.ansardeo.bnb.demo.trade.DemoTrailingProbeStore
 import com.ansardeo.bnb.paper.PaperEngine
 import com.ansardeo.bnb.paper.PaperEngineProvider
 import com.ansardeo.bnb.paper.TradingControlStore
@@ -102,7 +105,8 @@ class MainActivity : AppCompatActivity() {
         if (android.os.Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(this, android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
             runCatching { notificationPermission.launch(android.Manifest.permission.POST_NOTIFICATIONS) }
         }
-        com.ansardeo.bnb.paper.PaperMonitorService.startIfEnabled(this)
+        // Virtual background monitor retired (Round 1): it is no longer started; any previously running instance is stopped.
+        runCatching { com.ansardeo.bnb.paper.PaperMonitorService.stop(this) }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -162,9 +166,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun updateTopStatus() {
-        val paused = TradingControlStore.isPaused(this)
-        topStatus.text = if (paused) "STAGE 1 — VIRTUAL (PAUSED)" else "STAGE 1 — VIRTUAL"
-        topStatus.setTextColor(if (paused) yellow else green)
+        val auto = DemoAutoTradeStore.isOn(this)
+        topStatus.text = if (auto) "STAGE 2 — DEMO (AUTO-TRADING ON)" else "STAGE 2 — DEMO (AUTO-TRADING OFF)"
+        topStatus.setTextColor(if (auto) green else yellow)
     }
 
     private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
@@ -258,11 +262,11 @@ class MainActivity : AppCompatActivity() {
         val root = pageContainer()
 
         // 1) WALLET BALANCE (top)
-        val balCard = addCard(root, "WALLET BALANCE - ${stage().shortLabel}")
+        val balCard = addCard(root, "WALLET BALANCE - BINANCE DEMO")
         val balText = priceTv("-- USDT", 26f, green).apply { gravity = Gravity.END; textAlignment = View.TEXT_ALIGNMENT_VIEW_END }
         balCard.addView(balText, LinearLayout.LayoutParams(-1, -2))
         addSpace(balCard, 4)
-        val balSub = text("Loading ${stage().shortLabel} wallet...", 12f, muted); balCard.addView(balSub)
+        val balSub = text("Loading Binance Demo wallet...", 12f, muted); balCard.addView(balSub)
 
         // 2) LIVE MARKET (below)
         val marketCard = addCard(root, "LIVE CRYPTOCURRENCY PRICES (READ-ONLY)")
@@ -310,23 +314,17 @@ class MainActivity : AppCompatActivity() {
         renderList()
 
         fun renderWallet() {
+            val creds = DemoCredentialStore.repository(this).load()
+            if (creds == null) { balText.text = "-- USDT"; balSub.text = "Save your Binance Demo keys in More to see the Demo wallet."; return }
             lifecycleScope.launch {
-                try {
-                    val w = engine().getWallet()
-                    val active = paperDb.dao().getActiveCyclesWithEntries(stageId())
-                    val openOrders = paperDb.dao().getActiveOrders(stageId()).size
-                    val prices = lastOverview?.symbols ?: emptyMap()
-                    var unreal = 0.0
-                    for (cwe in active) {
-                        val px = prices[cwe.cycle.symbol]?.markPrice ?: continue // Mark Price only; no last-price substitute
-                        val avg = cwe.cycle.averageEntryPrice ?: continue
-                        val qty = cwe.cycle.totalRemainingQuantity.takeIf { it > 0 } ?: cwe.cycle.totalQuantity
-                        unreal += if (cwe.cycle.direction == "LONG") (px - avg) * qty else (avg - px) * qty
-                    }
-                    val equity = w.availableBalance + w.reservedMargin + unreal
-                    balText.text = PriceFormatter.formatUsdt(equity)
-                    balSub.text = "Available ${PriceFormatter.formatUsdt(w.availableBalance)} | Positions: ${active.size} | Open Orders: $openOrders | Unrealized ${PriceFormatter.formatPnl(unreal)} | Realized ${PriceFormatter.formatPnl(w.realizedPnl)} (Virtual)"
-                } catch (_: Exception) { balSub.text = "Unable to load virtual wallet." }
+                val r = DemoTradeClient.create().balance(creds)
+                val w = if (r.ok) com.ansardeo.bnb.demo.exec.DemoAccountView.parseWallet(r.body) else null
+                val ents = DemoExecutionProvider.get(this@MainActivity).entries()
+                val positions = ents.count { it.status != EntryStatus.CLOSED && it.status != EntryStatus.CANCELED && it.status != EntryStatus.REJECTED && it.executed.signum() > 0 }
+                val orders = ents.count { it.orderActive }
+                if (w == null) { balSub.text = "Could not read the Binance Demo wallet (${if (r.ok) "unexpected answer" else r.describe()}). Retrying with the next refresh." ; return@launch }
+                balText.text = PriceFormatter.formatUsdt(w.equity.toDouble())
+                balSub.text = "Wallet ${PriceFormatter.formatUsdt(w.walletBalance.toDouble())} | Available ${PriceFormatter.formatUsdt(w.available.toDouble())} | Unrealized ${PriceFormatter.formatPnl(w.unrealized.toDouble())} | Positions: $positions | Open Orders: $orders (from Binance Demo)"
             }
         }
 
@@ -416,7 +414,7 @@ class MainActivity : AppCompatActivity() {
         content.removeAllViews()
         val outer = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         val stageBar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; background = rounded(card, 12); setPadding(dp(12), dp(10), dp(12), dp(10)) }
-        stageBar.addView(text("${stage().title}", 13f, green, true), LinearLayout.LayoutParams(0, -2, 1f))
+        stageBar.addView(text("Stage 2 — Binance Demo", 13f, green, true), LinearLayout.LayoutParams(0, -2, 1f))
         outer.addView(stageBar, LinearLayout.LayoutParams(-1, -2).apply { setMargins(dp(12), dp(8), dp(12), dp(4)) })
         val view = LayoutInflater.from(this).inflate(R.layout.activity_manual_entry, outer, false)
         outer.addView(view)
@@ -453,6 +451,7 @@ class MainActivity : AppCompatActivity() {
         if (marginInput.text.isNullOrBlank()) marginInput.setText(fmtNum(globalDefaults.marginAmount))
         var defaultsAppliedFor: String? = null
         leverageSpinner.setPopupBackgroundDrawable(rounded(inputBg, 10))
+        leverageSpinner.isEnabled = false // Demo uses the leverage saved in Settings for this coin (set and read back on Binance)
         symbolInput.setAdapter(ArrayAdapter(this, android.R.layout.simple_dropdown_item_1line, mutableListOf<String>()))
 
         fun addSummaryRow(label: String, value: String, valueColor: Int = white, bold: Boolean = true) {
@@ -478,7 +477,7 @@ class MainActivity : AppCompatActivity() {
             val actLong = if (intended != null && intended > 0) runCatching { TrailingStopMath.activationPrice(TrailSide.LONG, TrailingStopMath.bd(intended), lev, TrailingStopMath.bd(eff.trailingActivationRoi)).toDouble() }.getOrNull() else null
             val actShort = if (intended != null && intended > 0) runCatching { TrailingStopMath.activationPrice(TrailSide.SHORT, TrailingStopMath.bd(intended), lev, TrailingStopMath.bd(eff.trailingActivationRoi)).toDouble() }.getOrNull() else null
             summaryBox.removeAllViews()
-            addSummaryRow("Stage", stage().title, green)
+            addSummaryRow("Stage", "Stage 2 — Binance Demo", green)
             addSummaryRow("Symbol", sym)
             addSummaryRow("Last Price", "${PriceFormatter.formatPrice(currentLivePrice)} USDT")
             addSummaryRow("Mark Price", "${PriceFormatter.formatPrice(currentMarkPrice)} USDT")
@@ -492,7 +491,7 @@ class MainActivity : AppCompatActivity() {
             addSummaryRow("Estimated Qty", if (qty != null) PriceFormatter.formatQty(qty) else "--")
             addSummaryRow("Long: Trailing activation / cycle SL", "${PriceFormatter.formatPrice(actLong)} / ${PriceFormatter.formatPrice(slLong)}", green)
             addSummaryRow("Short: Trailing activation / cycle SL", "${PriceFormatter.formatPrice(actShort)} / ${PriceFormatter.formatPrice(slShort)}", red)
-            val note = text("All entries are LIMIT orders. Stage 1 is simulated only. No MARKET orders. No fixed Take Profit: profit exit is the ROI trailing stop.", 11f, muted)
+            val note = text("Binance DEMO only. Entries are LIMIT orders; leverage comes from Settings. No MARKET entries. No fixed Take Profit: profit exit is the ROI trailing stop.", 11f, muted)
             summaryBox.addView(note)
         }
 
@@ -559,22 +558,33 @@ class MainActivity : AppCompatActivity() {
             val margin = marginInput.text.toString().toDoubleOrNull() ?: 0.0
             if (margin <= 0.0) { toast("Enter a valid margin"); return }
             val lev = try { LeverageConfig.requireSupported(selectedLev()) } catch (e: Exception) { toast(e.message ?: "Invalid leverage"); return }
-            val s = stage()
-            val warn = "${s.shortLabel} is simulated. No real Binance order will be submitted."
+            // Binance DEMO only. The coin must have a READY Safety Setup report (checked here, no order is sent otherwise).
+            val creds = DemoCredentialStore.repository(this).load()
+            if (creds == null) { toast("Save your Demo keys first (More)."); return }
+            if (!DemoSymbolSetupStore.ready(this, sym)) { result.setTextColor(red); result.text = "[X] Safety Setup for $sym is not READY. Open More → BINANCE DEMO SAFETY SETUP, pick $sym and run it first. No order was sent."; return }
+            val eff = LocalCoinSettingsStore.load(this, sym)
+            val price = intended.toBigDecimal(); val marginBd = margin.toBigDecimal()
+            val request = DemoExecutionService.EntryRequest(sym, dir, price, marginBd, eff.leverage, eff.stopLossRoi, eff.stopLossEnabled)
+            val svc = DemoExecutionProvider.get(this)
             AlertDialog.Builder(this)
-                .setTitle("Confirm $dir LIMIT Entry")
-                .setMessage("Stage: ${s.title}\n$warn\n\n$sym $dir\nIntended LIMIT price: ${PriceFormatter.formatPrice(intended)}\nLast price: ${PriceFormatter.formatPrice(currentLivePrice)}\nMargin ${PriceFormatter.formatUsdt(margin)} | ${lev}x\n\nPlace this $dir LIMIT entry?")
+                .setTitle("Confirm Demo $dir LIMIT Entry")
+                .setMessage("Binance DEMO only. No real-money order.\n\n$sym $dir\nLIMIT price: ${PriceFormatter.formatPrice(intended)}\nLast price: ${PriceFormatter.formatPrice(currentLivePrice)}\nMargin ${PriceFormatter.formatUsdt(margin)} | ${eff.leverage}x (from Settings)\n\nAfter a fill this entry gets its own Stop Loss on Binance Demo (shown ACTIVE only after Binance confirms it).\n\nPlace this $dir LIMIT entry?")
                 .setPositiveButton("CONFIRM") { _, _ ->
-                    setButtonsEnabled(false); result.setTextColor(muted); result.text = "Placing simulated $dir LIMIT entry..."
+                    setButtonsEnabled(false); result.setTextColor(muted); result.text = "Sending $dir LIMIT entry to Binance Demo..."
                     lifecycleScope.launch {
-                        val res = engine().openInitialLimit(this@MainActivity, sym, dir, margin, lev, intended)
-                        setButtonsEnabled(true)
-                        if (res.ok) {
-                            result.setTextColor(green); result.text = "[OK] ${res.message} (Cycle #${res.cycleId})"; toast("$dir LIMIT entry placed")
-                            runCatching { val m = currentMarkPrice; val l = currentLivePrice; if (m != null || l != null) engine().processAll(this@MainActivity, if (m != null) mapOf(sym to m) else emptyMap(), if (l != null) mapOf(sym to l) else emptyMap()) }
+                        val text: String; val ok: Boolean
+                        if (DemoAutoTradeStore.isOn(this@MainActivity)) {
+                            val res = DemoStrategyEngineProvider.get(this@MainActivity).submitEntry(creds, sym, dir, price, marginOverride = marginBd)
+                            ok = res is EngineSubmit.Placed
+                            text = when (res) { is EngineSubmit.Placed -> "Order sent: ${res.entry.status}"; is EngineSubmit.NotPlaced -> res.message }
                         } else {
-                            result.setTextColor(red); result.text = "[X] ${res.message}"
+                            val res = svc.placeEntry(creds, request)
+                            ok = res is DemoExecutionService.PlaceResult.Placed
+                            text = when (res) { is DemoExecutionService.PlaceResult.Placed -> "Order sent: ${res.entry.status}"; is DemoExecutionService.PlaceResult.Refused -> res.reason; else -> "Order state unknown — check Positions / Open Order and Binance Demo." }
                         }
+                        setButtonsEnabled(true)
+                        result.setTextColor(if (ok) green else red); result.text = (if (ok) "[OK] " else "[X] ") + text
+                        if (ok) toast("$dir LIMIT entry sent to Demo")
                     }
                 }.setNegativeButton("CANCEL", null).show()
         }
@@ -608,12 +618,7 @@ class MainActivity : AppCompatActivity() {
         stopRefresh(); updateTopStatus()
         val root = pageContainer()
 
-        // Display-only toggle: which panel this tab shows. Never changes what the Virtual engine does; Demo strategy automation is not implemented.
-        val modeBar = row().apply { background = rounded(card, 12); setPadding(dp(6), dp(6), dp(6), dp(6)) }
-        root.addView(modeBar); addSpace(root, 8)
-        val virtualTab = TextView(this).apply { gravity = Gravity.CENTER; setPadding(dp(8), dp(10), dp(8), dp(10)); textSize = 12f }
-        val demoTab = TextView(this).apply { gravity = Gravity.CENTER; setPadding(dp(8), dp(10), dp(8), dp(10)); textSize = 12f }
-        modeBar.addView(virtualTab, LinearLayout.LayoutParams(0, -2, 1f)); modeBar.addView(demoTab, LinearLayout.LayoutParams(0, -2, 1f))
+        // Virtual/Demo switch retired (Round 1): this tab always shows Binance Demo. The Virtual panel code is kept but unreachable.
 
         val tabBar = row().apply { background = rounded(card, 12); setPadding(dp(6), dp(6), dp(6), dp(6)) }
         root.addView(tabBar); addSpace(root, 8)
@@ -621,7 +626,7 @@ class MainActivity : AppCompatActivity() {
         root.addView(subBar); addSpace(root, 8)
         val body = column(); root.addView(body)
 
-        var mode = TradingModeStore.get(this)
+        val mode = TradingMode.DEMO
         var primaryTab = 0 // 0 Position, 1 Open Order, 2 History
         var positionSub = 0 // 0 Open, 1 Closed
         var orderSub = 0 // 0 Basic, 1 Conditional
@@ -629,19 +634,6 @@ class MainActivity : AppCompatActivity() {
         lateinit var primaryViews: List<TextView>
         lateinit var subViews: List<TextView>
         lateinit var render: () -> Unit
-
-        fun styleModeTabs() {
-            virtualTab.text = "Virtual"; demoTab.text = "Demo"
-            virtualTab.setTextColor(if (mode == TradingMode.VIRTUAL) yellow else muted); virtualTab.setTypeface(null, if (mode == TradingMode.VIRTUAL) Typeface.BOLD else Typeface.NORMAL)
-            virtualTab.background = if (mode == TradingMode.VIRTUAL) rounded(inputBg, 10) else null
-            demoTab.setTextColor(if (mode == TradingMode.DEMO) yellow else muted); demoTab.setTypeface(null, if (mode == TradingMode.DEMO) Typeface.BOLD else Typeface.NORMAL)
-            demoTab.background = if (mode == TradingMode.DEMO) rounded(inputBg, 10) else null
-        }
-        virtualTab.setOnClickListener { TradingModeStore.trySet(this, TradingMode.VIRTUAL); mode = TradingMode.VIRTUAL; styleModeTabs(); render() }
-        demoTab.setOnClickListener {
-            val err = TradingModeStore.trySet(this, TradingMode.DEMO)
-            if (err != null) toast(err) else { mode = TradingMode.DEMO; styleModeTabs(); render() }
-        }
 
         fun stylePrimary(posCount: Int, openCount: Int, histCount: Int) {
             val labels = listOf("Position ($posCount)", "Open Order ($openCount)", "History ($histCount)")
@@ -746,7 +738,7 @@ class MainActivity : AppCompatActivity() {
                 if (primaryTab == 0) { if (positionSub != i) { positionSub = i; render() } } else if (primaryTab == 1) { if (orderSub != i) { orderSub = i; render() } } else { if (historySub != i) { historySub = i; render() } }
             } }.also { subBar.addView(it, LinearLayout.LayoutParams(0, -2, 1f)) }
         }
-        stylePrimary(0,0,0); styleSub("Open","Closed"); styleModeTabs(); render()
+        stylePrimary(0,0,0); styleSub("Open","Closed"); render()
     }
 
     // ---------------- Demo panel renderers (same Position / Open Order / History layout as Virtual) ----------------
@@ -759,14 +751,19 @@ class MainActivity : AppCompatActivity() {
 
     private fun renderDemoPositionsOpen(body: LinearLayout, open: List<DemoEntry>) {
         if (open.isEmpty()) { body.addView(text("No open positions.", 13f, muted)); return }
-        val repo = DemoCredentialStore.repository(this); val svc = DemoExecutionProvider.get(this)
+        val repo = DemoCredentialStore.repository(this); val svc = DemoExecutionProvider.get(this); val engine = DemoStrategyEngineProvider.get(this)
         for (e in open) {
             val box = makeItemCard(body)
             val header = row()
             header.addView(text("${e.symbol}  ${e.direction}", 15f, if (e.direction == "LONG") green else red, true), LinearLayout.LayoutParams(0, -2, 1f))
             header.addView(text("${e.leverage}x", 12f, muted, true)); box.addView(header)
-            addLabel(box, "Fill Price", e.avgPrice?.let { PriceFormatter.formatPrice(it.toDouble()) } ?: "--", white, true)
-            addLabel(box, "Quantity", e.executedQty, white, true)
+            addLabel(box, "Current Price", DemoMarkCache.get(e.symbol)?.let { PriceFormatter.formatPrice(it.toDouble()) } ?: "--", white, true)
+            addLabel(box, "Entry Price", e.avgPrice?.let { PriceFormatter.formatPrice(it.toDouble()) } ?: "--", white, true)
+            addLabel(box, "Position Quantity", e.openQuantity.toPlainString(), white, true)
+            addLabel(box, "Margin", e.average?.let { a -> a.multiply(e.openQuantity).divide(java.math.BigDecimal(e.leverage), 2, java.math.RoundingMode.HALF_UP).toPlainString() + " USDT" } ?: "--", white, true)
+            val tr = engine.trailingInfo(e)
+            addLabel(box, "Trailing Stop Activation", tr?.activation?.let { PriceFormatter.formatPrice(it.toDouble()) } ?: "--", if (tr?.source?.startsWith("Binance") == true) green else yellow, true)
+            if (tr != null) box.addView(text(tr.source, 10f, muted))
             addLabel(box, "Status", e.status.name, white, true)
             addLabel(box, "Stop Loss", demoSlLine(e), if (e.status == EntryStatus.UNPROTECTED) red else if (e.slState == "VERIFIED") green else yellow, true)
             if (e.note.isNotBlank()) addLabel(box, "Note", e.note, red, true)
@@ -826,6 +823,8 @@ class MainActivity : AppCompatActivity() {
     private fun renderDemoHistory(body: LinearLayout, closed: List<DemoEntry>) {
         if (closed.isEmpty()) { body.addView(text("No closed positions.", 13f, muted)); return }
         val tf = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US)
+        val creds = DemoCredentialStore.repository(this).load()
+        val pnlViews = HashMap<String, TextView>()
         for (e in closed.asReversed()) {
             val box = makeItemCard(body)
             val header = row()
@@ -838,6 +837,18 @@ class MainActivity : AppCompatActivity() {
             addLabel(box, "Leverage", "${e.leverage}x")
             if (e.note.isNotBlank()) addLabel(box, "Note", e.note, muted)
             addLabel(box, "Updated", tf.format(Date(e.updatedAt)))
+            if (e.executed.signum() > 0) pnlViews[e.id] = text("Realized PnL: loading from Binance Demo...", 12f, muted).also { box.addView(it) }
+        }
+        if (creds != null && pnlViews.isNotEmpty()) lifecycleScope.launch {
+            val api = DemoTradeClient.create()
+            val bodies = HashMap<String, String?>()
+            for (e in closed.filter { pnlViews.containsKey(it.id) }) {
+                val tv = pnlViews[e.id] ?: continue
+                val txt = bodies.getOrPut(e.symbol) { api.userTrades(creds, e.symbol, closed.filter { it.symbol == e.symbol }.minOf { it.createdAt }).let { r -> if (r.ok) r.body else null } }
+                val v = txt?.let { com.ansardeo.bnb.demo.exec.DemoAccountView.netRealized(it, e.symbol, e.direction, e.createdAt, e.updatedAt + 120_000L) }
+                if (v == null) { tv.text = "Realized PnL: not available (Binance did not answer)" }
+                else { tv.setTextColor(if (v.signum() >= 0) green else red); tv.text = "Realized PnL (Binance, net of fees): ${PriceFormatter.formatPnl(v.toDouble())} — covers this coin/side in this entry's time window, so it may include other entries of the same coin/side" }
+            }
         }
     }
 
@@ -1390,89 +1401,67 @@ class MainActivity : AppCompatActivity() {
     private fun morePage() {
         val root = pageContainer()
         root.addView(text("More", 23f, white, true))
-        root.addView(text("App status, safety controls and sanitized logs. Every action here affects ONLY the local Stage 1 simulation.", 12f, muted))
+        root.addView(text("App status, Binance Demo setup, safety controls and events. Binance DEMO only — no real-money trading.", 12f, muted))
 
-        val paused = TradingControlStore.isPaused(this)
         val info = addCard(root, "APP STATUS")
         addLabel(info, "Application", "BNB — Binance Android Bot")
         addLabel(info, "Version", BuildConfig.VERSION_NAME)
-        addLabel(info, "Stage", stage().title, green)
-        addLabel(info, "Stage 2 / Stage 3", "Not available", lockedColor)
-        addLabel(info, "Orders", "SIMULATED ONLY (no real Binance orders)", green)
-        addLabel(info, "Bot", if (paused) "PAUSED" else "Running", if (paused) yellow else green)
+        addLabel(info, "Stage", "Stage 2 — Binance Demo", green)
+        addLabel(info, "Real trading", "Not available", lockedColor)
+        addLabel(info, "Orders", "BINANCE DEMO ONLY (no real money)", green)
+        addLabel(info, "Auto-Trading", if (DemoAutoTradeStore.isOn(this)) "ON (only while app is open)" else "OFF", if (DemoAutoTradeStore.isOn(this)) green else yellow)
         addLabel(info, "Market data", "Binance public USDⓈ-M endpoints (read-only)", muted)
 
         addDemoApiCard(root)
         addDemoProbeCard(root)
+        addDemoTrailingProbeCard(root)
         addDemoSetupCard(root)
         addDemoOrdersCard(root)
 
-        val mon = addCard(root, "BACKGROUND MONITORING (FOREGROUND SERVICE)")
-        mon.addView(Switch(this).apply {
-            text = "Keep monitoring when the screen is off or the app is closed"; isChecked = TradingControlStore.isMonitoringEnabled(this@MainActivity); setTextColor(white)
-            setOnCheckedChangeListener { _, on ->
-                if (on) com.ansardeo.bnb.paper.PaperMonitorService.start(this@MainActivity) else com.ansardeo.bnb.paper.PaperMonitorService.stop(this@MainActivity)
-                toast(if (on) "Monitoring service started" else "Monitoring service stopped")
-            }
-        })
-        mon.addView(text("While it runs a persistent notification is shown (with Pause/Resume and Stop). Android Force Stop, some manufacturers' battery savers or switching the phone off stop it; it cannot be guaranteed on every device. If monitoring stops, allow BNB to run unrestricted in battery settings.", 12f, muted))
-        addButton(mon, "BATTERY SETTINGS", inputBg).setOnClickListener {
-            runCatching { startActivity(Intent(android.provider.Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)) }
-        }
-
-        val ctl = addCard(root, "SAFETY CONTROLS (LOCAL SIMULATION ONLY)")
+        val ctl = addCard(root, "DEMO SAFETY CONTROLS (BINANCE DEMO ONLY)")
         val result = text("", 12f, muted)
-        fun livePrices(onReady: (Map<String, Double>?) -> Unit) {
-            lifecycleScope.launch {
-                val ov = lastOverview ?: runCatching { marketRepo.getOverview().also { lastOverview = it } }.getOrNull()
-                if (ov == null || !ov.dataAvailable || ov.stale) { onReady(null); return@launch }
-                onReady(ov.symbols.mapNotNull { (k, t) -> t.markPrice?.takeIf { it.isFinite() && it > 0.0 }?.let { k.uppercase() to it } }.toMap())
-            }
+        val repoC = DemoCredentialStore.repository(this)
+        val eng = DemoStrategyEngineProvider.get(this)
+        fun withCreds(block: (com.ansardeo.bnb.demo.DemoCredentials) -> Unit) {
+            val c = repoC.load()
+            if (c == null) { result.setTextColor(red); result.text = "Save your Demo keys first." } else block(c)
         }
-        addButton(ctl, if (paused) "RESUME BOT" else "PAUSE BOT", inputBg).setOnClickListener {
-            TradingControlStore.setPaused(this, !paused); updateTopStatus(); showPage("More")
+        fun autoOn() = DemoAutoTradeStore.isOn(this)
+        addButton(ctl, if (autoOn()) "PAUSE AUTO-TRADING (turn OFF)" else "RESUME AUTO-TRADING (turn ON)", inputBg).setOnClickListener {
+            if (autoOn()) { DemoAutoTradeStore.set(this, false); updateTopStatus(); showPage("More") }
+            else AlertDialog.Builder(this).setTitle("Turn Demo Auto-Trading ON?")
+                .setMessage("Binance DEMO only. While this app is OPEN the strategy may place Averaging, Opposite-Side and Re-entry LIMIT orders and close a cycle at market when its ROI Trailing Stop triggers.")
+                .setPositiveButton("TURN ON") { _, _ -> DemoAutoTradeStore.set(this, true); updateTopStatus(); showPage("More") }.setNegativeButton("BACK", null).show()
         }
         addButton(ctl, "CANCEL PENDING ORDERS", inputBg).setOnClickListener {
-            AlertDialog.Builder(this).setTitle("Cancel all pending orders?")
-                .setMessage("Cancels every unfilled LIMIT entry and waiting re-entry plan (simulated). Open positions stay open.")
-                .setPositiveButton("CANCEL ORDERS") { _, _ -> lifecycleScope.launch { val r = engine().cancelAllPendingOrders(); result.text = r.message; toast("Done") } }
+            AlertDialog.Builder(this).setTitle("Cancel all pending Demo orders?")
+                .setMessage("Cancels every unfilled Demo entry order and waiting Re-entry order. Open positions and their Stop Losses stay.")
+                .setPositiveButton("CANCEL ORDERS") { _, _ -> withCreds { c -> lifecycleScope.launch { val r = eng.cancelAllPending(c); result.setTextColor(muted); result.text = r; toast("Done") } } }
                 .setNegativeButton("BACK", null).show()
         }
         addButton(ctl, "EMERGENCY STOP", 0xFF3A3416.toInt()).setOnClickListener {
             AlertDialog.Builder(this).setTitle("Emergency stop?")
-                .setMessage("Pauses the bot and cancels all pending orders (simulated). Open positions are NOT closed.")
+                .setMessage("Turns Auto-Trading OFF and cancels all pending Demo orders. Open positions are NOT closed and keep their Stop Losses.")
                 .setPositiveButton("STOP") { _, _ ->
-                    TradingControlStore.setPaused(this, true)
-                    lifecycleScope.launch { val r = engine().cancelAllPendingOrders(); toast("Emergency stop done"); updateTopStatus(); showPage("More") }
+                    DemoAutoTradeStore.set(this, false); updateTopStatus()
+                    withCreds { c -> lifecycleScope.launch { val r = eng.cancelAllPending(c); result.setTextColor(muted); result.text = "Auto-Trading OFF. $r" } }
                 }.setNegativeButton("BACK", null).show()
         }
-        addButton(ctl, "PANIC CLOSE ALL POSITIONS", 0xFF5A1E1E.toInt()).setOnClickListener {
+        addButton(ctl, "PANIC CLOSE ALL DEMO POSITIONS", 0xFF5A1E1E.toInt()).setOnClickListener {
             AlertDialog.Builder(this).setTitle("Panic close?")
-                .setMessage("Closes every open simulated position at the current live price and cancels pending orders. Requires live prices.")
+                .setMessage("Binance DEMO: turns Auto-Trading OFF, cancels pending orders, closes every open Demo position at market and removes its Stop Loss and Trailing Stop orders. No re-entry follows.")
                 .setPositiveButton("CLOSE ALL") { _, _ ->
-                    livePrices { prices ->
-                        if (prices == null) { result.setTextColor(red); result.text = "Live prices are unavailable or stale. Try again in a moment." }
-                        else lifecycleScope.launch { val r = engine().panicClose(prices); result.setTextColor(if (r.ok) green else red); result.text = r.message }
-                    }
+                    DemoAutoTradeStore.set(this, false); updateTopStatus()
+                    withCreds { c -> lifecycleScope.launch { result.setTextColor(muted); result.text = "Closing on Binance Demo..."; val r = eng.panicCloseAll(c); result.text = r } }
                 }.setNegativeButton("BACK", null).show()
         }
         ctl.addView(result)
 
-        val wal = addCard(root, "VIRTUAL WALLET")
-        addButton(wal, "RESET ALL VIRTUAL DATA (5000 USDT)", 0xFF3A3416.toInt()).setOnClickListener {
-            AlertDialog.Builder(this).setTitle("Reset ALL virtual data?")
-                .setMessage("Deletes the virtual wallet history, all cycles, orders, positions, history and events, then restores 5000 USDT. This cannot be undone.")
-                .setPositiveButton("RESET") { _, _ -> lifecycleScope.launch { engine().resetAllData(); toast("Virtual data reset"); showPage("More") } }
-                .setNegativeButton("CANCEL", null).show()
-        }
-
-        val logs = addCard(root, "SANITIZED LOGS (last 25 events)", "Strategy events only. Never contains keys, signatures or request data.")
-        lifecycleScope.launch {
-            val ev = runCatching { paperDb.dao().getEvents(stageId(), 25) }.getOrDefault(emptyList())
-            if (ev.isEmpty()) logs.addView(text("No events yet.", 12f, muted))
-            val tf = java.text.SimpleDateFormat("MM-dd HH:mm:ss", Locale.US)
-            ev.forEach { logs.addView(text("${tf.format(java.util.Date(it.createdAt))}  ${it.type}  ${it.message}", 11f, muted)); addSpace(logs, 4) }
-        }
+        val logs = addCard(root, "DEMO EVENTS (last 25)", "Strategy and order events only. Never contains keys, signatures or request data.")
+        val ev = DemoExecutionProvider.get(this).events(25)
+        if (ev.isEmpty()) logs.addView(text("No events yet.", 12f, muted))
+        val tf = java.text.SimpleDateFormat("MM-dd HH:mm:ss", Locale.US)
+        ev.forEach { logs.addView(text("${tf.format(java.util.Date(it.first))}  ${it.second}", 11f, muted)); addSpace(logs, 4) }
     }
 
     // ---------------- Binance Demo API configuration (Stage 2: credentials + read-only connection test; NO orders) ----------------
@@ -1557,6 +1546,46 @@ class MainActivity : AppCompatActivity() {
     }
 
     // ---------------- Binance Demo Compatibility Probe (Phase 3A step 2: tiny Demo orders that are always cancelled; opens NO position) ----------------
+    private fun addDemoTrailingProbeCard(root: LinearLayout) {
+        val card = addCard(root, "BINANCE DEMO TRAILING STOP PROBE",
+            "Checks, on Binance DEMO only, that an exchange-side Trailing Stop order (closing only, with activation price and callback) is accepted in Hedge Mode, can be listed and cancelled. It places one far-away order (BTCUSDT), cancels it, and opens NO position. Until this passes the app keeps using its app-side Trailing Stop.")
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        card.addView(box)
+        val repo = DemoCredentialStore.repository(this)
+        val fmt = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
+        fun refresh() {
+            box.removeAllViews()
+            val t = DemoTrailingProbeStore.text(this)
+            if (t == null) addLabel(box, "Trailing probe", "Not run", muted)
+            else {
+                val ok = DemoTrailingProbeStore.supported(this)
+                addLabel(box, "Last trailing probe", (if (ok) "PASSED (exchange Trailing Stop in use)" else "NOT PASSED (app-side Trailing Stop in use)") + "  ·  " + fmt.format(Date(DemoTrailingProbeStore.at(this))), if (ok) green else red)
+                t.lines().forEach { if (it.isNotBlank()) box.addView(text(it, 11f, muted)) }
+            }
+        }
+        val runBtn = addButton(card, "RUN TRAILING PROBE (Demo, cancels its own order)", yellow)
+        runBtn.setOnClickListener {
+            val creds = repo.load()
+            if (creds == null) { toast(if (repo.hasCredentials()) "Stored keys cannot be read. Replace them." else "Save your Demo keys first."); return@setOnClickListener }
+            AlertDialog.Builder(this).setTitle("Run Trailing Stop probe?")
+                .setMessage("Sends one tiny Trailing Stop test order to Binance DEMO (BTCUSDT), 10% above the market so it cannot trigger, and cancels it. No position is opened and no setting is changed.")
+                .setPositiveButton("RUN") { _, _ ->
+                    runBtn.isEnabled = false
+                    lifecycleScope.launch {
+                        val r = DemoTrailingProbe(DemoTradeClient.create()).run(creds)
+                        DemoTrailingProbeStore.save(this@MainActivity, r, "BTCUSDT")
+                        runBtn.isEnabled = true; refresh(); toast(if (r.passed && r.cleanupOk) "Trailing probe passed" else "Trailing probe finished — see report")
+                    }
+                }.setNegativeButton("CANCEL", null).show()
+        }
+        addButton(card, "COPY REPORT", inputBg).setOnClickListener {
+            val t = DemoTrailingProbeStore.text(this)
+            if (t == null) { toast("Run the trailing probe first."); return@setOnClickListener }
+            (getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager).setPrimaryClip(android.content.ClipData.newPlainText("BNB trailing probe report", t)); toast("Report copied")
+        }
+        refresh()
+    }
+
     private fun addDemoProbeCard(root: LinearLayout) {
         val card = addCard(root, "BINANCE DEMO COMPATIBILITY PROBE",
             "Checks, on Binance DEMO only, that LIMIT orders and an exchange-side Stop Loss can be placed, verified and cancelled. It places a far-away LIMIT order and a far-away Stop Loss order (BTCUSDT), cancels both, and opens NO position. It changes no account setting. Trading stays on Virtual.")
@@ -1600,22 +1629,42 @@ class MainActivity : AppCompatActivity() {
         refresh()
     }
 
+    /** Coin picker for the Binance Demo cards (type or choose; the list is the Binance USDⓈ-M symbol list). [onPicked] runs when a coin is chosen from the list. */
+    private fun demoSymbolField(initial: String, onPicked: () -> Unit): AutoCompleteTextView {
+        val f = AutoCompleteTextView(this).apply {
+            hint = "Coin (e.g. ETHUSDT)"; setText(initial); setSingleLine(true); setTextColor(white); setHintTextColor(muted); threshold = 1
+            inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS
+        }
+        lifecycleScope.launch {
+            val list = marketRepo.getUsdmSymbols().getOrElse { listOf("BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT") }
+            f.setAdapter(ArrayAdapter(this@MainActivity, android.R.layout.simple_dropdown_item_1line, list))
+        }
+        f.setOnItemClickListener { _, _, _, _ -> onPicked() }
+        f.setOnFocusChangeListener { _, has -> if (!has) onPicked() }
+        return f
+    }
+    private fun pickedSymbol(f: AutoCompleteTextView): String? = f.text.toString().trim().uppercase().takeIf { Regex("[A-Z0-9]{2,20}USDT").matches(it) }
+
     // ---------------- Binance Demo Safety Setup (Phase 3A step 3: ISOLATED margin + leverage for one symbol; NO orders) ----------------
     private fun addDemoSetupCard(root: LinearLayout) {
-        val symbol = "BTCUSDT"
-        val card = addCard(root, "BINANCE DEMO SAFETY SETUP ($symbol)",
-            "Makes $symbol safe on Binance DEMO: checks Hedge Mode (never changed by the app), sets ISOLATED margin and your configured leverage, then reads both back from Binance. Nothing is changed while the symbol has a position or any order. Places NO orders. Trading stays on Virtual.")
+        val card = addCard(root, "BINANCE DEMO SAFETY SETUP",
+            "Pick the coin, then make it safe on Binance DEMO (do this once per coin before its first entry): checks Hedge Mode (never changed by the app), sets ISOLATED margin and your configured leverage, then reads both back from Binance. Nothing is changed while the symbol has a position or any order. Places NO orders. Trading stays on Virtual.")
+        lateinit var refresh: () -> Unit
+        val symField = demoSymbolField("BTCUSDT") { refresh() }
+        card.addView(symField)
         val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         card.addView(box)
         val repo = DemoCredentialStore.repository(this)
         val fmt = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
-        fun refresh() {
+        refresh = {
             box.removeAllViews()
-            val t = DemoSymbolSetupStore.text(this)
-            if (t == null) addLabel(box, "Setup", "Not run", muted)
+            val sym = pickedSymbol(symField)
+            val t = sym?.let { DemoSymbolSetupStore.text(this, it) }
+            if (sym == null) addLabel(box, "Coin", "Enter a valid USDT coin, e.g. ETHUSDT", red)
+            else if (t == null) addLabel(box, "Setup $sym", "Not run", muted)
             else {
-                val ok = DemoSymbolSetupStore.ready(this)
-                addLabel(box, "Last setup", (if (ok) "READY" else "NOT READY") + "  ·  " + fmt.format(Date(DemoSymbolSetupStore.at(this))), if (ok) green else red)
+                val ok = DemoSymbolSetupStore.ready(this, sym)
+                addLabel(box, "Last setup $sym", (if (ok) "READY" else "NOT READY") + "  ·  " + fmt.format(Date(DemoSymbolSetupStore.at(this, sym))), if (ok) green else red)
                 t.lines().forEach { if (it.isNotBlank()) box.addView(text(it, 11f, muted)) }
             }
         }
@@ -1623,6 +1672,7 @@ class MainActivity : AppCompatActivity() {
         runBtn.setOnClickListener {
             val creds = repo.load()
             if (creds == null) { toast(if (repo.hasCredentials()) "Stored keys cannot be read. Replace them." else "Save your Demo keys first."); return@setOnClickListener }
+            val symbol = pickedSymbol(symField) ?: return@setOnClickListener toast("Enter a valid USDT coin, e.g. ETHUSDT.")
             val lev = LocalCoinSettingsStore.load(this, symbol).leverage
             AlertDialog.Builder(this).setTitle("Run Demo safety setup?")
                 .setMessage("On Binance DEMO this will set $symbol to ISOLATED margin and ${lev}x leverage (your configured leverage) if it is not already, and read them back. No order is placed. Nothing is changed if $symbol has a position or any order.")
@@ -1632,14 +1682,14 @@ class MainActivity : AppCompatActivity() {
                         val report = DemoSymbolSetup(DemoTradeClient.create(), symbol, lev).run(creds) { msg -> runBtn.text = msg }
                         DemoSymbolSetupStore.save(this@MainActivity, report)
                         runBtn.isEnabled = true; runBtn.text = "RUN SAFETY SETUP (Demo)"
-                        refresh(); toast(if (report.ready) "Setup confirmed" else "Setup not ready — see report")
+                        refresh(); toast(if (report.ready) "Setup confirmed for $symbol" else "Setup not ready — see report")
                     }
                 }
                 .setNegativeButton("CANCEL", null).show()
         }
         addButton(card, "COPY REPORT", inputBg).setOnClickListener {
-            val t = DemoSymbolSetupStore.text(this)
-            if (t == null) { toast("Run the setup first."); return@setOnClickListener }
+            val t = pickedSymbol(symField)?.let { DemoSymbolSetupStore.text(this, it) }
+            if (t == null) { toast("Run the setup for this coin first."); return@setOnClickListener }
             (getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager).setPrimaryClip(android.content.ClipData.newPlainText("BNB setup report", t))
             toast("Report copied")
         }
@@ -1661,6 +1711,7 @@ class MainActivity : AppCompatActivity() {
         demoPollJob = lifecycleScope.launch {
             while (true) {
                 try {
+                    if (engine.hasLiveEntries()) { kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { engine.refreshMarks() }; demoOrdersRefresh?.invoke() }
                     val auto = DemoAutoTradeStore.isOn(this@MainActivity)
                     val creds = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) { if (svc.hasWork() || (auto && engine.hasOpenCycles())) repo.load() else null }
                     if (creds != null) {
@@ -1675,8 +1726,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun addDemoOrdersCard(root: LinearLayout) {
-        val symbol = "BTCUSDT"
-        val card = addCard(root, "BINANCE DEMO ORDERS ($symbol)",
+        val card = addCard(root, "BINANCE DEMO ORDERS",
             "Manual LIMIT entry on Binance DEMO. Every filled entry gets its own exchange-side Stop Loss (from its actual fill price, your Stop Loss ROI setting). A Stop Loss is shown as ACTIVE only after Binance Demo confirmed it. If it cannot be confirmed, the unprotected quantity is closed at market and new entries are halted. Run the Safety Setup first. Trading stays on Virtual.")
         val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         val form = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
@@ -1689,12 +1739,14 @@ class MainActivity : AppCompatActivity() {
         val dirSpinner = Spinner(this).apply { adapter = createDarkSpinnerAdapter(listOf("LONG", "SHORT")) }
         val priceField = EditText(this).apply { hint = "Limit price"; inputType = android.text.InputType.TYPE_CLASS_NUMBER or android.text.InputType.TYPE_NUMBER_FLAG_DECIMAL; setSingleLine(true); setTextColor(white); setHintTextColor(muted) }
         val marginField = EditText(this).apply { hint = "Margin (USDT)"; inputType = android.text.InputType.TYPE_CLASS_NUMBER or android.text.InputType.TYPE_NUMBER_FLAG_DECIMAL; setSingleLine(true); setTextColor(white); setHintTextColor(muted) }
-        marginField.setText(LocalCoinSettingsStore.load(this, symbol).marginAmount.toString())
-        form.addView(dirSpinner); form.addView(priceField); form.addView(marginField)
+        marginField.setText(LocalCoinSettingsStore.load(this, "BTCUSDT").marginAmount.toString())
+        lateinit var symbolField: AutoCompleteTextView
+        symbolField = demoSymbolField("BTCUSDT") { pickedSymbol(symbolField)?.let { s0 -> marginField.setText(LocalCoinSettingsStore.load(this, s0).marginAmount.toString()) } }
+        form.addView(symbolField); form.addView(dirSpinner); form.addView(priceField); form.addView(marginField)
 
         fun statusLine(e: DemoEntry): String {
             val sl = when (e.slState) { "VERIFIED" -> "Stop Loss ACTIVE @ ${e.slTrigger} (qty ${e.protectedQty})"; "DONE" -> "Stop Loss triggered/finished"; "LOST" -> "Stop Loss LOST"; else -> "no Stop Loss" }
-            return "${e.direction} ${e.quantity} @ ${e.limitPrice} · ${e.status} · filled ${e.executedQty}" + (e.avgPrice?.let { " @ $it" } ?: "") + " · $sl" + (if (e.note.isNotBlank()) " · ${e.note}" else "")
+            return "${e.symbol} ${e.direction} ${e.quantity} @ ${e.limitPrice} · ${e.status} · filled ${e.executedQty}" + (e.avgPrice?.let { " @ $it" } ?: "") + " · $sl" + (if (e.note.isNotBlank()) " · ${e.note}" else "")
         }
 
         fun refresh() {
@@ -1730,6 +1782,7 @@ class MainActivity : AppCompatActivity() {
             if (creds == null) { toast(if (repo.hasCredentials()) "Stored keys cannot be read. Replace them." else "Save your Demo keys first."); return@setOnClickListener }
             val price = priceField.text.toString().toBigDecimalOrNull(); val margin = marginField.text.toString().toBigDecimalOrNull()
             if (price == null || margin == null || price.signum() <= 0 || margin.signum() <= 0) { toast("Enter a valid price and margin."); return@setOnClickListener }
+            val symbol = pickedSymbol(symbolField) ?: return@setOnClickListener toast("Enter a valid USDT coin, e.g. ETHUSDT.")
             val s = LocalCoinSettingsStore.load(this, symbol)
             val dir = dirSpinner.selectedItem.toString()
             val request = DemoExecutionService.EntryRequest(symbol, dir, price, margin, s.leverage, s.stopLossRoi, s.stopLossEnabled)
@@ -1740,7 +1793,7 @@ class MainActivity : AppCompatActivity() {
                     lifecycleScope.launch {
                         if (DemoAutoTradeStore.isOn(this@MainActivity)) {
                             // Auto-Trading ON: the entry starts a strategy cycle and goes through Global Best Entry Price Priority.
-                            val res = engine.submitEntry(creds, symbol, dir, price)
+                            val res = engine.submitEntry(creds, symbol, dir, price, marginOverride = margin)
                             placeBtn.isEnabled = true; refresh()
                             toast(when (res) { is EngineSubmit.Placed -> "Order sent: ${res.entry.status}"; is EngineSubmit.NotPlaced -> res.message })
                         } else {

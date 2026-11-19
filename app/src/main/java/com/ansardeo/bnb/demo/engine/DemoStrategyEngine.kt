@@ -9,6 +9,7 @@ import com.ansardeo.bnb.demo.exec.DemoExecStore
 import com.ansardeo.bnb.demo.exec.DemoExecutionService
 import com.ansardeo.bnb.demo.exec.EntryStatus
 import com.ansardeo.bnb.demo.trade.DemoTradeClient
+import com.ansardeo.bnb.demo.trade.ExchangeRules
 import com.ansardeo.bnb.trading.EntryBook
 import com.ansardeo.bnb.trading.EntryCandidate
 import com.ansardeo.bnb.trading.EntryKind
@@ -27,6 +28,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import org.json.JSONObject
+import java.util.concurrent.ConcurrentHashMap
 import java.math.BigDecimal
 import java.math.RoundingMode
 import com.ansardeo.bnb.trading.PlaceResult as StrategyPlace
@@ -68,6 +70,15 @@ class DemoCycleEntryBook(private val svc: DemoExecutionService, private val stor
     }
 }
 
+/** Latest Demo mark price per symbol, refreshed by the poll loop while the app is open (display only). */
+object DemoMarkCache {
+    private val m = ConcurrentHashMap<String, BigDecimal>()
+    fun put(symbol: String, price: BigDecimal) { m[symbol] = price }
+    fun get(symbol: String): BigDecimal? = m[symbol]
+}
+
+data class TrailingDisplay(val activation: String, val source: String)
+
 sealed class EngineSubmit {
     data class Placed(val entry: DemoEntry, val message: String) : EngineSubmit()
     data class NotPlaced(val message: String) : EngineSubmit()
@@ -91,6 +102,8 @@ class DemoStrategyEngine(
     private val store: DemoExecStore,
     private val settingsOf: (String) -> LocalCoinSettings,
     private val clock: () -> Long = { System.currentTimeMillis() },
+    /** True only after the Demo Trailing Stop probe passed: then the cycle Trailing Stop is placed as an order on Binance Demo (Phase 3C). */
+    private val trailingOrderOk: () -> Boolean = { false },
 ) {
     private val mutex = Mutex()
     private val book = DemoCycleEntryBook(svc, store, clock)
@@ -98,8 +111,8 @@ class DemoStrategyEngine(
     private var counter = 0
 
     // ------------------------------------------------------------------ public API
-    suspend fun submitEntry(c: DemoCredentials, symbol: String, direction: String, price: BigDecimal, kind: EntryKind = EntryKind.MANUAL): EngineSubmit =
-        mutex.withLock { submitLocked(c, symbol, direction, price, kind, null) }
+    suspend fun submitEntry(c: DemoCredentials, symbol: String, direction: String, price: BigDecimal, kind: EntryKind = EntryKind.MANUAL, marginOverride: BigDecimal? = null): EngineSubmit =
+        mutex.withLock { submitLocked(c, symbol, direction, price, kind, null, marginOverride) }
 
     /** One strategy pass over every open cycle. Never throws (except cancellation); a failure is logged and retried on the next pass. */
     suspend fun tick(c: DemoCredentials) = mutex.withLock {
@@ -108,13 +121,59 @@ class DemoStrategyEngine(
         }
     }
 
+    /** Cancels every unfilled entry order (including waiting Re-entry orders). Open positions and their Stop Losses stay. Returns a short report. */
+    suspend fun cancelAllPending(c: DemoCredentials): String = mutex.withLock {
+        val pend = store.all().filter { isPending(it) }
+        if (pend.isEmpty()) return@withLock "No pending entry orders."
+        for (e in pend) svc.cancelEntry(c, e.id)
+        val left = store.all().count { isPending(it) }
+        if (left == 0) "Cancelled ${pend.size} pending order(s)." else "Cancel sent for ${pend.size}; $left still being re-checked — see Open Order."
+    }
+
+    /**
+     * Panic close (Demo): cancels pending entries, closes every open entry at market (the approved closing-only method), removes each
+     * cycle's Binance Trailing Stop order and ends the cycles WITHOUT re-entry. Nothing is claimed closed until Binance confirmed it.
+     */
+    suspend fun panicCloseAll(c: DemoCredentials): String = mutex.withLock {
+        val lines = ArrayList<String>()
+        for (e in store.all().filter { isPending(it) }) svc.cancelEntry(c, e.id)
+        for (e in store.all().filter { isLive(it) }) lines.add("${e.symbol} ${e.direction}: " + svc.closeEntryAtMarket(c, e.id))
+        for (cy in store.cycles().filter { it.status != CycleStatus.CLOSED }) {
+            val es = store.all().filter { it.cycleId == cy.id }
+            if (es.any { isPending(it) || isLive(it) }) { log(cy, "panic close: not everything is closed yet; check Binance Demo"); continue }
+            cleanupTrailing(c, cy)
+            save(cy.copy(status = CycleStatus.CLOSED, reentryDone = true, note = "Closed by panic close (no re-entry)."))
+            log(cy, "closed by panic close (no re-entry)")
+        }
+        val open = store.all().count { isLive(it) || isPending(it) }
+        (if (lines.isEmpty()) "No open positions." else lines.joinToString("\n")) + (if (open > 0) "\nStill open/pending: $open — check Binance Demo." else "")
+    }
+
+    /** Fetches the Demo mark price of every symbol that has an open position (public data) so the Positions tab can show the current price. */
+    suspend fun refreshMarks() {
+        for (sym in store.all().filter { isLive(it) }.map { it.symbol }.distinct()) mark(sym)?.let { DemoMarkCache.put(sym, it) }
+    }
+    fun hasLiveEntries(): Boolean = store.all().any { isLive(it) }
+
+    /** What the Positions tab shows as the Trailing Stop activation price of this entry's cycle, and where it comes from. */
+    fun trailingInfo(e: DemoEntry): TrailingDisplay? {
+        val cy = store.getCycle(e.cycleId) ?: return null
+        if (cy.status == CycleStatus.CLOSED) return null
+        val placed = cy.trActivation
+        if (cy.trMode == "EXCHANGE" && cy.trAlgoId != null && placed != null) return TrailingDisplay(placed, "Binance Demo Trailing Stop ACTIVE · callback ${cy.trCallback}% price")
+        val s = settingsOf(cy.symbol); if (!s.trailingEnabled) return null
+        val wap = wapOf(store.all().filter { it.cycleId == cy.id && isLive(it) }) ?: return null
+        val act = TrailingStopMath.activationPrice(TrailSide.fromDirection(cy.direction), wap, cy.leverage, TrailingStopMath.bd(s.trailingActivationRoi))
+        return TrailingDisplay(act.setScale(4, RoundingMode.HALF_UP).toPlainString(), if (cy.trMode == "APP" && cy.trailActive) "app-side Trailing Stop ACTIVE" else "calculated · no Binance order yet")
+    }
+
     fun cycles(): List<DemoCycle> = store.cycles().reversed()
     fun hasOpenCycles(): Boolean = store.cycles().any { it.status != CycleStatus.CLOSED }
 
     // ------------------------------------------------------------------ entries
-    private suspend fun submitLocked(c: DemoCredentials, symbol: String, direction: String, price: BigDecimal, kind: EntryKind, cycleId: String?): EngineSubmit {
+    private suspend fun submitLocked(c: DemoCredentials, symbol: String, direction: String, price: BigDecimal, kind: EntryKind, cycleId: String?, marginOverride: BigDecimal? = null): EngineSubmit {
         val s = settingsOf(symbol)
-        val margin = when (kind) { EntryKind.AVERAGING -> s.averagingMargin; EntryKind.OPPOSITE_SIDE -> s.oppositeMargin; else -> s.marginAmount }
+        val margin = when (kind) { EntryKind.AVERAGING -> s.averagingMargin; EntryKind.OPPOSITE_SIDE -> s.oppositeMargin; else -> marginOverride?.toDouble() ?: s.marginAmount }
         val cid = cycleId ?: newCycleId()
         if (cycleId == null) store.putCycle(DemoCycle(cid, symbol, direction, s.leverage, kind.name, createdAt = clock(), updatedAt = clock()))
         book.creds = c
@@ -165,6 +224,7 @@ class DemoStrategyEngine(
         val pending = es.filter { isPending(it) }
         if (cy.status == CycleStatus.ACTIVE && live.isEmpty() && pending.isEmpty()) {
             if (es.isEmpty() && clock() - cy.createdAt < 60_000L) return // entry is just being created
+            cleanupTrailing(c, cy)
             save(cy.copy(status = CycleStatus.CLOSED, note = "No open entries left (Stop Loss, cancel or manual close)."))
             log(cy, "closed: no open entries left (no automatic re-entry for this reason)")
             return
@@ -176,13 +236,19 @@ class DemoStrategyEngine(
         val s = settingsOf(cy.symbol)
         val side = TrailSide.fromDirection(cy.direction)
 
-        // 1) profit exit first: cycle ROI Trailing Stop on the cycle WAP
+        // 1) profit exit first: cycle ROI Trailing Stop. Placed as an order on Binance Demo when the probe passed (Phase 3C), otherwise (or as fallback) app-side.
         if (s.trailingEnabled) {
             val step = TrailingStopMath.step(side, wap, cy.leverage, TrailingConfig(TrailingStopMath.bd(s.trailingActivationRoi), TrailingStopMath.bd(s.trailingCallbackRoi)), cy.trailState(), mark)
             cy = save(cy.withTrail(step.state))
-            if (step.justActivated) log(cy, "Trailing Stop activated at ${mark.toPlainString()} (WAP ${wap.toPlainString()}); stop ${step.state.stopPrice?.setScale(2, RoundingMode.HALF_UP)?.toPlainString()}")
-            if (step.exitTriggered) {
-                cy = save(cy.copy(status = CycleStatus.CLOSING, closePrice = mark.toPlainString(), closeWap = wap.toPlainString()))
+            if (step.justActivated) log(cy, "price reached the Trailing Stop activation at ${mark.toPlainString()} (WAP ${wap.toPlainString()})")
+            if (cy.trMode.isEmpty()) {
+                cy = if (trailingOrderOk() && !step.state.active && cy.trFail < 3) placeOrFallback(c, cy, live, wap, mark, s) else save(cy.copy(trMode = "APP"))
+            } else if (cy.trMode == "EXCHANGE") {
+                cy = syncExchangeTrail(c, cy, live, wap, mark, step.state.active, s)
+                if (cy.status == CycleStatus.CLOSING) { continueClosing(c, cy); return }
+            }
+            if (cy.trMode == "APP" && step.exitTriggered) {
+                cy = save(cy.copy(status = CycleStatus.CLOSING, exitBy = "APP", closePrice = mark.toPlainString(), closeWap = wap.toPlainString()))
                 log(cy, "Trailing Stop triggered at ${mark.toPlainString()}; closing all open entries of the cycle")
                 continueClosing(c, cy)
                 return
@@ -216,7 +282,17 @@ class DemoStrategyEngine(
 
     private suspend fun continueClosing(c: DemoCredentials, cy: DemoCycle) {
         for (e in store.all().filter { it.cycleId == cy.id && isPending(it) }) svc.cancelEntry(c, e.id)
-        for (e in store.all().filter { it.cycleId == cy.id && isLive(it) }) {
+        val liveNow = store.all().filter { it.cycleId == cy.id && isLive(it) }
+        if (cy.exitBy == "EXCHANGE" && liveNow.isNotEmpty()) {
+            // Binance's own Trailing Stop closed the position: confirm that on the exchange before recording it; never send a second close for it.
+            val onExchange = svc.exchangePositionAmount(c, cy.symbol, cy.direction) ?: return // unreadable: retried by the next pass
+            val others = store.all().filter { it.cycleId != cy.id && it.symbol == cy.symbol && it.direction == cy.direction && isLive(it) }.fold(BigDecimal.ZERO) { a, e -> a.add(liveQty(e)) }
+            val mine = onExchange.subtract(others)
+            for (e in liveNow) {
+                val msg = if (mine.signum() <= 0) svc.markClosedByExchange(c, e.id) else svc.closeEntryAtMarket(c, e.id) // something is still open: close it
+                log(cy, "${e.id}: $msg")
+            }
+        } else for (e in liveNow) {
             val msg = svc.closeEntryAtMarket(c, e.id)
             log(cy, "${e.id}: $msg")
         }
@@ -242,6 +318,71 @@ class DemoStrategyEngine(
         log(cy, "Re-entry: ${side.name} @ ${samePrice.setScale(2, RoundingMode.HALF_UP)} (50% of booked ROI) and ${opp.name} @ ${oppPrice.setScale(2, RoundingMode.HALF_UP)} (100%)")
         report(cy, submitLocked(c, cy.symbol, side.name, samePrice, EntryKind.REENTRY_SAME, null))
         report(cy, submitLocked(c, cy.symbol, opp.name, oppPrice, EntryKind.REENTRY_OPPOSITE, null))
+    }
+
+    // ------------------------------------------------------------------ Phase 3C: Trailing Stop order on Binance Demo
+    private fun roundedWap(w: BigDecimal) = w.setScale(8, RoundingMode.HALF_UP).toPlainString()
+
+    /** Places the cycle's Trailing Stop on Binance Demo (confirmed before it counts). Not placed when price is already past the activation: the app-side trailing takes over then. */
+    private suspend fun placeOrFallback(c: DemoCredentials, cy0: DemoCycle, live: List<DemoEntry>, wap: BigDecimal, mark: BigDecimal, s: LocalCoinSettings): DemoCycle {
+        var cy = cy0
+        val side = TrailSide.fromDirection(cy.direction)
+        val activation = TrailingStopMath.activationPrice(side, wap, cy.leverage, TrailingStopMath.bd(s.trailingActivationRoi))
+        val reached = if (side == TrailSide.LONG) mark >= activation else mark <= activation
+        if (reached) { log(cy, "price is already past the Trailing Stop activation: using the app-side Trailing Stop"); return save(cy.copy(trMode = "APP")) }
+        val qty = live.fold(BigDecimal.ZERO) { a, e -> a.add(liveQty(e)) }
+        val callbackPrice = TrailingStopMath.bd(s.trailingCallbackRoi).divide(BigDecimal(cy.leverage), 6, RoundingMode.HALF_UP)
+        val placed = svc.placeTrailingOrder(c, cy.symbol, cy.direction, qty, activation, callbackPrice, cy.id)
+        if (placed != null) {
+            cy = save(cy.copy(trMode = "EXCHANGE", trAlgoId = placed.algoId, trQty = placed.quantity, trWap = roundedWap(wap), trActivation = placed.activation, trCallback = placed.callback, trFail = 0))
+            log(cy, "Trailing Stop order is ACTIVE on Binance Demo (confirmed): activation ${placed.activation}, callback ${placed.callback}% price (= ${s.trailingCallbackRoi}% ROI at ${cy.leverage}x, rounded to 0.1%)")
+            return cy
+        }
+        val fails = cy.trFail + 1
+        log(cy, "Trailing Stop order could not be placed/confirmed (attempt $fails of 3)" + if (fails >= 3) "; using the app-side Trailing Stop" else "")
+        return save(cy.copy(trFail = fails, trMode = if (fails >= 3) "APP" else cy.trMode))
+    }
+
+    /** Keeps the Binance Trailing Stop order in step with the cycle: detects that it fired, replaces it when the open quantity or WAP changed (averaging, Stop Loss close). */
+    private suspend fun syncExchangeTrail(c: DemoCredentials, cy0: DemoCycle, live: List<DemoEntry>, wap: BigDecimal, mark: BigDecimal, shadowActive: Boolean, s: LocalCoinSettings): DemoCycle {
+        var cy = cy0
+        val id = cy.trAlgoId ?: return placeOrFallback(c, cy, live, wap, mark, s)
+        val info = svc.algoInfo(c, id)
+        when (info.status) {
+            null -> return cy
+            "NEW", "WORKING" -> Unit
+            "TRIGGERING", "TRIGGERED", "FINISHED" -> return exchangeExit(cy, wap, mark, info.price, info.status)
+            else -> { log(cy, "the Binance Trailing Stop order is no longer active (${info.status}); using the app-side Trailing Stop"); return save(cy.copy(trMode = "APP", trAlgoId = null)) }
+        }
+        val qty = live.fold(BigDecimal.ZERO) { a, e -> a.add(liveQty(e)) }
+        if (ExchangeRules.plain(qty) == cy.trQty && roundedWap(wap) == cy.trWap) return cy
+        val side = TrailSide.fromDirection(cy.direction)
+        val old = cy.trActivation?.let { BigDecimal(it) }
+        val crossed = old != null && (if (side == TrailSide.LONG) mark >= old else mark <= old)
+        when (val st = svc.cancelAlgoOrder(c, id)) {
+            "TRIGGERING", "TRIGGERED", "FINISHED" -> return exchangeExit(cy, wap, mark, null, st)
+            "NEW", "WORKING", null -> { log(cy, "could not replace the Binance Trailing Stop yet (cancel not confirmed); retrying"); return cy }
+        }
+        cy = save(cy.copy(trAlgoId = null, trQty = "", trWap = "", trActivation = null, trCallback = null))
+        if (shadowActive || crossed) {
+            log(cy, "open quantity/WAP changed after the trailing had started: the Binance Trailing Stop order was cancelled and the app-side Trailing Stop continues (it keeps the extreme and never loosens the stop)")
+            return save(cy.copy(trMode = "APP"))
+        }
+        log(cy, "open quantity/WAP changed: replacing the Binance Trailing Stop order")
+        return placeOrFallback(c, cy, live, wap, mark, s)
+    }
+
+    private fun exchangeExit(cy0: DemoCycle, wap: BigDecimal, mark: BigDecimal, price: BigDecimal?, status: String): DemoCycle {
+        val close = price ?: mark
+        val cy = save(cy0.copy(status = CycleStatus.CLOSING, exitBy = "EXCHANGE", closePrice = close.toPlainString(), closeWap = wap.toPlainString()))
+        log(cy, "the Binance Trailing Stop order fired (status $status); close price ${close.toPlainString()}" + if (price == null) " (Demo mark price: Binance gave no fill price)" else "")
+        return cy
+    }
+
+    private suspend fun cleanupTrailing(c: DemoCredentials, cy: DemoCycle) {
+        val id = cy.trAlgoId ?: return
+        val st = svc.cancelAlgoOrder(c, id)
+        log(cy, "Binance Trailing Stop order removed (status $st)")
     }
 
     // ------------------------------------------------------------------ helpers
