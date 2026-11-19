@@ -14,7 +14,9 @@ class NoDirectHttpInExecTest {
 
     @Test fun noRawHttpHostsEndpointsOrOrderTypes() {
         val banned = listOf("OkHttp", "Request.Builder", "HttpUrl", "Endpoint.", "binance.com", "\"type\" to", "TAKE_PROFIT", "TRAILING_STOP", "closePosition", "reduceOnly", "/fapi/", "testnet", "X-MBX-APIKEY", "signature", "Log.", "println(", "printStackTrace")
-        for (f in sources()) { val t = code(f); banned.forEach { assertFalse("${f.name} contains $it", t.contains(it)) } }
+        // The ONLY exemption: DemoAlgoView.kt is a read-only parser that classifies orders Binance already lists; it cannot send anything.
+        // Placing a trailing order stays guarded (NoUnapprovedTradeEndpointsTest: closing-only, built once in DemoTradeClient).
+        for (f in sources()) { val t = code(f); banned.filterNot { f.name == "DemoAlgoView.kt" && it == "TRAILING_STOP" }.forEach { assertFalse("${f.name} contains $it", t.contains(it)) } }
     }
 
     @Test fun noSecretsAreStoredOrLogged() {

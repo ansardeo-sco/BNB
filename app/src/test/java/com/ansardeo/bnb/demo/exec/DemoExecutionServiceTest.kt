@@ -135,10 +135,17 @@ class DemoExecutionServiceTest {
         ex.hedge = false; assertTrue((place(s) as PlaceResult.Refused).reason.contains("Hedge")); ex.hedge = true
         ex.margin = "CROSSED"; assertTrue((place(s) as PlaceResult.Refused).reason.contains("ISOLATED")); ex.margin = "ISOLATED"
         ex.leverage = 20; assertTrue((place(s) as PlaceResult.Refused).reason.contains("leverage")); ex.leverage = 6
-        assertTrue((place(s, req(slEnabled = false)) as PlaceResult.Refused).reason.contains("Stop Loss"))
         assertTrue((place(s, req(margin = "1")) as PlaceResult.Refused).reason.contains("minimum"))   // order value below min notional
         assertTrue((place(s, req(price = "50000")) as PlaceResult.Refused).reason.contains("band"))   // outside PERCENT_PRICE
         assertTrue(ex.posts("/fapi/v1/order").isEmpty())
+    }
+
+    @Test fun stopLossOffIsNotRefusedAndGetsNoStopLossOrder() {
+        ex.limitFill = "full"
+        val r = place(service(), req(slEnabled = false))
+        assertTrue("SL OFF must not block the entry: $r", r is PlaceResult.Placed)
+        assertEquals(0, ex.posts("/fapi/v1/algoOrder").size)
+        assertFalse(store.all().single().slOn)
     }
 
     @Test fun orderLostBeforeSendingIsTreatedAsNotPlacedAndNothingIsDuplicated() {
