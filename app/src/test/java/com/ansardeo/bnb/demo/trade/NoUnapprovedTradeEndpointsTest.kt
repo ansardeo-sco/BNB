@@ -13,17 +13,8 @@ class NoUnapprovedTradeEndpointsTest {
     private fun code(f: File) = f.readText().lines().filterNot { it.trim().startsWith("*") || it.trim().startsWith("/*") || it.trim().startsWith("//") }.joinToString("\n")
 
     @Test fun noUnapprovedOrderTypesOrParameters() {
-        val banned = listOf("TAKE_PROFIT", "closePosition", "reduceOnly", "activationPrice", "batchOrders", "allOpenOrders", "listenKey")
+        val banned = listOf("TAKE_PROFIT", "TRAILING_STOP", "closePosition", "reduceOnly", "callbackRate", "activationPrice", "batchOrders", "allOpenOrders", "listenKey")
         for (f in sources()) { val t = code(f); banned.forEach { assertFalse("${f.name} contains $it", t.contains(it)) } }
-        // Phase 3C approval: ONLY the closing-only TRAILING_STOP_MARKET algo order, built in DemoTradeClient (any other trailing/callback usage stays banned).
-        for (f in sources()) {
-            val t = code(f)
-            assertFalse("${f.name}: unapproved trailing order type", Regex("TRAILING_STOP(?!_MARKET)").containsMatchIn(t))
-            if (f.name != "DemoTradeClient.kt") { assertFalse("${f.name}: trailing parameters", t.contains("callbackRate") || t.contains("activatePrice") || t.contains("TRAILING_STOP_MARKET")) }
-        }
-        val client = code(sources().first { it.name == "DemoTradeClient.kt" })
-        assertEquals(1, Regex("\"type\" to \"TRAILING_STOP_MARKET\"").findAll(client).count())
-        assertTrue(client.contains("require((positionSide == \"LONG\" && side == \"SELL\") || (positionSide == \"SHORT\" && side == \"BUY\")) { \"closing side only\" }"))
         // Step 3 approval: margin-type / leverage CHANGES may be requested only by the typed methods of the trade client (and listed in the catalog), nowhere else.
         val settingChange = listOf("/fapi/v1/leverage", "\"marginType\" to", "\"leverage\" to")
         for (f in sources().filter { it.name != "DemoTradeClient.kt" && it.name != "TradeEndpoints.kt" }) { val t = code(f); settingChange.forEach { assertFalse("${f.name} must not change account settings ($it)", t.contains(it)) } }
@@ -56,7 +47,7 @@ class NoUnapprovedTradeEndpointsTest {
     @Test fun onlyApprovedOrderTypesAreSent() {
         val t = sources().joinToString("\n") { code(it) }
         val types = Regex("\"type\" to \"([A-Z_]+)\"").findAll(t).map { it.groupValues[1] }.toSet()
-        assertEquals(setOf("LIMIT", "STOP_MARKET", "MARKET", "TRAILING_STOP_MARKET"), types)
+        assertEquals(setOf("LIMIT", "STOP_MARKET", "MARKET"), types)
     }
 
     @Test fun onlyTheGuardedFactoryAndNoLiveHost() {
