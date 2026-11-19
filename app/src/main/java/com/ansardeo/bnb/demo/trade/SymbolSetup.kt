@@ -135,16 +135,17 @@ class DemoSymbolSetup(private val api: DemoTradeClient, private val symbol: Stri
 /** Keeps the last setup report and the confirmed config on the device (sanitized text only). */
 object DemoSymbolSetupStore {
     private const val PREFS = "bnb_demo_symbol_setup"
-    private fun prefs(c: Context) = c.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+    /** One stored report per symbol (BTCUSDT keeps the original file, so earlier results stay valid). */
+    private fun prefs(c: Context, symbol: String) = c.applicationContext.getSharedPreferences(if (symbol == "BTCUSDT") PREFS else PREFS + "_" + symbol, Context.MODE_PRIVATE)
     fun save(c: Context, r: SetupReport) {
-        val e = prefs(c).edit().putString("text", r.toText()).putString("status", r.status.name).putString("symbol", r.symbol).putLong("at", r.atMillis)
+        val e = prefs(c, r.symbol).edit().putString("text", r.toText()).putString("status", r.status.name).putString("symbol", r.symbol).putLong("at", r.atMillis)
         r.config?.let { e.putString("margin", it.marginType).putInt("lev", it.leverage) } ?: e.remove("margin").remove("lev")
         e.apply()
     }
-    fun text(c: Context): String? = prefs(c).getString("text", null)
-    fun at(c: Context): Long = prefs(c).getLong("at", 0L)
-    fun ready(c: Context): Boolean = prefs(c).getString("status", null) == SetupReport.Status.READY.name
-    fun clear(c: Context) { prefs(c).edit().clear().apply() }
+    fun text(c: Context, symbol: String = "BTCUSDT"): String? = prefs(c, symbol).getString("text", null)
+    fun at(c: Context, symbol: String = "BTCUSDT"): Long = prefs(c, symbol).getLong("at", 0L)
+    fun ready(c: Context, symbol: String = "BTCUSDT"): Boolean = prefs(c, symbol).getString("status", null) == SetupReport.Status.READY.name
+    fun clear(c: Context, symbol: String = "BTCUSDT") { prefs(c, symbol).edit().clear().apply() }
 }
 
 /** Process-wide holder of the exchange rules last read from Binance Demo (used by order preparation in later steps). */

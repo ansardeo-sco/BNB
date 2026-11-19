@@ -25,6 +25,8 @@ class TradeEndpointCatalogTest {
             Triple(HttpVerb.GET, "/fapi/v1/symbolConfig", true),
             Triple(HttpVerb.POST, "/fapi/v1/marginType", true),
             Triple(HttpVerb.POST, "/fapi/v1/leverage", true),
+            // Round 2 (approved): read-only trade history for realized PnL
+            Triple(HttpVerb.GET, "/fapi/v1/userTrades", true),
         )
         assertEquals(approved, actual)
         assertEquals(approved.size, Endpoint.values().size)

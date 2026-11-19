@@ -26,6 +26,7 @@ class DemoCompatibilityProbeTest {
     private var algoSupported = true
     private var legacyAccepted = true
     private var cancelFailures = 0          // number of DELETE calls that fail before succeeding; -1 = always fail
+    private var algoStaleQueries = 0        // cancel is accepted (DELETE succeeds) but GET keeps answering NEW this many times first
     private var limitRejected = false
 
     private val exchangeInfo = """{"symbols":[{"symbol":"BTCUSDT","status":"TRADING","filters":[
@@ -59,7 +60,10 @@ class DemoCompatibilityProbeTest {
                     path == "/fapi/v1/order" && m == "DELETE" -> if (failCancel()) MockResponse().setResponseCode(500) else orders[p("orderId")!!.toLong()]?.let { it.status = "CANCELED"; MockResponse().setBody("""{"orderId":${it.id},"status":"CANCELED"}""") } ?: err(-2011, "Unknown order")
                     path == "/fapi/v1/openOrders" -> MockResponse().setBody(arr(orders.values.filter { it.status == "NEW" }, "orderId", "clientOrderId"))
                     path == "/fapi/v1/algoOrder" && m == "POST" -> if (!algoSupported) err(-4120, "STOP_ORDER_SWITCH_ALGO") else { val o = Ord(next++, p("clientAlgoId")!!, "NEW"); algos[o.id] = o; MockResponse().setBody("""{"algoId":${o.id},"algoStatus":"NEW"}""") }
-                    path == "/fapi/v1/algoOrder" && m == "GET" -> algos[p("algoId")!!.toLong()]?.let { MockResponse().setBody("""{"algoId":${it.id},"algoStatus":"${it.status}"}""") } ?: err(-2013, "no algo")
+                    path == "/fapi/v1/algoOrder" && m == "GET" -> algos[p("algoId")!!.toLong()]?.let {
+                        val reported = if (it.status == "CANCELED" && algoStaleQueries > 0) { algoStaleQueries--; "NEW" } else it.status
+                        MockResponse().setBody("""{"algoId":${it.id},"algoStatus":"$reported"}""")
+                    } ?: err(-2013, "no algo")
                     path == "/fapi/v1/algoOrder" && m == "DELETE" -> if (failCancel()) MockResponse().setResponseCode(500) else algos[p("algoId")!!.toLong()]?.let { it.status = "CANCELED"; MockResponse().setBody("""{"algoId":${it.id},"algoStatus":"CANCELED"}""") } ?: err(-2011, "Unknown")
                     path == "/fapi/v1/openAlgoOrders" -> MockResponse().setBody(arr(algos.values.filter { it.status == "NEW" }, "algoId", "clientAlgoId").replace("\"status\"", "\"algoStatus\""))
                     else -> MockResponse().setResponseCode(404)
@@ -167,5 +171,18 @@ class DemoCompatibilityProbeTest {
         val r = run()
         assertFalse(r.stopLossSupported); assertTrue(seen.none { it.method == "POST" })
         assertEquals("NOT TESTED", verdict(r, "Limit order"))
+    }
+
+    @Test fun cancelConfirmationIsRetriedWhenBinanceReportsTheOldStatusFirst() {
+        algoStaleQueries = 2
+        val r = run()
+        assertTrue(r.toText(), r.stopLossSupported); assertTrue(r.cleanupOk)
+    }
+
+    @Test fun cancelNeverConfirmedWithinTheRetryWindowIsReportedAsPartial() {
+        algoStaleQueries = 99
+        val r = run()
+        assertFalse(r.stopLossSupported)
+        assertTrue(verdict(r, "Stop Loss order").startsWith("PARTIAL"))
     }
 }

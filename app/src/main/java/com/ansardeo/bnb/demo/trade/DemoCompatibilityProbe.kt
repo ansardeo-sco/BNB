@@ -3,6 +3,7 @@ package com.ansardeo.bnb.demo.trade
 import android.content.Context
 import com.ansardeo.bnb.demo.DemoCredentials
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
@@ -140,10 +141,16 @@ class DemoCompatibilityProbe(private val api: DemoTradeClient, private val symbo
             step("Stop Loss in open conditional orders", listed, if (ao.ok) (if (listed) "listed" else "not listed") else ao.describe())
             val cx = api.cancelAlgo(c, id)
             step("Stop Loss cancelled", cx.ok, if (cx.ok) "cancel accepted" else cx.describe())
-            val q2 = api.queryAlgo(c, id)
-            val st2 = if (q2.ok) algoStatusOf(q2.body) else null
+            // Binance Demo can answer "cancel accepted" before the status is actually updated: re-check a few times before concluding it failed.
+            var st2: String? = null; var lastDescribe = ""
+            for (attempt in 1..4) {
+                val q2 = api.queryAlgo(c, id)
+                st2 = if (q2.ok) algoStatusOf(q2.body) else null; lastDescribe = if (q2.ok) "status $st2" else q2.describe()
+                if (st2 != null && st2 != "NEW" && st2 != "WORKING") break
+                if (attempt < 4) delay(400L * attempt)
+            }
             val cancelled = st2 != null && st2 != "NEW" && st2 != "WORKING"
-            step("Stop Loss cancel verified", cancelled, if (q2.ok) "status $st2" else q2.describe())
+            step("Stop Loss cancel verified", cancelled, lastDescribe)
             if (cancelled) algoId = null
             val full = st == "NEW" && listed && cancelled
             verdict("Stop Loss order", if (full) "SUPPORTED (algo STOP_MARKET placed without a position, verified, cancelled)" else "PARTIAL — see steps")
@@ -199,7 +206,8 @@ class DemoCompatibilityProbe(private val api: DemoTradeClient, private val symbo
             if (!ao.ok) clean = false else for (id in probeIds(ao.body, "algoId", "clientAlgoId")) {
                 if (!api.cancelAlgo(c, id).ok) clean = false
             }
-            // verify
+            // verify (Binance Demo can answer "cancel accepted" slightly before the open-orders list updates)
+            delay(400L)
             val oo2 = api.openOrders(c, symbol); val ao2 = api.openAlgoOrders(c, symbol)
             if (!oo2.ok || !ao2.ok) clean = false
             else {

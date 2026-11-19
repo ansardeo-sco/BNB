@@ -28,4 +28,6 @@ enum class Endpoint(val verb: HttpVerb, val path: String, val signed: Boolean) {
     SYMBOL_CONFIG(HttpVerb.GET, "/fapi/v1/symbolConfig", true),
     MARGIN_TYPE_SET(HttpVerb.POST, "/fapi/v1/marginType", true),
     LEVERAGE_SET(HttpVerb.POST, "/fapi/v1/leverage", true),
+    /** Round 2 (approved): READ-ONLY trade history, used only to show realized PnL in History. */
+    USER_TRADES(HttpVerb.GET, "/fapi/v1/userTrades", true),
 }
