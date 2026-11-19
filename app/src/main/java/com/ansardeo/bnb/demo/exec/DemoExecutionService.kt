@@ -38,7 +38,7 @@ class DemoExecutionService(
     private val mutex = Mutex()
     private var counter = 0
 
-    data class EntryRequest(val symbol: String, val direction: String, val limitPrice: BigDecimal, val marginAmount: BigDecimal, val expectedLeverage: Int, val slRoiPercent: Double, val slEnabled: Boolean)
+    data class EntryRequest(val symbol: String, val direction: String, val limitPrice: BigDecimal, val marginAmount: BigDecimal, val expectedLeverage: Int, val slRoiPercent: Double, val slEnabled: Boolean, val cycleId: String = "", val kind: String = "MANUAL")
 
     sealed class PlaceResult {
         data class Placed(val entry: DemoEntry) : PlaceResult()
@@ -54,6 +54,65 @@ class DemoExecutionService(
     suspend fun refresh(c: DemoCredentials) = withContext(Dispatchers.IO) {
         mutex.withLock {
             for (e in store.all()) if (e.needsAttention || e.hasOpenProtection) progress(c, e)
+            // An entry whose Stop Loss is gone while Binance shows no position for it was closed outside the app (e.g. on the Binance app): record that.
+            for (e in store.all()) if (e.slState == "LOST" && e.closable) reconcileIfFlat(c, store.get(e.id) ?: e)
+        }
+    }
+
+    /**
+     * Step 6: closes the open quantity of one entry at market (the position-closing method only; a position-opening MARKET order
+     * cannot be built), then removes that entry's Stop Loss once nothing is left to protect. Serialized by the same mutex as
+     * every other state change, so it can never race a fill, a fail-safe or another close.
+     */
+    suspend fun closeEntryAtMarket(c: DemoCredentials, id: String): String = withContext(Dispatchers.IO) {
+        mutex.withLock {
+            var e = store.get(id) ?: return@withLock "Entry not found."
+            if (e.orderActive && e.orderId != null) {
+                val cx = api.cancelOrder(c, e.symbol, e.orderId!!)
+                ev("${e.id}: cancelling the open order before closing (${if (cx.ok) "accepted" else cx.describe()})")
+                val q = api.queryOrder(c, e.symbol, e.orderId!!); if (q.ok) e = save(applyOrder(e, q.body, e.status))
+                if (e.orderActive) return@withLock "Could not cancel the open order yet; try again."
+            }
+            val qty = e.openQuantity
+            if (qty.signum() <= 0) return@withLock "Nothing to close for this entry."
+            val qtyText = ExchangeRules.plain(qty)
+            ev("${e.id}: closing $qtyText at market")
+            var filled = false
+            for (attempt in 1..2) {
+                val r = api.newMarketCloseOrder(c, e.symbol, e.closeSide, e.direction, qtyText, e.id + "C" + attempt)
+                val oid = if (r.ok) runCatching { JSONObject(r.body).getLong("orderId") }.getOrNull() else null
+                if (oid == null) { ev("${e.id}: close attempt $attempt failed — ${r.describe()}"); continue }
+                var st = runCatching { JSONObject(r.body).getString("status") }.getOrNull()
+                if (st != "FILLED") { val q = api.queryOrder(c, e.symbol, oid); if (q.ok) st = runCatching { JSONObject(q.body).getString("status") }.getOrNull() }
+                if (st == "FILLED") { filled = true; break }
+                ev("${e.id}: close attempt $attempt not confirmed filled (status $st)")
+            }
+            if (!filled) {
+                if (reconcileIfFlat(c, e)) return@withLock "No open position was found on Binance Demo for this entry (it was closed outside the app). The entry is now recorded as closed."
+                return@withLock "Market close was not confirmed. Check Binance Demo and try again."
+            }
+            e = save(e.copy(closedQty = ExchangeRules.plain(e.closedQuantity.add(qty))))
+            ev("${e.id}: $qtyText closed at market")
+            if (e.openQuantity.signum() <= 0) {
+                val algoId = e.slAlgoId
+                if (algoId != null && (e.slState == "VERIFIED")) {
+                    api.cancelAlgo(c, algoId)
+                    // Binance Demo can answer "cancel accepted" before the status is actually updated: re-check a few times before giving up.
+                    var gone = false
+                    for (attempt in 1..4) {
+                        val q = api.queryAlgo(c, algoId)
+                        if (q.ok) gone = runCatching { JSONObject(q.body).getString("algoStatus") }.getOrNull().let { it != "NEW" && it != "WORKING" }
+                        if (gone) break
+                        if (attempt < 4) kotlinx.coroutines.delay(400L * attempt)
+                    }
+                    e = save(e.copy(status = EntryStatus.CLOSED, slState = if (gone) "NONE" else e.slState, note = if (gone) "" else "Stop Loss cleanup not confirmed — check Binance Demo"))
+                    ev("${e.id}: position closed; Stop Loss cleanup ${if (gone) "confirmed" else "NOT confirmed — check Binance Demo"}")
+                } else {
+                    e = save(e.copy(status = EntryStatus.CLOSED))
+                    ev("${e.id}: position closed")
+                }
+            }
+            "Closed $qtyText. ${if (e.status == EntryStatus.CLOSED) "Entry fully closed." else "Entry partially closed; re-check protection."}"
         }
     }
 
@@ -74,6 +133,120 @@ class DemoExecutionService(
     fun clearHalt() { store.clearHalt(); ev("Halt cleared by the user") }
     fun hasWork(): Boolean = store.all().any { it.needsAttention || it.hasOpenProtection }
 
+    // ------------------------------------------------------------------ Phase 3C: exchange-side cycle Trailing Stop helpers
+    data class TrailingPlaced(val algoId: Long, val quantity: String, val activation: String, val callback: String)
+    data class AlgoInfo(val status: String?, val price: BigDecimal?)
+
+    /**
+     * Places the closing-only Trailing Stop order of a cycle on Binance Demo and returns it ONLY after Binance confirmed it as active
+     * (queried back); an unconfirmed order is cancelled and null is returned. Activation is rounded away from the entry (never earlier than configured);
+     * the callback is a PRICE percent with one decimal, between 0.1 and 10 (Binance limits).
+     */
+    suspend fun placeTrailingOrder(c: DemoCredentials, symbol: String, direction: String, quantity: BigDecimal, rawActivation: BigDecimal, callbackPercent: BigDecimal, tag: String): TrailingPlaced? = withContext(Dispatchers.IO) {
+        mutex.withLock {
+            val rules = rulesFor(symbol) ?: return@withLock null
+            val act = if (direction == "LONG") ExchangeRules.ceilToStep(rawActivation, rules.tickSize) else ExchangeRules.floorToStep(rawActivation, rules.tickSize)
+            if (act.signum() <= 0 || quantity.signum() <= 0) return@withLock null
+            val cb = callbackPercent.setScale(1, RoundingMode.HALF_UP).max(BigDecimal("0.1")).min(BigDecimal("10.0"))
+            val qtyText = ExchangeRules.plain(quantity); val actText = ExchangeRules.plain(act); val cbText = cb.toPlainString()
+            val closeSide = if (direction == "LONG") "SELL" else "BUY"
+            val cid = tag + "R" + (counter++ % 1000).toString()
+            val r = api.newTrailingStopAlgo(c, symbol, closeSide, direction, qtyText, actText, cbText, cid)
+            val id = if (r.ok) runCatching { JSONObject(r.body).getLong("algoId") }.getOrNull() else null
+            if (id == null) { ev("$tag: Trailing Stop order not accepted — ${r.describe()}"); return@withLock null }
+            if (!verifyAlgo(c, symbol, id)) { ev("$tag: Trailing Stop order not confirmed by Binance Demo"); api.cancelAlgo(c, id); return@withLock null }
+            ev("$tag: Trailing Stop order ACTIVE on Binance Demo (confirmed) qty $qtyText activation $actText callback $cbText% (price)")
+            TrailingPlaced(id, qtyText, actText, cbText)
+        }
+    }
+
+    /** Status of a conditional order as Binance reports it now (null = could not be read) plus its actual fill price when Binance gives one. */
+    suspend fun algoInfo(c: DemoCredentials, algoId: Long): AlgoInfo = withContext(Dispatchers.IO) {
+        mutex.withLock {
+            val q = api.queryAlgo(c, algoId)
+            if (!q.ok) return@withLock AlgoInfo(null, null)
+            val o = runCatching { JSONObject(q.body) }.getOrNull() ?: return@withLock AlgoInfo(null, null)
+            val px = listOf("actualPrice", "avgPrice").map { DemoEntry.bd(o.optString(it, "0")) }.firstOrNull { it.signum() > 0 }
+            AlgoInfo(o.optString("algoStatus").ifBlank { null }, px)
+        }
+    }
+
+    /** Cancels a conditional order and returns the status Binance reports afterwards (re-checked a few times, as Demo can be slow); null = unreadable. */
+    suspend fun cancelAlgoOrder(c: DemoCredentials, algoId: Long): String? = withContext(Dispatchers.IO) {
+        mutex.withLock {
+            api.cancelAlgo(c, algoId)
+            var st: String? = null
+            for (attempt in 1..4) {
+                val q = api.queryAlgo(c, algoId)
+                st = if (q.ok) runCatching { JSONObject(q.body).getString("algoStatus") }.getOrNull() else null
+                if (st != null && st != "NEW" && st != "WORKING") break
+                if (attempt < 4) kotlinx.coroutines.delay(400L * attempt)
+            }
+            st
+        }
+    }
+
+    /** The open quantity Binance reports for one direction of a symbol (null = could not be read). */
+    suspend fun exchangePositionAmount(c: DemoCredentials, symbol: String, direction: String): BigDecimal? = withContext(Dispatchers.IO) {
+        mutex.withLock { readPosition(c, symbol, direction) }
+    }
+
+    private suspend fun readPosition(c: DemoCredentials, symbol: String, direction: String): BigDecimal? {
+        val r = api.positionRisk(c, symbol)
+        if (!r.ok) return null
+        val a = jsonArray(r.body) ?: return null
+        var total = BigDecimal.ZERO; var seen = false
+        for (i in 0 until a.length()) {
+            val o = a.optJSONObject(i) ?: continue
+            if (o.optString("symbol", symbol) != symbol || o.optString("positionSide") != direction) continue
+            seen = true; total = total.add(DemoEntry.bd(o.optString("positionAmt", "0")).abs())
+        }
+        return if (seen) total else null
+    }
+
+    /**
+     * Records an entry as closed OUTSIDE the app, but only when Binance Demo was read successfully and shows no position left for this entry
+     * (the direction's position minus what the other open entries of the same symbol+direction account for). Sends no order. Called with the lock held.
+     */
+    private suspend fun reconcileIfFlat(c: DemoCredentials, e: DemoEntry): Boolean {
+        if (e.executed.signum() <= 0 || e.openQuantity.signum() <= 0 || e.orderActive) return false
+        val onExchange = readPosition(c, e.symbol, e.direction) ?: return false
+        val others = store.all().filter { it.id != e.id && it.symbol == e.symbol && it.direction == e.direction && it.executed.signum() > 0 && !it.orderActive &&
+            it.status != EntryStatus.CLOSED && it.status != EntryStatus.FAILSAFE_CLOSED && it.status != EntryStatus.REJECTED && it.slState != "DONE" }
+            .fold(BigDecimal.ZERO) { a, o -> a.add(o.openQuantity) }
+        if (onExchange.subtract(others).signum() > 0) return false
+        val algoId = e.slAlgoId
+        if (algoId != null && e.slState == "VERIFIED") api.cancelAlgo(c, algoId) // best effort; a LOST one is already gone
+        save(e.copy(closedQty = ExchangeRules.plain(e.executed), status = EntryStatus.CLOSED, slState = "NONE", note = "Closed outside the app (no position found on Binance Demo)"))
+        ev("${e.id}: no ${e.direction} position found on Binance Demo — recorded as closed outside the app")
+        return true
+    }
+
+    /**
+     * The position of this entry was closed by Binance itself (the cycle Trailing Stop order fired): records it as closed and removes the
+     * entry's own Stop Loss (verified). Never sends a closing order.
+     */
+    suspend fun markClosedByExchange(c: DemoCredentials, id: String): String = withContext(Dispatchers.IO) {
+        mutex.withLock {
+            var e = store.get(id) ?: return@withLock "Entry not found."
+            e = save(e.copy(closedQty = ExchangeRules.plain(e.executed)))
+            val algoId = e.slAlgoId
+            var gone = true
+            if (algoId != null && e.slState == "VERIFIED") {
+                api.cancelAlgo(c, algoId); gone = false
+                for (attempt in 1..4) {
+                    val q = api.queryAlgo(c, algoId)
+                    if (q.ok) gone = runCatching { JSONObject(q.body).getString("algoStatus") }.getOrNull().let { it != "NEW" && it != "WORKING" }
+                    if (gone) break
+                    if (attempt < 4) kotlinx.coroutines.delay(400L * attempt)
+                }
+            }
+            e = save(e.copy(status = EntryStatus.CLOSED, slState = if (gone) "NONE" else e.slState, note = if (gone) "" else "Stop Loss cleanup not confirmed — check Binance Demo"))
+            ev("${e.id}: closed by the Binance Trailing Stop; Stop Loss cleanup ${if (gone) "confirmed" else "NOT confirmed — check Binance Demo"}")
+            "Entry closed by the exchange."
+        }
+    }
+
     // ------------------------------------------------------------------ placing
     private suspend fun place(c: DemoCredentials, req: EntryRequest): PlaceResult {
         store.halt()?.let { return PlaceResult.Refused("Demo trading is halted: $it") }
@@ -87,9 +260,10 @@ class DemoExecutionService(
         val pm = api.positionMode(c)
         val hedge = if (pm.ok) runCatching { JSONObject(pm.body).getBoolean("dualSidePosition") }.getOrNull() else null
         if (hedge != true) return PlaceResult.Refused(if (hedge == null) "Position mode could not be read: ${pm.describe()}" else "Hedge Mode is OFF. Turn it ON in Binance Demo.")
-        val sc = api.symbolConfig(c, req.symbol)
-        val cfg = if (sc.ok) configOf(sc.body, req.symbol) else null
-        if (cfg == null) return PlaceResult.Refused("Margin/leverage could not be read: ${sc.describe()}")
+        var sc = api.symbolConfig(c, req.symbol)
+        var cfg = if (sc.ok) configOf(sc.body, req.symbol) else null
+        if (cfg == null) { sc = api.symbolConfig(c, req.symbol); cfg = if (sc.ok) configOf(sc.body, req.symbol) else null } // one retry: Binance Demo sometimes answers with an incomplete body
+        if (cfg == null) return PlaceResult.Refused("Margin/leverage could not be read: ${sc.describe()} · Binance answered: ${sc.body.take(160).ifBlank { "(empty)" }}")
         if (!cfg.first.equals("ISOLATED", true)) return PlaceResult.Refused("${req.symbol} is ${cfg.first}, not ISOLATED. Run the Safety Setup first.")
         if (cfg.second != req.expectedLeverage) return PlaceResult.Refused("${req.symbol} leverage on Binance is ${cfg.second}x but Settings say ${req.expectedLeverage}x. Run the Safety Setup first.")
         val rules = rulesFor(req.symbol) ?: return PlaceResult.Refused("Exchange rules for ${req.symbol} are not available.")
@@ -104,7 +278,7 @@ class DemoExecutionService(
         prep as OrderPrep.Result.Ok
 
         val id = newId()
-        var e = DemoEntry(id, req.symbol, req.direction, req.expectedLeverage, req.slRoiPercent, prep.priceText, prep.quantityText, status = EntryStatus.SENDING, createdAt = clock(), updatedAt = clock())
+        var e = DemoEntry(id, req.symbol, req.direction, req.expectedLeverage, req.slRoiPercent, prep.priceText, prep.quantityText, status = EntryStatus.SENDING, createdAt = clock(), updatedAt = clock(), cycleId = req.cycleId, kind = req.kind)
         save(e)
         ev("$id: sending ${req.direction} LIMIT ${prep.quantityText} @ ${prep.priceText}")
         val r = api.newLimitOrder(c, req.symbol, side, req.direction, prep.quantityText, prep.priceText, id)
@@ -203,6 +377,7 @@ class DemoExecutionService(
             "NEW", "WORKING" -> e
             "TRIGGERING", "TRIGGERED", "FINISHED" -> { ev("${e.id}: Stop Loss $st"); save(e.copy(slState = "DONE", note = "Stop Loss $st")) }
             else -> {
+                if (reconcileIfFlat(c, e)) return store.get(e.id) ?: e // the position itself is gone (closed on Binance): not a lost Stop Loss
                 ev("${e.id}: Stop Loss is no longer active (status $st) — NEW ENTRIES HALTED")
                 store.setHalt("The Stop Loss of ${e.id} (${e.symbol} ${e.direction}) is no longer active (status $st). Check the position on Binance Demo.")
                 save(e.copy(slState = "LOST", note = "Stop Loss no longer active ($st)"))

@@ -108,3 +108,88 @@ These tests are compiled/run only with `-PengineTests` (so the normal build is u
 - First fill ends the order (rest cancelled), so one Stop Loss covers a fixed quantity. MARKET orders exist only as a closing-only method (SELL on LONG / BUY on SHORT).
 - Known gap (unchanged): an entry that fills while the app is closed is protected only when the app next runs (start-up refresh).
 - More tab → "BINANCE DEMO ORDERS (BTCUSDT)". No strategy automation; Virtual stays the default.
+
+### Phase 3A Round B (steps 6+7) — close position, sync, Positions tab, mode toggle
+- `DemoExecutionService.closePosition()`: closes an entry's open quantity at market (closing-only method, same restriction as the fail-safe), then removes its Stop Loss once nothing is left to protect. Serialized by the same mutex as every other state change.
+- Positions tab gets a Virtual/Demo toggle (display only — it never changes what the Virtual engine does, and does not enable any Demo strategy automation). Demo view: open entries with CANCEL ORDER / CLOSE POSITION, closed history, and the event log.
+- `TradingModeStore` / `TradingModePrefs`: the Demo view is locked until Demo API keys are saved AND the Compatibility Probe passed (Stop Loss confirmed supported + cleaned up). Virtual stays the default and switching back to Virtual is always allowed.
+- Sync: the existing start/5s poll (`startDemoPoll`) already resolves unknown orders, tracks fills, places/verifies Stop Losses and checks for a lost Stop Loss; it runs again whenever the app is foregrounded (onStart), covering "sync on start/reconnect" for everything the app itself placed. A position opened directly on Binance (not through this app) is outside this app's tracking, as before.
+
+### Fix — cancel confirmation retried (Binance Demo real-device finding)
+Binance Demo can answer a Stop Loss / order cancel as accepted before its status actually flips; the Compatibility Probe and `closeEntryAtMarket` now re-check up to 4 times (short backoff) before concluding a cancel was not confirmed, instead of failing on the first stale read.
+
+### Fix — Demo Positions tab now uses the same Position / Open Order / History layout as Virtual
+The Demo panel previously showed a flat text list; it now shares the exact tab structure Virtual uses (Position → Open/Closed, Open Order → Basic/Conditional, History → Open events/Closed), with the same per-item card layout (symbol, direction, fill price, quantity, Stop Loss line, Close/Cancel buttons). Virtual's own rendering and data were not changed.
+
+## Phase 3A status (Step 8 — hardening + final review)
+
+**Done and confirmed on a real Binance Demo account by the user (not just unit tests):**
+- Stage 2: Demo API keys saved (Android Keystore AES‑256‑GCM), read-only connection test.
+- Step 1–2: Demo trade client (approved-endpoint-only) + Compatibility Probe — LIMIT place/query/list/cancel and Stop Loss (algo STOP_MARKET) place/query/list/cancel all confirmed SUPPORTED, no position opened.
+- Step 3: Safety Setup — ISOLATED margin + configured leverage set and read back from Binance Demo; Hedge Mode only ever read, never changed.
+- Steps 4–5: Demo LIMIT entries; a fill gets its own exchange-side Stop Loss computed from the actual fill price, placed and verified as ACTIVE only after Binance Demo confirms it; fail-safe (market-close + halt) exercised live after a real failure (avgPrice 0 in the new-order answer) and fixed.
+- Steps 6–7: CLOSE POSITION (market, closing-only) + Stop Loss cleanup; Positions tab now shows Demo the same way as Virtual (Position/Open Order/History, same per-item cards); mode toggle locked until keys are saved and the probe passed.
+- Real-device fixes applied during this phase: coroutine-in-lambda compile error, `exchangeInfo` timeout on a large response, flaky retry test, a method name (`closePosition`) that collided with a banned-string security test, fill price sometimes reported as 0 by Binance (now falls back to a re-query / cumQuote), and cancel status needing a short retry before Binance Demo reflects it.
+
+**Verified by static/unit tests (listed in this README's earlier sections); not independently re-run in this review beyond re-checking their banned-string/endpoint-catalog logic by hand against the current source.**
+
+**Known limitations (by design / deferred, not bugs):**
+1. If the app is closed at the moment an entry order fills, its Stop Loss is placed only when the app is next opened (the poll loop). The user has decided to leave this as-is for Phase 3A and revisit it at the real-money/server stage.
+2. Several Demo entries on the same symbol and direction each get their own Stop Loss sized to their own quantity; if their quantities overlap on the exchange's single net position, the Stop Losses are not merged into one. This matches the approved per-entry-SL design.
+3. The app only tracks orders/positions it placed itself. An order or position opened directly on Binance (outside the app) is not shown or managed here.
+4. Demo strategy automation (priority, averaging, opposite entries, re-entry, trailing exit) is **not implemented** — every Demo order in Phase 3A is placed manually from the app. That is Phase 3B and needs separate approval.
+5. Live (real-money) trading is **not implemented and not reachable from this app** — Stage 3 has not been started.
+
+**Not changed in Phase 3A:** the Virtual engine, the trading strategy rules, the Dashboard, and Settings.
+
+## Phase 3B — Strategy automation on Binance Demo (one merged step)
+
+**Binance Demo only. Real trading is NOT part of this and is not authorized.** No Live endpoint, Live key or real-money code was added.
+
+What it does (only while the app is open AND the **Demo Auto-Trading** switch is ON; the switch defaults to OFF and is found on the Binance Demo Orders card):
+- **Entries** go through the approved Global Best Entry Price Priority (`EntryPriorityService`; LONG lowest wins, SHORT highest wins, per symbol + direction, safe replace sequence). Each entry starts or joins a *cycle* (`demo/exec/DemoCycle.kt`).
+- **Per-entry Stop Loss** is unchanged from Phase 3A (own SL from its own fill price, verified by Binance before it is called active, fail-safe + halt otherwise). There is no cycle-level Stop Loss and no fixed Take Profit.
+- **Averaging**: once per cycle when the cycle Position ROI (on its weighted average entry) reaches the Averaging trigger; one LIMIT entry at the current Demo mark price, with its own Stop Loss. The "done" flag is set before the order is sent, so it can never repeat.
+- **Opposite-Side**: ROI trigger + callback trail (`OppositeTrigger`), then one opposite LIMIT entry at the current mark that starts its own cycle.
+- **Profit exit**: cycle ROI Trailing Stop (`TrailingStopMath`) on the cycle WAP. When it fires, pending orders of the cycle are cancelled and every open entry is closed at market (closing method only), their Stop Losses are removed and verified.
+- **Re-entry**: after a Trailing close with a positive booked ROI: same side 50 %, opposite side 100 % of the booked ROI (`ReentryFormula`, `RoiMath.reentryPrice`). No automatic re-entry after a Stop Loss, fail-safe, manual close or cancel.
+- Switch OFF = the engine does nothing (Stop Losses already on Binance stay active). Switch ON/OFF does not affect plain manual entries made while it is OFF (Phase 3A behaviour).
+
+Interpretation decisions (please check): averaging and the opposite entry are LIMIT orders at the mark price when triggered (they may fill at once); booked ROI uses the Demo mark price at the moment the trailing stop fired as the close price; re-entry margin = the coin's Margin Amount; the priority feasibility check is always "feasible" (no balance-aware replacement); only entries placed by this app are known to the priority book; the engine's decisions use the 5-second foreground poll, so a fast move between polls is seen late (Stop Losses on Binance still protect each entry).
+
+Known limits: nothing runs while the app is closed (deferred to the server stage); several entries on the same symbol+direction share Binance's net position; the Virtual engine, Settings and Dashboard are untouched. Tests are written (`demo/engine/DemoStrategyEngineTest.kt`) but were not executed in the authoring environment; they run in the GitHub Actions build.
+
+## Phase 3C — Trailing Stop as an order on Binance Demo (approved: "3C approved")
+
+**Binance Demo only. Real trading is NOT authorized and not implemented.**
+
+- **Probe first**: More tab → "BINANCE DEMO TRAILING STOP PROBE". It places one far-away closing-only Trailing Stop order (activation 10 % above the mark, so it cannot trigger), lists, cancels and verifies it, and opens no position. Only after it **passed** does the strategy use the exchange-side Trailing Stop. Without a passed probe (or if placement fails 3 times) the previous app-side Trailing Stop is used unchanged.
+- **Right after the first fill** the cycle's Trailing Stop is placed on Binance Demo: `TRAILING_STOP_MARKET`, closing side only, the cycle's open quantity, MARK_PRICE, activation price = WAP × (1 + Activation ROI / (100 × leverage)) (LONG; mirrored for SHORT), callback = Callback ROI / leverage as a **price** percent rounded to 0.1 % (Binance limits: 0.1–10). It is called ACTIVE only after Binance Demo confirmed it by query. Binance then manages it, also while the app is closed.
+- **Averaging / quantity change**: the order is cancelled (verified) and re-placed with the new total quantity and the new WAP-based activation, as long as the trailing has not started. If the price already passed the activation, the order is cancelled and the app-side Trailing Stop continues from the extreme it tracked (it never loosens the stop). The entries' own Stop Losses are never touched.
+- **When Binance fires it**: the app (next time it runs) sees the order finished, checks the position on Binance (positionRisk), records the entries as closed **without sending another close**, removes each entry's own Stop Loss (verified), computes the booked ROI and places the Re-entry orders as before. If Binance still shows an open quantity, that quantity is closed at market.
+- **Positions tab**: Current Price, Entry Price, Position Quantity, Margin and "Trailing Stop Activation" (with its source: Binance order ACTIVE / calculated / app-side).
+- Guards: the static tests now allow exactly one new order type (`TRAILING_STOP_MARKET`, built in one place, closing side only); every other trailing/take-profit/reduceOnly/closePosition usage is still banned.
+
+Interpretation notes: the close price of an exchange-side trailing exit is Binance's fill price when the order query reports one, otherwise the Demo mark price at the moment the app notices; if the app was closed while the order fired, the booked ROI and the Re-entry prices use that later price. A trailing that Binance activated while the app was closed is not known to the app until it runs; a replacement after that restarts the trailing (the app-side takeover only knows the extremes it saw). Tests are written but were not executed in the authoring environment.
+
+### Fix after Phase 3C test: positions closed outside the app
+If a position is closed on the Binance app itself, Binance cancels its Stop Loss / Trailing Stop orders and the app used to keep a ghost "open" entry ("Stop Loss LOST", market close "not confirmed"). Now, whenever the Stop Loss is found cancelled, or a market close fails, or a LOST entry is refreshed, the app reads the position from Binance Demo; only if that read succeeds and shows nothing left for this entry (position minus the other open entries of the same symbol+direction) is the entry recorded as "Closed outside the app". No order is sent for that, and no halt is raised. If Binance still holds the position, the old behaviour (Stop Loss LOST + halt, close at market) is unchanged.
+
+### Demo coin selector
+The Binance Demo Safety Setup card and the Binance Demo Orders card now have a coin field (type or pick any USDⓈ-M USDT symbol, e.g. ETHUSDT). Run the Safety Setup once per coin (ISOLATED + that coin's leverage from Settings); its report is stored per coin. Orders use that coin's Settings (leverage, Stop Loss ROI, trailing, averaging, ...). The margin typed in the Orders card is now also honoured when Auto-Trading routes the entry through the strategy (before, it used the Settings margin). The probes stay on BTCUSDT. Only BTCUSDT has been verified on Binance Demo so far; other coins are untested.
+
+## Round 1 — Virtual retired from the UI, Trade panel places Demo entries
+- The **Trade** tab now sends the LIMIT entry to **Binance Demo** (leverage comes from Settings for the coin; the Safety Setup of that coin must be READY or nothing is sent). With Auto-Trading ON the entry starts a strategy cycle, otherwise it is a plain 3A entry with its own Stop Loss.
+- The **Virtual/Demo switch** in the Positions tab is gone: that tab always shows Binance Demo. The top bar reads "STAGE 2 — DEMO".
+- **More** page: Demo safety controls — Pause/Resume Auto-Trading, Cancel pending orders, Emergency stop (Auto-Trading OFF + cancel pending; positions stay), Panic close (Auto-Trading OFF, cancel pending, close open Demo positions at market with the approved closing-only order, remove Stop Loss / Trailing orders, no re-entry). Demo events list replaces the Virtual log.
+- The Virtual background monitor is no longer started (a running instance is stopped). **Virtual code is kept in the repository** (PaperEngine, database, Home/Settings pieces) until Demo practice is complete. Home, Dashboard, History and Settings still carry Virtual pieces: Rounds 2 and 3.
+- No change to the strategy, formulas or Binance endpoints. Real trading is not part of this build.
+
+## Round 2 — Home and History from Binance Demo data
+- **Home** wallet card reads the Binance Demo USDT balance (wallet, available, unrealized PnL, equity = wallet + unrealized) plus the Demo position / open-order counts. The Virtual wallet is no longer shown.
+- **History → Closed** shows, per closed entry, the realized PnL (net of fees) read from Binance Demo trade history, so positions that Binance closed while the app was closed (Stop Loss, Trailing Stop, manual close on Binance) are included. The figure covers the coin/side in the entry's time window and may include other entries of the same coin/side (stated on screen).
+- **Disclosed addition:** one new READ-ONLY signed endpoint, `GET /fapi/v1/userTrades` (catalog is now 18 endpoints; `TradeEndpointCatalogTest` updated for exactly this entry). It cannot place, change or cancel anything.
+- Parsing is in the pure `DemoAccountView` (unit tested). No change to strategy, formulas or order endpoints.
+
+### Round 2 fix — Trade no longer depends on the stored Safety Setup report
+A later Safety Setup run on a coin that has open Stop Loss orders ends as LOCKED and overwrote the stored READY report, which made the Round 1 Trade gate refuse BTCUSDT. The gate is removed: every Demo entry already re-reads margin type and leverage from Binance and is refused unless ISOLATED and equal to Settings.

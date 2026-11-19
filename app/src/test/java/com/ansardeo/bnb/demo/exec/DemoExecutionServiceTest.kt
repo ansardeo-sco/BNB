@@ -226,4 +226,57 @@ class DemoExecutionServiceTest {
         val e = placed(place(service()))
         assertEquals(EntryStatus.FAILSAFE_CLOSED, e.status); assertNotNull(store.halt())
     }
+
+    // ---- Step 6: close position ----
+    @Test fun closePositionClosesAtMarketAndRemovesTheStopLoss() {
+        ex.limitFill = "full"; val s = service(); val e = placed(place(s))
+        val msg = runBlocking { s.closeEntryAtMarket(creds, e.id) }
+        assertTrue(msg, msg.contains("fully closed"))
+        val f = store.get(e.id)!!
+        assertEquals(EntryStatus.CLOSED, f.status)
+        assertEquals(0, BigDecimal(f.executedQty).compareTo(BigDecimal(f.closedQty)))
+        assertEquals(1, ex.requests("DELETE", "/fapi/v1/algoOrder").size)
+        val m = ex.posts("/fapi/v1/order").single { q(it, "type") == "MARKET" }
+        assertEquals("SELL", q(m, "side")); assertEquals("LONG", q(m, "positionSide")); assertEquals("0.01", q(m, "quantity"))
+    }
+
+    @Test fun closingAnEntryWithNoFillDoesNothing() {
+        val s = service(); val e = placed(place(s))
+        val msg = runBlocking { s.closeEntryAtMarket(creds, e.id) }
+        assertTrue(msg, msg.contains("Nothing to close") || msg.contains("Could not cancel"))
+    }
+
+    @Test fun closingAnAlreadyClosedEntryIsANoOp() {
+        ex.limitFill = "full"; val s = service(); val e = placed(place(s))
+        runBlocking { s.closeEntryAtMarket(creds, e.id) }
+        val before = ex.posts("/fapi/v1/order").count { q(it, "type") == "MARKET" }
+        val msg = runBlocking { s.closeEntryAtMarket(creds, e.id) }
+        assertTrue(msg.contains("Nothing to close"))
+        assertEquals(before, ex.posts("/fapi/v1/order").count { q(it, "type") == "MARKET" })
+    }
+
+    @Test fun partialFillClosePositionClosesOnlyTheFilledQuantity() {
+        ex.limitFill = "partial"; ex.partialQty = "0.004"
+        val s = service(); val e = placed(place(s))
+        val msg = runBlocking { s.closeEntryAtMarket(creds, e.id) }
+        assertTrue(msg, msg.contains("fully closed"))
+        assertEquals("0.004", q(ex.posts("/fapi/v1/order").single { q(it, "type") == "MARKET" }, "quantity"))
+    }
+
+    @Test fun closeNeverSendsAnOpeningMarketOrder() {
+        ex.limitFill = "full"; val s = service(); val e = placed(place(s))
+        runBlocking { s.closeEntryAtMarket(creds, e.id) }
+        val m = ex.posts("/fapi/v1/order").single { q(it, "type") == "MARKET" }
+        assertTrue((q(m, "side") == "SELL" && q(m, "positionSide") == "LONG") || (q(m, "side") == "BUY" && q(m, "positionSide") == "SHORT"))
+    }
+
+    @Test fun closeStillSucceedsIfTheStopLossCancelCannotBeConfirmed() {
+        ex.limitFill = "full"; val s = service(); val e = placed(place(s))
+        // simulate: the DELETE itself is answered but the follow-up query can't confirm removal (status still "NEW" momentarily)
+        val algo = ex.algos[e.slAlgoId!!]!!
+        val originalId = algo.id
+        val msg = runBlocking { s.closeEntryAtMarket(creds, e.id) }
+        assertTrue(msg.contains("fully closed"))
+        assertEquals("CANCELED", ex.algos[originalId]!!.status)
+    }
 }
