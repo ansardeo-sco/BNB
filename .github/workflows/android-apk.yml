@@ -63,37 +63,6 @@ jobs:
           fi
           exit $ec
 
-      - name: Stage 1 - engine characterization tests (Robolectric, informational)
-        id: engine
-        continue-on-error: true
-        run: |
-          set +e
-          mkdir -p /tmp/engine-results
-          gradle --no-daemon --stacktrace testDebugUnitTest -PengineTests --tests 'com.ansardeo.bnb.paper.engine.*' 2>&1 | tee /tmp/engine.log
-          ec=${PIPESTATUS[0]}
-          cp -r app/build/test-results/testDebugUnitTest/. /tmp/engine-results/ 2>/dev/null || true
-          python3 - <<'PY'
-          import glob, xml.etree.ElementTree as ET
-          rows = []
-          for p in sorted(glob.glob('/tmp/engine-results/TEST-*.xml')):
-              for tc in ET.parse(p).getroot().iter('testcase'):
-                  bad = tc.find('failure') if tc.find('failure') is not None else tc.find('error')
-                  rows.append(('FAIL' if bad is not None else 'PASS', tc.get('name'), (bad.get('message') or '')[:300] if bad is not None else ''))
-          print('==== ENGINE CHARACTERIZATION RESULTS ====')
-          for r in rows: print(*r)
-          print('total', len(rows), 'failed', sum(1 for r in rows if r[0] == 'FAIL'))
-          PY
-          exit $ec
-
-      - name: Upload engine characterization reports
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: engine-characterization-reports
-          path: /tmp/engine-results/
-          if-no-files-found: warn
-          retention-days: 7
-
       - name: Upload test reports (diagnostic)
         if: always()
         uses: actions/upload-artifact@v4
