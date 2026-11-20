@@ -225,3 +225,27 @@ A later Safety Setup run on a coin that has open Stop Loss orders ends as LOCKED
 - Unchanged: Stop Loss, Trailing Stop, Opposite-Side, Re-entry formulas and the Demo-only guards.
 
 Tests written (not executed in the authoring environment): `DemoAccountViewTest` (equity scenarios), `AveragingMathTest`, `SettingsResolverTest`, `DemoStrategyEngineTest` (two-order Averaging, restart, partial fill, rejection, cycle closure, Re-entry untouched).
+
+## Round 5 — Opposite-Side as a real Binance trailing order, new defaults, Trailing cards, Home-style tabs
+
+### Opposite-Side (replaces the -50 % loss trigger)
+- Right after the Initial Entry is filled **and has its own Stop Loss** (or Stop Loss is OFF), the app places ONE real Binance conditional order, once per cycle: LONG source -> `SELL` + positionSide `SHORT`; SHORT source -> `BUY` + `LONG`; type `TRAILING_STOP_MARKET`, MARK_PRICE, fixed quantity, no reduceOnly / closePosition.
+- Activation price = initial fill x (1 ± Activation ROI / (100 x leverage)) rounded to the tick (default +40 %). Callback is sent as price % = Callback ROI / leverage rounded to 0.1 (default 3 % ROI; 10x -> 0.3 %). Quantity = Opposite Margin x leverage / activation price. Leverage is always the Initial Leverage.
+- It executes as a **MARKET** order when Binance triggers it (Binance has no trailing-LIMIT order).
+- It lives on Binance: works with the app closed / Auto-Trading OFF, stays when the original position closes first, and is never cancelled by the original's trailing/closing. Only **Emergency stop** and **Panic close** cancel it (Auto-Trading OFF does not).
+- **Duplicate prevention at placement only**: nothing is placed unless `positionRisk` is readable and shows no position in the opposite direction, and no pending opposite entry order or pending opposite trailing order exists (store + Binance). Unreadable = not placed. Not re-placed after Averaging. Cycles opened by an Opposite-Side order do not place another one.
+- When it has opened a position, the app (when it runs) **adopts** it as its own cycle (kind OPPOSITE_SIDE) and places its own Stop Loss at once; fail-safe close + halt only if that Stop Loss cannot be placed.
+- **Gate**: a new Demo "Opposite-Side (opening) trailing probe" (More tab) places one far-away SELL+SHORT opening trailing order on BTCUSDT, queries, lists, cancels and verifies it; no position is opened. Until it passes, the Opposite-Side order is NOT used and there is **no app-side substitute** (a clear event is logged).
+- Policy: exactly one new builder `newOpeningTrailingAlgo` (opening side only) on the same `POST /fapi/v1/algoOrder`; the endpoint catalog is unchanged (18). The static tests were updated for exactly this one exemption.
+
+### Defaults (apply only to unsaved settings)
+Initial Margin 100 USDT, Leverage 10x, closing Trailing +40 % / callback 5 %, Opposite Margin 100, Opposite Trailing +40 % / callback 3 %. The old keys `oppositeTriggerRoi` / `oppositeCallbackRoi` are ignored; the new keys (`oppTrailActivationRoi`, `oppTrailCallbackRoi`) are independent of the closing Trailing keys.
+
+### Open Order -> Conditional -> Trailing Stop
+Two kinds of card, built only from Binance `openAlgoOrders` rows: **POSITION CLOSE** (LONG+SELL / SHORT+BUY, blue) and **POSITION OPEN** (LONG+BUY / SHORT+SELL, amber, with Order Margin ≈ and Leverage). Current Trigger Price shows "—" before activation and "calculated" after (Binance does not expose it). The Cancel Trailing Stop button is removed from these cards.
+
+### Tabs
+Positions tabs (all three levels) use the Home market-tab look: selected = dark `bg` background, yellow bold text; unselected = muted, no background; containers use the Home tab-bar colour; no underline.
+
+### Not verified (assumptions until probe + phone test)
+Binance Demo accepting the opening trailing order, coexisting with the closing trailing/Stop Loss, surviving the original position's close, and exposing the triggered order's fill. Nothing was compiled or run by the author.

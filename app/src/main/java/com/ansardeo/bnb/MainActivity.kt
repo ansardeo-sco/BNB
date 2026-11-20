@@ -37,6 +37,8 @@ import com.ansardeo.bnb.demo.trade.DemoSymbolSetup
 import com.ansardeo.bnb.demo.trade.DemoSymbolSetupStore
 import com.ansardeo.bnb.demo.trade.DemoTradeClient
 import com.ansardeo.bnb.demo.trade.DemoTrailingProbe
+import com.ansardeo.bnb.demo.trade.DemoOpeningTrailingProbe
+import com.ansardeo.bnb.demo.trade.DemoOpeningTrailingProbeStore
 import com.ansardeo.bnb.demo.trade.DemoTrailingProbeStore
 import com.ansardeo.bnb.trading.RoiMath
 import com.ansardeo.bnb.trading.TrailSide
@@ -478,7 +480,7 @@ class MainActivity : AppCompatActivity() {
                 addSummaryRow("Averaging Order 2", "${fmtNum(eff.avg2AllocationPct)}% = ${fmtNum(margin * eff.avg2AllocationPct / 100.0)} USDT | ${fmtNum(eff.avg2TriggerRoi)}% ROI")
                 addSummaryRow("Averaging price basis / submission", "Initial Entry fill price / both orders together")
             } else addSummaryRow("Averaging", "Disabled")
-            addSummaryRow("Opposite-side trigger ROI / callback", if (eff.oppositeEnabled) "${fmtNum(eff.oppositeTriggerRoi)}% / ${fmtNum(eff.oppositeCallbackRoi)}% (margin ${fmtNum(eff.oppositeMargin)})" else "Disabled")
+            addSummaryRow("Opposite-Side trailing (activation / callback ROI)", if (eff.oppositeEnabled) "+${fmtNum(eff.oppositeActivationRoi)}% / ${fmtNum(eff.oppositeCallbackRoi)}% (margin ${fmtNum(eff.oppositeMargin)}, leverage ${eff.leverage}x)" else "Disabled")
             addSummaryRow("Re-entry ROI (of booked ROI)", if (eff.reentryEnabled) "50% same / 100% opposite" else "Disabled")
             addSummaryRow("Estimated Qty", if (qty != null) PriceFormatter.formatQty(qty) else "--")
             addSummaryRow("Long: Trailing activation / cycle SL", "${PriceFormatter.formatPrice(actLong)} / ${PriceFormatter.formatPrice(slLong)}", green)
@@ -619,11 +621,11 @@ class MainActivity : AppCompatActivity() {
         stopRefresh(); updateTopStatus()
         positionsVisible = true
         val root = pageContainer()
-        val tabBar = row().apply { background = rounded(card, 12); setPadding(dp(6), dp(6), dp(6), dp(6)) }
+        val tabBar = row().apply { background = rounded(inputBg, 12); setPadding(dp(6), dp(6), dp(6), dp(6)) }
         root.addView(tabBar); addSpace(root, 8)
-        val subBar = row().apply { background = rounded(card, 10); setPadding(dp(4), dp(4), dp(4), dp(4)) }
+        val subBar = row().apply { background = rounded(inputBg, 10); setPadding(dp(4), dp(4), dp(4), dp(4)) }
         root.addView(subBar); addSpace(root, 8)
-        val condBar = row().apply { background = rounded(card, 10); setPadding(dp(4), dp(4), dp(4), dp(4)) }
+        val condBar = row().apply { background = rounded(inputBg, 10); setPadding(dp(4), dp(4), dp(4), dp(4)) }
         root.addView(condBar); addSpace(root, 8)
         val body = column(); root.addView(body)
 
@@ -640,7 +642,7 @@ class MainActivity : AppCompatActivity() {
         fun style(tv: TextView, sel: Boolean, r: Int) {
             tv.setTextColor(if (sel) yellow else muted)
             tv.setTypeface(null, if (sel) Typeface.BOLD else Typeface.NORMAL)
-            tv.background = if (sel) rounded(inputBg, r) else null
+            tv.background = if (sel) rounded(bg, r) else null
         }
         fun renderDemo() {
             demoOrdersRefresh = { runOnUiThread { if (body.isAttachedToWindow) render() } }
@@ -778,25 +780,50 @@ class MainActivity : AppCompatActivity() {
     private fun renderLiveConditional(body: LinearLayout, snap: com.ansardeo.bnb.demo.exec.DemoExecutionService.ExchangeSnapshot, trailing: Boolean) {
         val all = snap.algos
         if (all == null) { body.addView(text("Conditional orders could not be read from Binance Demo.", 13f, red)); return }
-        val rows = if (trailing) com.ansardeo.bnb.demo.exec.DemoAlgoView.trailingStops(all) else com.ansardeo.bnb.demo.exec.DemoAlgoView.stopLosses(all)
-        if (rows.isEmpty()) { body.addView(text(if (trailing) "No active Trailing Stop orders on Binance Demo." else "No active Stop Loss orders on Binance Demo.", 13f, muted)); return }
+        if (trailing) { renderTrailingCards(body, all, snap.positions ?: emptyList()); return }
+        val rows = com.ansardeo.bnb.demo.exec.DemoAlgoView.stopLosses(all)
+        if (rows.isEmpty()) { body.addView(text("No active Stop Loss orders on Binance Demo.", 13f, muted)); return }
         val repo = DemoCredentialStore.repository(this); val svc = DemoExecutionProvider.get(this)
         for (a in rows) {
             val box = makeItemCard(body)
             val header = row()
             header.addView(text("${a.symbol} ${a.direction}", 15f, if (a.direction == "LONG") green else red, true), LinearLayout.LayoutParams(0, -2, 1f))
-            header.addView(text(if (trailing) "Trailing Stop" else "Stop Loss", 12f, yellow, true)); box.addView(header)
-            if (trailing) {
-                addLabel(box, "Activation Price", PriceFormatter.formatPrice(a.activationPrice?.toDoubleOrNull()), yellow, true)
-                addLabel(box, "Callback Rate", (a.callbackRate ?: "--") + "%", white, true)
-            } else {
-                addLabel(box, "Order Type", a.orderType, white, true)
-                addLabel(box, "Trigger Price", PriceFormatter.formatPrice(a.triggerPrice?.toDoubleOrNull()), red, true)
-            }
+            header.addView(text("Stop Loss", 12f, yellow, true)); box.addView(header)
+            addLabel(box, "Order Type", a.orderType, white, true)
+            addLabel(box, "Trigger Price", PriceFormatter.formatPrice(a.triggerPrice?.toDoubleOrNull()), red, true)
             addLabel(box, "Quantity", a.quantity, white, true)
             addLabel(box, "Algo Order ID", a.algoId.toString(), muted)
             addLabel(box, "Order Status", a.status, white, true)
-            addCancelButton(box, if (trailing) "Cancel Trailing Stop" else "Cancel Stop Loss") { val c = repo.load() ?: return@addCancelButton "Save Demo keys first."; svc.cancelConditional(c, a.algoId) }
+            addCancelButton(box, "Cancel Stop Loss") { val c = repo.load() ?: return@addCancelButton "Save Demo keys first."; svc.cancelConditional(c, a.algoId) }
+        }
+    }
+
+    /** Trailing Stop tab: two kinds of card, both built only from Binance openAlgoOrders rows. No cancel button here (the orders live on Binance). */
+    private fun renderTrailingCards(body: LinearLayout, all: List<com.ansardeo.bnb.demo.exec.AlgoRow>, positions: List<com.ansardeo.bnb.demo.exec.PositionRow>) {
+        val cards = com.ansardeo.bnb.demo.exec.DemoTrailingCards.build(com.ansardeo.bnb.demo.exec.DemoAlgoView.trailingStops(all), positions)
+        if (cards.isEmpty()) { body.addView(text("No active Trailing Stop orders on Binance Demo.", 13f, muted)); return }
+        val blue = 0xFF3B82F6.toInt(); val amber = 0xFFF0B90B.toInt()
+        fun pct(v: java.math.BigDecimal?) = v?.setScale(2, java.math.RoundingMode.HALF_UP)?.stripTrailingZeros()?.toPlainString()?.let { "$it%" } ?: "—"
+        for (t in cards) {
+            val close = t.kind == com.ansardeo.bnb.demo.exec.TrailingCardKind.POSITION_CLOSE
+            val accent = if (close) blue else amber
+            val box = makeItemCard(body)
+            box.background = android.graphics.drawable.GradientDrawable().apply { setColor(card); cornerRadius = dp(14).toFloat(); setStroke(dp(2), accent) }
+            val header = row()
+            header.addView(text((if (close) "\u2198 " else "\uFF0B ") + t.title, 13f, accent, true), LinearLayout.LayoutParams(0, -2, 1f))
+            header.addView(text("${t.symbol} ${t.direction} · ${t.side}", 13f, if (t.direction == "LONG") green else red, true)); box.addView(header)
+            box.addView(text(t.description, 12f, accent)); addSpace(box, 4)
+            addLabel(box, "Status", t.status, white, true)
+            addLabel(box, "Activation ROI", pct(t.activationRoi), white, true)
+            addLabel(box, "Callback ROI", pct(t.callbackRoi), white, true)
+            addLabel(box, "Activation Price", PriceFormatter.formatPrice(t.activationPrice?.toDouble()), yellow, true)
+            addLabel(box, "Current Trigger Price", if (t.triggerCalculated) "calculated" else "—", muted, true)
+            addLabel(box, "Quantity", t.quantity, white, true)
+            if (!close) {
+                addLabel(box, "Order Margin ≈", t.orderMarginApprox?.setScale(2, java.math.RoundingMode.HALF_UP)?.toPlainString()?.let { "$it USDT" } ?: "—", white, true)
+                addLabel(box, "Leverage", t.leverage?.let { "${it}x" } ?: "—", white, true)
+            }
+            addLabel(box, "Order ID", t.algoId.toString(), muted)
         }
     }
 
@@ -903,7 +930,7 @@ class MainActivity : AppCompatActivity() {
                 SettingKeys.TRAILING_ENABLED to eff.trailingEnabled, SettingKeys.TRAILING_ACTIVATION_ROI to eff.trailingActivationRoi, SettingKeys.TRAILING_CALLBACK_ROI to eff.trailingCallbackRoi,
                 SettingKeys.AVERAGING_ENABLED to eff.averagingEnabled, SettingKeys.AVG1_ALLOCATION to eff.avg1AllocationPct, SettingKeys.AVG1_TRIGGER_ROI to eff.avg1TriggerRoi, SettingKeys.AVG2_ALLOCATION to eff.avg2AllocationPct, SettingKeys.AVG2_TRIGGER_ROI to eff.avg2TriggerRoi,
                 SettingKeys.REENTRY_ENABLED to eff.reentryEnabled,
-                SettingKeys.OPPOSITE_ENABLED to eff.oppositeEnabled, SettingKeys.OPPOSITE_MARGIN to eff.oppositeMargin, SettingKeys.OPPOSITE_TRIGGER_ROI to eff.oppositeTriggerRoi,
+                SettingKeys.OPPOSITE_ENABLED to eff.oppositeEnabled, SettingKeys.OPPOSITE_MARGIN to eff.oppositeMargin, SettingKeys.OPPOSITE_TRIGGER_ROI to eff.oppositeActivationRoi,
                 SettingKeys.OPPOSITE_CALLBACK_ROI to eff.oppositeCallbackRoi,
                 SettingKeys.STOP_LOSS_ENABLED to eff.stopLossEnabled, SettingKeys.STOP_LOSS_ROI to eff.stopLossRoi,
             )
@@ -1069,18 +1096,19 @@ class MainActivity : AppCompatActivity() {
             }
 
             tile("Opposite-Side", true, SettingKeys.OPPOSITE_ENABLED, listOf(SettingKeys.OPPOSITE_ENABLED, SettingKeys.OPPOSITE_MARGIN, SettingKeys.OPPOSITE_TRIGGER_ROI, SettingKeys.OPPOSITE_CALLBACK_ROI),
-                "Activates when the position's ROI reaches the trigger, then trails the adverse move; when price reverses by the callback ROI, a LIMIT entry opens a separate opposite cycle (own margin, leverage, Stop Loss and trailing). Only if no opposite-direction cycle is open. Controlled only by this toggle; independent of Averaging.",
-                { big, cap -> big.text = "${f(numOf(SettingKeys.OPPOSITE_MARGIN))} USDT  |  ${f(numOf(SettingKeys.OPPOSITE_TRIGGER_ROI))}% / ${f(numOf(SettingKeys.OPPOSITE_CALLBACK_ROI))}%"; cap.text = "Margin  |  Trigger / Callback ROI" }
+                "Right after the Initial Entry is filled (and has its Stop Loss), a REAL Binance Trailing Stop order is placed in the OPPOSITE direction (LONG source: SELL/SHORT, SHORT source: BUY/LONG). It activates when the source position reaches the Activation ROI and opens the opposite position when price reverses by the Callback ROI. It lives on Binance (works with the app closed or Auto-Trading OFF) and stays even if the original position closes first. Binance has no trailing-LIMIT order: it opens at MARKET when triggered. Leverage is always the Initial Leverage. Own margin; when it opens, the app gives it its own Stop Loss. Placed once per cycle and not replaced after Averaging. Independent of the closing Trailing Stop settings.",
+                { big, cap -> big.text = "${f(numOf(SettingKeys.OPPOSITE_MARGIN))} USDT  |  +${f(numOf(SettingKeys.OPPOSITE_TRIGGER_ROI))}% / ${f(numOf(SettingKeys.OPPOSITE_CALLBACK_ROI))}%"; cap.text = "Margin  |  Activation / Callback ROI  ·  Leverage ${levNow()}x (same as Initial)" }
             ) { ed ->
-                num(ed, "Opposite-side margin (USDT)", SettingKeys.OPPOSITE_MARGIN)
-                num(ed, "Opposite-Side Trigger ROI (%) — negative, default -50 (activation)", SettingKeys.OPPOSITE_TRIGGER_ROI, signed = true)
-                num(ed, "Opposite-Side Callback ROI (%) — reversal confirmation, default 5", SettingKeys.OPPOSITE_CALLBACK_ROI)
+                num(ed, "Opposite Order Margin (USDT) — default 100", SettingKeys.OPPOSITE_MARGIN)
+                ed.addView(text("Opposite Leverage: ${levNow()}x (always equal to the Initial Leverage; not a separate setting)", 12f, muted)); addSpace(ed, 6)
+                num(ed, "Opposite Trailing Activation ROI (%) — positive, default 40", SettingKeys.OPPOSITE_TRIGGER_ROI)
+                num(ed, "Opposite Trailing Callback ROI (%) — default 3 (sent to Binance as callback ROI ÷ leverage in price %)", SettingKeys.OPPOSITE_CALLBACK_ROI)
             }
 
             refreshAll = {
                 tiles.forEach { it.refresh() }
                 val slTxt = if (boolOf(SettingKeys.STOP_LOSS_ENABLED)) "-${f(numOf(SettingKeys.STOP_LOSS_ROI))}%" else "Disabled"
-                derivedTv.text = "Derived at ${levNow()}x: Stop Loss $slTxt | Averaging ${f(numOf(SettingKeys.AVG1_TRIGGER_ROI))}% / ${f(numOf(SettingKeys.AVG2_TRIGGER_ROI))}% | Opposite ${f(numOf(SettingKeys.OPPOSITE_TRIGGER_ROI))}% | Re-entry ${f(numOf(SettingKeys.TRAILING_ACTIVATION_ROI)?.div(2.0))}%"
+                derivedTv.text = "Derived at ${levNow()}x: Stop Loss $slTxt | Averaging ${f(numOf(SettingKeys.AVG1_TRIGGER_ROI))}% / ${f(numOf(SettingKeys.AVG2_TRIGGER_ROI))}% | Opposite trailing +${f(numOf(SettingKeys.OPPOSITE_TRIGGER_ROI))}% / ${f(numOf(SettingKeys.OPPOSITE_CALLBACK_ROI))}% | Re-entry ${f(numOf(SettingKeys.TRAILING_ACTIVATION_ROI)?.div(2.0))}%"
             }
             refreshAll()
             relayout()
@@ -1095,7 +1123,7 @@ class MainActivity : AppCompatActivity() {
                     val v = HashMap<String, Any>()
                     boolControls.forEach { (k, s) -> v[k] = s.isChecked }
                     numControls.forEach { (k, et) -> v[k] = et.text.toString().toDoubleOrNull() ?: throw IllegalArgumentException("Enter a valid number for every field.") }
-                    listOf(SettingKeys.AVG1_TRIGGER_ROI, SettingKeys.AVG2_TRIGGER_ROI, SettingKeys.OPPOSITE_TRIGGER_ROI).forEach { k -> v[k] = RoiMath.normalizeLossTrigger(v[k] as Double) }
+                    listOf(SettingKeys.AVG1_TRIGGER_ROI, SettingKeys.AVG2_TRIGGER_ROI).forEach { k -> v[k] = RoiMath.normalizeLossTrigger(v[k] as Double) }
                     v[SettingKeys.STOP_LOSS_ROI] = Math.abs(v[SettingKeys.STOP_LOSS_ROI] as Double)
                     v[SettingKeys.LEVERAGE] = LeverageConfig.requireSupported(LeverageConfig.SUPPORTED_LEVERAGES.getOrElse(levSpin.selectedItemPosition) { 6 })
                     // Strict validation (throws with a readable message) before anything is saved.
@@ -1103,7 +1131,7 @@ class MainActivity : AppCompatActivity() {
                         symbol = key,
                         marginAmount = v[SettingKeys.MARGIN] as Double, leverage = v[SettingKeys.LEVERAGE] as Int,
                         oppositeEnabled = v[SettingKeys.OPPOSITE_ENABLED] as Boolean, oppositeMargin = v[SettingKeys.OPPOSITE_MARGIN] as Double,
-                        oppositeTriggerRoi = v[SettingKeys.OPPOSITE_TRIGGER_ROI] as Double,
+                        oppositeActivationRoi = v[SettingKeys.OPPOSITE_TRIGGER_ROI] as Double,
                         oppositeCallbackRoi = v[SettingKeys.OPPOSITE_CALLBACK_ROI] as Double,
                         stopLossEnabled = v[SettingKeys.STOP_LOSS_ENABLED] as Boolean, stopLossRoi = v[SettingKeys.STOP_LOSS_ROI] as Double,
                         averagingEnabled = v[SettingKeys.AVERAGING_ENABLED] as Boolean,
@@ -1172,11 +1200,12 @@ class MainActivity : AppCompatActivity() {
                     addLabel(box, "Averaging Order 2", "${fmtNum(eff.avg2AllocationPct)}% of Initial Margin | ${fmtNum(eff.avg2TriggerRoi)}% ROI${tag(SettingKeys.AVG2_TRIGGER_ROI)}")
                     addLabel(box, "Opposite-Side", onOff(eff.oppositeEnabled) + tag(SettingKeys.OPPOSITE_ENABLED), if (eff.oppositeEnabled) green else lockedColor)
                     addLabel(box, "Opposite-Side Margin", "${fmtNum(eff.oppositeMargin)} USDT${tag(SettingKeys.OPPOSITE_MARGIN)}")
-                    addLabel(box, "Opposite-Side Trigger ROI", "${fmtNum(eff.oppositeTriggerRoi)}%${tag(SettingKeys.OPPOSITE_TRIGGER_ROI)}")
+                    addLabel(box, "Opposite Trailing Activation ROI", "+${fmtNum(eff.oppositeActivationRoi)}%${tag(SettingKeys.OPPOSITE_TRIGGER_ROI)}")
+                    addLabel(box, "Opposite Leverage", "${eff.leverage}x (same as Initial)")
                     addLabel(box, "Trailing Stop", if (eff.trailingEnabled) "ON  (activation ${fmtNum(eff.trailingActivationRoi)}% / callback ${fmtNum(eff.trailingCallbackRoi)}% ROI)${tag(SettingKeys.TRAILING_ACTIVATION_ROI)}" else "OFF${tag(SettingKeys.TRAILING_ENABLED)}")
                     addLabel(box, "Re-entry", onOff(eff.reentryEnabled) + " (50% same / 100% opposite of booked ROI)" + tag(SettingKeys.REENTRY_ENABLED), if (eff.reentryEnabled) green else lockedColor)
                     addLabel(box, "Stop Loss", (if (eff.stopLossEnabled) "ON, -${fmtNum(eff.stopLossRoi)}% ROI" else "OFF") + tag(SettingKeys.STOP_LOSS_ENABLED), if (eff.stopLossEnabled) green else lockedColor)
-                    addLabel(box, "Opposite Callback ROI", "${fmtNum(eff.oppositeCallbackRoi)}%${tag(SettingKeys.OPPOSITE_CALLBACK_ROI)}")
+                    addLabel(box, "Opposite Trailing Callback ROI", "${fmtNum(eff.oppositeCallbackRoi)}%${tag(SettingKeys.OPPOSITE_CALLBACK_ROI)}")
                     if (lock != null) { box.addView(text(lock, 12f, yellow, true)); addSpace(box, 4) }
                     val actions = row(); box.addView(actions)
                     val edit = Button(this@MainActivity).apply { text = "Edit"; isAllCaps = false; isEnabled = lock == null; alpha = if (lock == null) 1f else 0.4f; setTextColor(if (lock == null) 0xFF000000.toInt() else white); background = rounded(if (lock == null) yellow else inputBg, 12) }
@@ -1239,6 +1268,7 @@ class MainActivity : AppCompatActivity() {
         addDemoApiCard(root)
         addDemoProbeCard(root)
         addDemoTrailingProbeCard(root)
+        addDemoOpeningTrailingProbeCard(root)
         addDemoSetupCard(root)
         addDemoOrdersCard(root)
 
@@ -1254,7 +1284,7 @@ class MainActivity : AppCompatActivity() {
         addButton(ctl, if (autoOn()) "PAUSE AUTO-TRADING (turn OFF)" else "RESUME AUTO-TRADING (turn ON)", inputBg).setOnClickListener {
             if (autoOn()) { DemoAutoTradeStore.set(this, false); updateTopStatus(); showPage("More") }
             else AlertDialog.Builder(this).setTitle("Turn Demo Auto-Trading ON?")
-                .setMessage("Binance DEMO only. While this app is OPEN the strategy may place Averaging, Opposite-Side and Re-entry LIMIT orders and close a cycle at market when its ROI Trailing Stop triggers.")
+                .setMessage("Binance DEMO only. While this app is OPEN the strategy may place Averaging and Re-entry LIMIT orders, adopt a position opened by the Opposite-Side trailing order, and close a cycle at market when its ROI Trailing Stop triggers.")
                 .setPositiveButton("TURN ON") { _, _ -> DemoAutoTradeStore.set(this, true); updateTopStatus(); showPage("More") }.setNegativeButton("BACK", null).show()
         }
         addButton(ctl, "CANCEL PENDING ORDERS", inputBg).setOnClickListener {
@@ -1265,15 +1295,15 @@ class MainActivity : AppCompatActivity() {
         }
         addButton(ctl, "EMERGENCY STOP", 0xFF3A3416.toInt()).setOnClickListener {
             AlertDialog.Builder(this).setTitle("Emergency stop?")
-                .setMessage("Turns Auto-Trading OFF and cancels all pending Demo orders. Open positions are NOT closed and keep their Stop Losses.")
+                .setMessage("Turns Auto-Trading OFF, cancels all pending Demo orders and cancels any waiting Opposite-Side trailing order on Binance. Open positions are NOT closed and keep their Stop Losses.")
                 .setPositiveButton("STOP") { _, _ ->
                     DemoAutoTradeStore.set(this, false); updateTopStatus()
-                    withCreds { c -> lifecycleScope.launch { val r = eng.cancelAllPending(c); result.setTextColor(muted); result.text = "Auto-Trading OFF. $r" } }
+                    withCreds { c -> lifecycleScope.launch { val r = eng.cancelAllPending(c); val o = eng.cancelOpposingOrders(c); result.setTextColor(muted); result.text = "Auto-Trading OFF. $r\n$o" } }
                 }.setNegativeButton("BACK", null).show()
         }
         addButton(ctl, "PANIC CLOSE ALL DEMO POSITIONS", 0xFF5A1E1E.toInt()).setOnClickListener {
             AlertDialog.Builder(this).setTitle("Panic close?")
-                .setMessage("Binance DEMO: turns Auto-Trading OFF, cancels pending orders, closes every open Demo position at market and removes its Stop Loss and Trailing Stop orders. No re-entry follows.")
+                .setMessage("Binance DEMO: turns Auto-Trading OFF, cancels pending orders, closes every open Demo position at market and removes its Stop Loss and Trailing Stop orders and cancels waiting Opposite-Side trailing orders. No re-entry follows.")
                 .setPositiveButton("CLOSE ALL") { _, _ ->
                     DemoAutoTradeStore.set(this, false); updateTopStatus()
                     withCreds { c -> lifecycleScope.launch { result.setTextColor(muted); result.text = "Closing on Binance Demo..."; val r = eng.panicCloseAll(c); result.text = r } }
@@ -1406,6 +1436,46 @@ class MainActivity : AppCompatActivity() {
             val t = DemoTrailingProbeStore.text(this)
             if (t == null) { toast("Run the trailing probe first."); return@setOnClickListener }
             (getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager).setPrimaryClip(android.content.ClipData.newPlainText("BNB trailing probe report", t)); toast("Report copied")
+        }
+        refresh()
+    }
+
+    private fun addDemoOpeningTrailingProbeCard(root: LinearLayout) {
+        val card = addCard(root, "BINANCE DEMO OPPOSITE-SIDE (OPENING) TRAILING PROBE",
+            "Checks, on Binance DEMO only, that an OPENING Trailing Stop order (SELL + SHORT) is accepted in Hedge Mode, can be listed and cancelled. It places one far-away order (BTCUSDT), cancels it, and opens NO position. Until this passes the Opposite-Side strategy is NOT used (there is no app-side substitute).")
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        card.addView(box)
+        val repo = DemoCredentialStore.repository(this)
+        val fmt = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
+        fun refresh() {
+            box.removeAllViews()
+            val t = DemoOpeningTrailingProbeStore.text(this)
+            if (t == null) addLabel(box, "Opposite-Side probe", "Not run", muted)
+            else {
+                val ok = DemoOpeningTrailingProbeStore.supported(this)
+                addLabel(box, "Last Opposite-Side probe", (if (ok) "PASSED (Opposite-Side order may be used)" else "NOT PASSED (Opposite-Side not used)") + "  ·  " + fmt.format(Date(DemoOpeningTrailingProbeStore.at(this))), if (ok) green else red)
+                t.lines().forEach { if (it.isNotBlank()) box.addView(text(it, 11f, muted)) }
+            }
+        }
+        val runBtn = addButton(card, "RUN OPPOSITE-SIDE PROBE (Demo, cancels its own order)", yellow)
+        runBtn.setOnClickListener {
+            val creds = repo.load()
+            if (creds == null) { toast(if (repo.hasCredentials()) "Stored keys cannot be read. Replace them." else "Save your Demo keys first."); return@setOnClickListener }
+            AlertDialog.Builder(this).setTitle("Run Opposite-Side probe?")
+                .setMessage("Sends one tiny OPENING Trailing Stop test order (SELL + SHORT) to Binance DEMO (BTCUSDT), 10% above the market so it cannot trigger, and cancels it. No position is opened and no setting is changed.")
+                .setPositiveButton("RUN") { _, _ ->
+                    runBtn.isEnabled = false
+                    lifecycleScope.launch {
+                        val r = DemoOpeningTrailingProbe(DemoTradeClient.create()).run(creds)
+                        DemoOpeningTrailingProbeStore.save(this@MainActivity, r, "BTCUSDT")
+                        runBtn.isEnabled = true; refresh(); toast(if (r.passed && r.cleanupOk) "Opposite-Side probe passed" else "Opposite-Side probe finished — see report")
+                    }
+                }.setNegativeButton("CANCEL", null).show()
+        }
+        addButton(card, "COPY REPORT", inputBg).setOnClickListener {
+            val t = DemoOpeningTrailingProbeStore.text(this)
+            if (t == null) { toast("Run the Opposite-Side probe first."); return@setOnClickListener }
+            (getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager).setPrimaryClip(android.content.ClipData.newPlainText("BNB opposite-side probe report", t)); toast("Report copied")
         }
         refresh()
     }

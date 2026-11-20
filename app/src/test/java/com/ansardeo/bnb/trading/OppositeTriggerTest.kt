@@ -4,76 +4,33 @@ import org.junit.Assert.*
 import org.junit.Test
 import java.math.BigDecimal
 
-/** Opposite-Side activation and callback are Position ROI values (leverage included), never raw price percentages. */
+/** Opposite-Side order parameters: ROI values with leverage included, converted to what Binance's trailing order takes (price percent). */
 class OppositeTriggerTest {
     private fun d(s: String) = BigDecimal(s)
-    private fun eq(expected: String, actual: BigDecimal) = assertEquals("expected $expected but was $actual", 0, d(expected).compareTo(actual))
+    private fun eq(expected: String, actual: BigDecimal?) = assertEquals("expected $expected but was $actual", 0, d(expected).compareTo(actual!!))
 
-    @Test fun activationIsPositionRoiOfTheSourceLong() {
-        // LONG W=100, 10x: -50% Position ROI = 5% price move down -> 95
-        eq("95", OppositeTrigger.activationPrice(TrailSide.LONG, d("100"), 10, d("-50")))
-        // the sign of the configured value does not matter
-        eq("95", OppositeTrigger.activationPrice(TrailSide.LONG, d("100"), 10, d("50")))
-        // 20x halves the price distance
-        eq("97.5", OppositeTrigger.activationPrice(TrailSide.LONG, d("100"), 20, d("-50")))
+    @Test fun longSourceActivatesAbovePrice() {
+        eq("104", OppositeTrigger.activationPrice(TrailSide.LONG, d("100"), 10, d("40")))   // +40 % ROI at 10x = +4 % price
+        eq("104", OppositeTrigger.activationPrice(TrailSide.LONG, d("100"), 10, d("-40")))  // only the magnitude counts
     }
-
-    @Test fun activationIsPositionRoiOfTheSourceShort() {
-        eq("105", OppositeTrigger.activationPrice(TrailSide.SHORT, d("100"), 10, d("-50")))
-        eq("102.5", OppositeTrigger.activationPrice(TrailSide.SHORT, d("100"), 20, d("-50")))
+    @Test fun shortSourceActivatesBelowPrice() {
+        eq("96", OppositeTrigger.activationPrice(TrailSide.SHORT, d("100"), 10, d("40")))
+        eq("98", OppositeTrigger.activationPrice(TrailSide.SHORT, d("100"), 20, d("40")))
     }
-
-    @Test fun noActivationBeforeTheTriggerRoiIsReached() {
-        val s = OppositeTrigger.step(TrailSide.LONG, d("100"), 10, d("-50"), d("5"), TrailingState(), d("96"))
-        assertFalse(s.state.active); assertFalse(s.justActivated); assertFalse(s.exitTriggered)
-        eq("95", s.activationPrice)
+    @Test fun callbackRoiBecomesPricePercentDividedByLeverage() {
+        eq("0.3", OppositeTrigger.callbackPricePercent(d("3"), 10)) // 3 % ROI at 10x = 0.3 % price
+        eq("0.5", OppositeTrigger.callbackPricePercent(d("3"), 6))
+        eq("0.2", OppositeTrigger.callbackPricePercent(d("3"), 15)) // 0.2 exactly
+        eq("0.1", OppositeTrigger.callbackPricePercent(d("0.5"), 20)) // never below Binance's 0.1 minimum
+        assertNull(OppositeTrigger.callbackPricePercent(d("250"), 20)) // 12.5 % is outside 0.1-10
     }
-
-    @Test fun longSourceFullSequenceActivatesTrailsAndFiresOnFivePercentRoiReversal() {
-        var st = TrailingState()
-        // 10x: callback 5% ROI = 0.5% price (NOT 5% price)
-        var s = OppositeTrigger.step(TrailSide.LONG, d("100"), 10, d("-50"), d("5"), st, d("95")); st = s.state
-        assertTrue(s.justActivated)
-        eq("95.475", st.stopPrice!!) // 95 * 1.005
-        s = OppositeTrigger.step(TrailSide.LONG, d("100"), 10, d("-50"), d("5"), st, d("93")); st = s.state
-        eq("93", st.extreme!!); eq("93.465", st.stopPrice!!); assertFalse(s.exitTriggered)
-        // a bounce that stays below the trigger does not fire, and the trigger never moves up
-        s = OppositeTrigger.step(TrailSide.LONG, d("100"), 10, d("-50"), d("5"), st, d("93.4")); st = s.state
-        assertFalse(s.exitTriggered); eq("93.465", st.stopPrice!!)
-        // the first price at or above the trigger fires (the callback is 0.5% of price at 10x, not 5%)
-        s = OppositeTrigger.step(TrailSide.LONG, d("100"), 10, d("-50"), d("5"), st, d("93.47")); st = s.state
-        assertTrue(s.exitTriggered)
-        eq("93.465", st.stopPrice!!)
+    @Test fun quantityIsMarginTimesLeverageOverActivationPrice() {
+        eq("0.0158227848", OppositeTrigger.quantity(d("100"), 10, d("63200")).setScale(10, java.math.RoundingMode.DOWN))
+        eq("1000", OppositeTrigger.quantity(d("100"), 10, d("1")))
     }
-
-    @Test fun shortSourceFullSequenceIsMirrored() {
-        var st = TrailingState()
-        var s = OppositeTrigger.step(TrailSide.SHORT, d("100"), 10, d("-50"), d("5"), st, d("105")); st = s.state
-        assertTrue(s.justActivated)
-        s = OppositeTrigger.step(TrailSide.SHORT, d("100"), 10, d("-50"), d("5"), st, d("107")); st = s.state
-        eq("107", st.extreme!!); eq("106.465", st.stopPrice!!) // 107 * (1 - 0.005)
-        s = OppositeTrigger.step(TrailSide.SHORT, d("100"), 10, d("-50"), d("5"), st, d("106.5")); st = s.state
-        assertFalse(s.exitTriggered)
-        s = OppositeTrigger.step(TrailSide.SHORT, d("100"), 10, d("-50"), d("5"), st, d("106.46")); st = s.state
-        assertTrue(s.exitTriggered)
-    }
-
-    @Test fun callbackDistanceScalesWithLeverage() {
-        // same 5% ROI callback: 5x -> 1% price, 20x -> 0.25% price
-        val s5 = OppositeTrigger.step(TrailSide.LONG, d("100"), 5, d("-25"), d("5"), TrailingState(), d("95"))
-        eq("95.95", s5.state.stopPrice!!) // 95 * 1.01
-        val s20 = OppositeTrigger.step(TrailSide.LONG, d("100"), 20, d("-100"), d("5"), TrailingState(), d("95"))
-        eq("95.2375", s20.state.stopPrice!!) // 95 * 1.0025
-    }
-
-    @Test fun triggerNeverMovesBackwards() {
-        var st = TrailingState()
-        val prices = listOf("95", "92", "94", "91", "93.4", "90")
-        var last: BigDecimal? = null
-        for (p in prices) {
-            val s = OppositeTrigger.step(TrailSide.LONG, d("100"), 10, d("-50"), d("5"), st, d(p)); st = s.state
-            last?.let { assertTrue("stop must not rise above previous for a LONG source: $p", st.stopPrice!! <= it) }
-            last = st.stopPrice
-        }
+    @Test fun sidesAreTheOppositeOfTheSource() {
+        assertEquals("SELL" to "SHORT", OppositeTrigger.orderSides("LONG"))
+        assertEquals("BUY" to "LONG", OppositeTrigger.orderSides("SHORT"))
+        assertEquals(TrailSide.SHORT, OppositeTrigger.oppositeSide(TrailSide.LONG)); assertEquals(TrailSide.LONG, OppositeTrigger.oppositeSide(TrailSide.SHORT))
     }
 }

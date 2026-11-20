@@ -31,13 +31,14 @@ class DemoStrategyEngineTest {
     private lateinit var engine: DemoStrategyEngine
     private var now = 1_700_000_000_000L
     private var trailingOk = false
-    private var settings = LocalCoinSettings(symbol = "BTCUSDT", marginAmount = 100.0, oppositeMargin = 100.0)
+    private var openingOk = false
+    private var settings = LocalCoinSettings(symbol = "BTCUSDT", marginAmount = 100.0, oppositeMargin = 100.0, leverage = 6, trailingActivationRoi = 33.0, trailingCallbackRoi = 3.0)
 
     @Before fun setUp() {
         ex = FakeDemoExchange().start(); store = InMemoryExecStore()
         val api = DemoTradeClient(OkHttpClient(), ex.server.url("/"), { System.currentTimeMillis() })
         svc = DemoExecutionService(api, store, RulesCache(), { now++ })
-        engine = DemoStrategyEngine(api, svc, store, { settings }, { now++ }, { trailingOk })
+        engine = DemoStrategyEngine(api, svc, store, { settings }, { now++ }, { trailingOk }, { openingOk })
     }
     @After fun tearDown() { ex.shutdown() }
 
@@ -181,7 +182,7 @@ class DemoStrategyEngineTest {
         avgSetup(); triggerAveraging(); tick(); tick()
         assertEquals(3, limitPosts().size)
         val api = DemoTradeClient(OkHttpClient(), ex.server.url("/"), { System.currentTimeMillis() })
-        val restarted = DemoStrategyEngine(api, DemoExecutionService(api, store, RulesCache(), { now++ }), store, { settings }, { now++ }, { trailingOk })
+        val restarted = DemoStrategyEngine(api, DemoExecutionService(api, store, RulesCache(), { now++ }), store, { settings }, { now++ }, { trailingOk }, { openingOk })
         runBlocking { restarted.tick(creds); restarted.tick(creds) }
         assertEquals(3, limitPosts().size); assertEquals(2, avgEntries().size)
     }
@@ -269,17 +270,97 @@ class DemoStrategyEngineTest {
         assertEquals(0, store.all().count { it.kind.startsWith("REENTRY") })
     }
 
-    // ---------------- opposite side ----------------
-    @Test fun oppositeSideFiresAfterTheTriggerAndItsCallback() {
-        settings = settings.copy(averagingEnabled = false)
-        ex.limitFill = "full"; ex.fillPrice = "60000"; submit("LONG", "60000")
-        ex.mark = "55000.00"; tick(); assertEquals(1, limitPosts().size) // armed at -50 % ROI
-        ex.mark = "54000.00"; tick(); assertEquals(1, limitPosts().size)  // new low, still no callback
-        ex.mark = "54500.00"; tick(); assertEquals(2, limitPosts().size)  // 54000 x (1 + 5/600) = 54450 reached
-        val opp = store.all().single { it.kind == "OPPOSITE_SIDE" }
-        assertEquals("SHORT", opp.direction); assertEquals("VERIFIED", opp.slState)
-        assertNotEquals(store.all().first().cycleId, opp.cycleId) // its own cycle
-        tick(); assertEquals(2, limitPosts().size)
+    // ---------------- opposite side (real Binance opening trailing order) ----------------
+    private fun oppPosts() = trailPosts().filter { it.requestUrl!!.queryParameter("positionSide") == "SHORT" && it.requestUrl!!.queryParameter("side") == "SELL" }
+    private fun oppSetup(dir: String = "LONG") {
+        openingOk = true; settings = settings.copy(averagingEnabled = false)
+        ex.limitFill = "full"; ex.fillPrice = "60000"
+        if (dir == "LONG") { ex.longAmt = "0.01"; ex.shortAmt = "0" } else { ex.longAmt = "0"; ex.shortAmt = "0.01" }
+        submit(dir, "60000")
+    }
+
+    @Test fun oppositeOrderIsPlacedOnceAfterTheFillAndTheStopLoss() {
+        oppSetup(); tick()
+        val p = oppPosts().single().requestUrl!!
+        assertEquals("TRAILING_STOP_MARKET", p.queryParameter("type"))
+        assertEquals("MARK_PRICE", p.queryParameter("workingType"))
+        assertEquals("63300", p.queryParameter("activatePrice").let { BigDecimal(it).stripTrailingZeros().toPlainString() }) // 60000 x (1 + 33/600)
+        assertEquals("0.5", p.queryParameter("callbackRate")) // 3 % ROI / 6x
+        assertNull(p.queryParameter("reduceOnly")); assertNull(p.queryParameter("closePosition"))
+        tick(); tick(); assertEquals(1, oppPosts().size)
+        val cy = store.cycles().single(); assertNotNull(cy.oppAlgoId); assertTrue(cy.oppDone)
+    }
+
+    @Test fun oppositeActivationUsesItsOwnSettingNotTheClosingTrailing() {
+        settings = settings.copy(oppositeActivationRoi = 40.0, trailingActivationRoi = 20.0)
+        oppSetup(); tick()
+        assertEquals("64000", BigDecimal(oppPosts().single().requestUrl!!.queryParameter("activatePrice")!!).stripTrailingZeros().toPlainString()) // 60000 x (1 + 40/600)
+    }
+
+    @Test fun shortSourcePlacesABuyLongOpeningOrder() {
+        openingOk = true; settings = settings.copy(averagingEnabled = false)
+        ex.limitFill = "full"; ex.fillPrice = "60000"; ex.longAmt = "0"; ex.shortAmt = "0.01"
+        submit("SHORT", "60000"); tick()
+        val p = trailPosts().single { it.requestUrl!!.queryParameter("side") == "BUY" }.requestUrl!!
+        assertEquals("LONG", p.queryParameter("positionSide")); assertEquals("56700", BigDecimal(p.queryParameter("activatePrice")!!).stripTrailingZeros().toPlainString().let { if (it.contains("E")) BigDecimal(it).toPlainString() else it })
+    }
+
+    @Test fun withoutAPassedOpeningProbeNothingIsPlacedAndThereIsNoSubstitute() {
+        openingOk = false; settings = settings.copy(averagingEnabled = false)
+        ex.limitFill = "full"; ex.fillPrice = "60000"; ex.longAmt = "0.01"; ex.shortAmt = "0"; submit("LONG", "60000"); tick(); tick()
+        assertEquals(0, oppPosts().size); assertNull(store.cycles().single().oppAlgoId)
+        assertTrue(events().any { it.contains("Opposite-Side order NOT placed") })
+    }
+
+    @Test fun anExistingOppositePositionBlocksPlacement() {
+        openingOk = true; settings = settings.copy(averagingEnabled = false)
+        ex.limitFill = "full"; ex.fillPrice = "60000"; ex.longAmt = "0.01"; ex.shortAmt = "0.01"; submit("LONG", "60000"); tick()
+        assertEquals(0, oppPosts().size); assertTrue(events().any { it.contains("position already exists") })
+    }
+
+    @Test fun anUnreadablePositionRiskBlocksPlacement() {
+        openingOk = true; settings = settings.copy(averagingEnabled = false)
+        ex.limitFill = "full"; ex.fillPrice = "60000"; submit("LONG", "60000"); tick() // longAmt/shortAmt null: positionRisk answers 404
+        assertEquals(0, oppPosts().size); assertTrue(events().any { it.contains("cannot be ruled out") })
+    }
+
+    @Test fun aPendingOppositeEntryOrderBlocksPlacement() {
+        openingOk = true; settings = settings.copy(averagingEnabled = false, reentryEnabled = false)
+        ex.limitFill = "none"; ex.longAmt = "0.01"; ex.shortAmt = "0"
+        submit("SHORT", "61000") // pending SHORT entry (opposite of the LONG below)
+        ex.limitFill = "full"; ex.fillPrice = "60000"; submit("LONG", "60000"); tick()
+        assertEquals(0, oppPosts().size)
+    }
+
+    @Test fun oppositeOrderIsNotReplacedAfterAveraging() {
+        openingOk = true; settings = settings.copy(averagingEnabled = true)
+        ex.limitFill = "full"; ex.fillPrice = "60000"; ex.longAmt = "0.01"; ex.shortAmt = "0"; submit("LONG", "60000"); tick()
+        assertEquals(1, oppPosts().size)
+        ex.mark = "55000.00"; ex.limitFill = "none"; tick(); tick()
+        assertEquals(1, oppPosts().size)
+    }
+
+    @Test fun oppositeOrderStaysOnBinanceWhenTheSourceCycleClosesAndIsCancelledOnlyByPanic() {
+        oppSetup(); tick()
+        val id = store.cycles().single().oppAlgoId!!
+        val e = store.all().single(); runBlocking { svc.markClosedByExchange(creds, e.id) }
+        ex.mark = "60000.00"; tick(); tick()
+        assertEquals("NEW", ex.algos[id]!!.status) // closing / finalising the cycle never touches it
+        runBlocking { engine.cancelOpposingOrders(creds) }
+        assertEquals("CANCELED", ex.algos[id]!!.status)
+    }
+
+    @Test fun aTriggeredOppositeOrderIsAdoptedWithItsOwnStopLoss() {
+        oppSetup(); tick()
+        val id = store.cycles().single().oppAlgoId!!
+        ex.triggerAlgo(id); ex.shortAmt = "0.0158"
+        val before = ex.posts("/fapi/v1/algoOrder").size
+        tick()
+        val adopted = store.all().single { it.kind == "OPPOSITE_SIDE" }
+        assertEquals("SHORT", adopted.direction); assertEquals("0.0158", adopted.executedQty); assertEquals("VERIFIED", adopted.slState)
+        assertEquals(before + 1, ex.posts("/fapi/v1/algoOrder").size) // exactly its Stop Loss
+        assertTrue(store.cycles().first { it.oppAlgoId == id }.oppAdopted)
+        tick(); assertEquals(1, store.all().count { it.kind == "OPPOSITE_SIDE" }) // never adopted twice
     }
 
     // ---------------- trailing exit + re-entry ----------------
@@ -406,6 +487,23 @@ class DemoStrategyEngineTest {
         ex.algoFailures = 0; ex.limitFill = "none"
         ex.mark = "63300.00"; tick(); ex.mark = "62900.00"; tick()
         assertEquals(1, marketPosts().size); assertEquals("APP", store.getCycle(e.cycleId)!!.exitBy)
+    }
+
+    @Test fun theOpeningTrailingProbePlacesASellShortOrderFarAwayAndCancelsIt() {
+        val api = DemoTradeClient(OkHttpClient(), ex.server.url("/"), { System.currentTimeMillis() })
+        val r = runBlocking { com.ansardeo.bnb.demo.trade.DemoOpeningTrailingProbe(api).run(creds) }
+        assertTrue(r.toText("BTCUSDT"), r.passed && r.cleanupOk)
+        val t = trailPosts().single().requestUrl!!
+        assertEquals("SELL", t.queryParameter("side")); assertEquals("SHORT", t.queryParameter("positionSide"))
+        assertNull(t.queryParameter("reduceOnly")); assertNull(t.queryParameter("closePosition"))
+        assertTrue(BigDecimal(t.queryParameter("activatePrice")!!) > BigDecimal(ex.mark))
+        assertTrue(ex.algos.values.none { it.status == "NEW" }); assertEquals(0, ex.posts("/fapi/v1/order").size)
+    }
+
+    @Test fun theOpeningTrailingBuilderRefusesAClosingSide() {
+        val api = DemoTradeClient(OkHttpClient(), ex.server.url("/"), { System.currentTimeMillis() })
+        try { runBlocking { api.newOpeningTrailingAlgo(creds, "BTCUSDT", "SELL", "LONG", "0.01", "63000", "0.5", "x1") }; fail() } catch (_: IllegalArgumentException) {}
+        try { runBlocking { api.newOpeningTrailingAlgo(creds, "BTCUSDT", "BUY", "SHORT", "0.01", "63000", "0.5", "x1") }; fail() } catch (_: IllegalArgumentException) {}
     }
 
     @Test fun withoutAPassedProbeNoTrailingOrderIsEverSent() {

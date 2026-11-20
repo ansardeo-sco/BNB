@@ -33,7 +33,7 @@ class DemoSettingsService(private val store: DemoExecStore) {
         if (sym.isBlank() || !sym.endsWith("USDT")) return Result(false, "Enter a valid USDT symbol, e.g. BTCUSDT.")
         lockReason(sym)?.let { return Result(false, it) }
         val normalized = HashMap<String, Any>(changes)
-        listOf(SettingKeys.AVG1_TRIGGER_ROI, SettingKeys.AVG2_TRIGGER_ROI, SettingKeys.OPPOSITE_TRIGGER_ROI).forEach { k ->
+        listOf(SettingKeys.AVG1_TRIGGER_ROI, SettingKeys.AVG2_TRIGGER_ROI).forEach { k ->
             (normalized[k] as? Number)?.let { normalized[k] = RoiMath.normalizeLossTrigger(it.toDouble()) }
         }
         val merged = HashMap(LocalCoinSettingsStore.overridesFor(context, sym)); merged.putAll(normalized)

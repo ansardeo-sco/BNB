@@ -26,7 +26,9 @@ data class DemoCycle(
     val initFill: String? = null, val initMargin: String? = null,
     /** Set BEFORE each Averaging order is sent, so a restart or a repeated tick can never send it twice. */
     val avg1Sent: Boolean = false, val avg2Sent: Boolean = false,
+    /** Opposite-Side: true once placement was ATTEMPTED (never retried/re-placed, not even after Averaging). The real Binance opening Trailing Stop order is tracked below. */
     val oppDone: Boolean = false,
+    val oppAlgoId: Long? = null, val oppQty: String = "", val oppActivation: String? = null, val oppCallback: String? = null, val oppAdopted: Boolean = false,
     val reentryDone: Boolean = false,
     /** Set when the Trailing Stop fired: the mark price at that moment and the cycle's weighted average entry price at that moment. */
     val closePrice: String? = null,
@@ -50,7 +52,7 @@ data class DemoCycle(
         put("id", id); put("symbol", symbol); put("direction", direction); put("leverage", leverage); put("kind", kind); put("status", status.name)
         put("trailActive", trailActive); trailExtreme?.let { put("trailExtreme", it) }; trailStop?.let { put("trailStop", it) }
         put("oppActive", oppActive); oppExtreme?.let { put("oppExtreme", it) }; oppStop?.let { put("oppStop", it) }
-        put("avgDone", avgDone); initFill?.let { put("initFill", it) }; initMargin?.let { put("initMargin", it) }; put("avg1Sent", avg1Sent); put("avg2Sent", avg2Sent); put("oppDone", oppDone); put("reentryDone", reentryDone)
+        put("avgDone", avgDone); initFill?.let { put("initFill", it) }; initMargin?.let { put("initMargin", it) }; put("avg1Sent", avg1Sent); put("avg2Sent", avg2Sent); put("oppDone", oppDone); oppAlgoId?.let { put("oppAlgoId", it) }; put("oppQty", oppQty); oppActivation?.let { put("oppActivation", it) }; oppCallback?.let { put("oppCallback", it) }; put("oppAdopted", oppAdopted); put("reentryDone", reentryDone)
         closePrice?.let { put("closePrice", it) }; closeWap?.let { put("closeWap", it) }
         put("exitBy", exitBy); put("trMode", trMode); trAlgoId?.let { put("trAlgoId", it) }; put("trQty", trQty); put("trWap", trWap); trActivation?.let { put("trActivation", it) }; trCallback?.let { put("trCallback", it) }; put("trFail", trFail); bookedRoi?.let { put("bookedRoi", it) }
         put("note", note); put("createdAt", createdAt); put("updatedAt", updatedAt)
@@ -65,7 +67,7 @@ data class DemoCycle(
                 status = CycleStatus.valueOf(o.getString("status")),
                 trailActive = o.optBoolean("trailActive"), trailExtreme = s("trailExtreme"), trailStop = s("trailStop"),
                 oppActive = o.optBoolean("oppActive"), oppExtreme = s("oppExtreme"), oppStop = s("oppStop"),
-                avgDone = o.optBoolean("avgDone"), initFill = s("initFill"), initMargin = s("initMargin"), avg1Sent = o.optBoolean("avg1Sent"), avg2Sent = o.optBoolean("avg2Sent"), oppDone = o.optBoolean("oppDone"), reentryDone = o.optBoolean("reentryDone"),
+                avgDone = o.optBoolean("avgDone"), initFill = s("initFill"), initMargin = s("initMargin"), avg1Sent = o.optBoolean("avg1Sent"), avg2Sent = o.optBoolean("avg2Sent"), oppDone = o.optBoolean("oppDone"), oppAlgoId = if (o.has("oppAlgoId")) o.getLong("oppAlgoId") else null, oppQty = o.optString("oppQty", ""), oppActivation = s("oppActivation"), oppCallback = s("oppCallback"), oppAdopted = o.optBoolean("oppAdopted"), reentryDone = o.optBoolean("reentryDone"),
                 closePrice = s("closePrice"), closeWap = s("closeWap"),
                 exitBy = o.optString("exitBy", ""), trMode = o.optString("trMode", ""), trAlgoId = if (o.has("trAlgoId")) o.getLong("trAlgoId") else null, trQty = o.optString("trQty", ""), trWap = o.optString("trWap", ""), trActivation = s("trActivation"), trCallback = s("trCallback"), trFail = o.optInt("trFail", 0), bookedRoi = s("bookedRoi"),
                 note = o.optString("note", ""), createdAt = o.optLong("createdAt", 0L), updatedAt = o.optLong("updatedAt", 0L),
