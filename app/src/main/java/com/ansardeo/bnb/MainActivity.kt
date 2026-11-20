@@ -758,7 +758,7 @@ class MainActivity : AppCompatActivity() {
     }
     private fun fmtDateTime(ts: Long?): String = if (ts == null || ts <= 0L) "Not Available" else SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date(ts))
     private fun fmtDuration(ms: Long): String { val s = ms / 1000; return if (s < 60) "${s}s" else if (s < 3600) "${s / 60}m ${s % 60}s" else if (s < 86400) "${s / 3600}h ${(s % 3600) / 60}m" else "${s / 86400}d ${(s % 86400) / 3600}h" }
-    private fun closeReasonText(r: String) = when (r) { "TRAILING_STOP" -> "Trailing Stop"; "STOP_LOSS" -> "Stop Loss"; "MANUAL_CLOSE" -> "Manual Close"; "PANIC_CLOSE" -> "Panic Close"; "EMERGENCY_STOP" -> "Emergency Stop"; else -> "Unknown" }
+    private fun closeReasonText(r: String) = when (r) { "TRAILING_EXIT" -> "Trailing Stop"; "STOP_LOSS" -> "Stop Loss"; "MANUAL_CLOSE" -> "Manual Close"; "PANIC_CLOSE" -> "Panic Close"; "EMERGENCY_STOP" -> "Emergency Stop"; else -> "Unknown" }
     private fun fmtBd(bd: java.math.BigDecimal?, scale: Int = 2) = bd?.setScale(scale, java.math.RoundingMode.HALF_UP)?.toPlainString() ?: "Not Available"
 
     private fun sortDescription(s: SortSpec) = when (s.field) {

@@ -100,7 +100,7 @@ class DemoPositionPresentationTest {
     private fun main(): String = listOf("src/main/java/com/ansardeo/bnb/MainActivity.kt", "app/src/main/java/com/ansardeo/bnb/MainActivity.kt").map { File(it) }.first { it.isFile }.readText()
     @Test fun screenRulesAreInTheSource() {
         val src = main()
-        val i = src.indexOf("private fun renderLivePositions"); val j = src.indexOf("private fun renderLiveBasic")
+        val i = src.indexOf("private fun renderLivePositions"); val j = src.indexOf("/** Positions > Closed")
         val open = src.substring(i, j)
         assertFalse(open.contains("Close All")); assertFalse(src.contains("CLOSE POSITION (market)"))
         assertFalse("PNL must not print USDT twice", open.contains("formatPnl(p.unrealizedPnl.toDouble()) + \" USDT\""))

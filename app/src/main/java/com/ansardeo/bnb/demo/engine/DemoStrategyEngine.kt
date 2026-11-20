@@ -435,7 +435,7 @@ class DemoStrategyEngine(
         val close = cy0.closePrice?.let { BigDecimal(it) }; val wap = cy0.closeWap?.let { BigDecimal(it) }
         if (close == null || wap == null) { save(cy0.copy(status = CycleStatus.CLOSED, note = "Closed.")); return }
         val booked = ReentryFormula.bookedRoi(side, wap, close, cy0.leverage)
-        var cy = save(cy0.copy(bookedRoi = booked.setScale(4, RoundingMode.HALF_UP).toPlainString(), reentryDone = true, status = CycleStatus.CLOSED, closeReason = "TRAILING_STOP", note = "Closed by Trailing Stop."))
+        var cy = save(cy0.copy(bookedRoi = booked.setScale(4, RoundingMode.HALF_UP).toPlainString(), reentryDone = true, status = CycleStatus.CLOSED, closeReason = "TRAILING_EXIT", note = "Closed by Trailing Stop."))
         log(cy, "closed by Trailing Stop; booked ROI ${booked.setScale(2, RoundingMode.HALF_UP)}% (WAP ${wap.toPlainString()} -> close ${close.toPlainString()})")
         val s = settingsOf(cy.symbol)
         if (!s.reentryEnabled) { log(cy, "Re-entry is disabled in Settings"); return }
@@ -531,7 +531,7 @@ class DemoStrategyEngine(
         n = n.copy(updatedAt = clock()); store.putCycle(n); return n
     }
 
-    private fun closeReasonLabel(r: String) = when (r) { "TRAILING_STOP" -> "Trailing Stop"; "STOP_LOSS" -> "Stop Loss"; "MANUAL_CLOSE" -> "Manual Close"; "PANIC_CLOSE" -> "Panic Close"; "EMERGENCY_STOP" -> "Emergency Stop"; else -> "reason unknown" }
+    private fun closeReasonLabel(r: String) = when (r) { "TRAILING_EXIT" -> "Trailing Stop"; "STOP_LOSS" -> "Stop Loss"; "MANUAL_CLOSE" -> "Manual Close"; "PANIC_CLOSE" -> "Panic Close"; "EMERGENCY_STOP" -> "Emergency Stop"; else -> "reason unknown" }
 
     private fun recordEvent(cy: DemoCycle, type: String, ref: String, text: String): DemoCycle =
         if (cy.ev.any { it.type == type && it.ref == ref }) cy else cy.copy(ev = (cy.ev + CycleEvent(type, clock(), text, ref)).takeLast(80))

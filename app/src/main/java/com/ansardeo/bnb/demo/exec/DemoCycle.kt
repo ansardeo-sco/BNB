@@ -42,7 +42,7 @@ data class DemoCycle(
     val trMode: String = "",
     val trAlgoId: Long? = null, val trQty: String = "", val trWap: String = "", val trActivation: String? = null, val trCallback: String? = null, val trFail: Int = 0,
     val bookedRoi: String? = null,
-    /** Position presentation records (Phase 6). [closeReason]: TRAILING_STOP, STOP_LOSS, MANUAL_CLOSE, PANIC_CLOSE or "" (= Unknown, never guessed). */
+    /** Position presentation records (Phase 6). [closeReason]: TRAILING_EXIT, STOP_LOSS, MANUAL_CLOSE, PANIC_CLOSE or "" (= Unknown, never guessed). */
     val closeReason: String = "", val closedAt: Long = 0L,
     /** Opposite cycles: the cycle whose Opposite-Side order opened this position. */
     val sourceCycleId: String? = null,
