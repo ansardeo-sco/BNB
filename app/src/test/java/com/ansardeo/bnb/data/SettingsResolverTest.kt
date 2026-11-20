@@ -48,15 +48,15 @@ class SettingsResolverTest {
     }
 
     @Test fun disablingStopLossWidensTheTriggerLimit() {
-        try { LocalCoinSettings(symbol = "X", averagingTriggerRoi = -85.0); fail() } catch (_: IllegalArgumentException) {}
-        val s = LocalCoinSettings(symbol = "X", stopLossEnabled = false, averagingTriggerRoi = -85.0)
-        assertEquals(-85.0, s.averagingTriggerRoi, 1e-9)
+        try { LocalCoinSettings(symbol = "X", avg2TriggerRoi = -85.0); fail() } catch (_: IllegalArgumentException) {}
+        val s = LocalCoinSettings(symbol = "X", stopLossEnabled = false, avg2TriggerRoi = -85.0)
+        assertEquals(-85.0, s.avg2TriggerRoi, 1e-9)
         assertFalse(s.stopLossEnabled)
     }
 
     @Test fun triggerMustStayInsideTheConfiguredStopLoss() {
-        try { LocalCoinSettings(symbol = "X", stopLossRoi = 55.0, averagingTriggerRoi = -60.0); fail() } catch (_: IllegalArgumentException) {}
-        LocalCoinSettings(symbol = "X", stopLossRoi = 55.0, averagingTriggerRoi = -55.0, oppositeTriggerRoi = -50.0)
+        try { LocalCoinSettings(symbol = "X", stopLossRoi = 55.0, avg2TriggerRoi = -60.0); fail() } catch (_: IllegalArgumentException) {}
+        LocalCoinSettings(symbol = "X", stopLossRoi = 55.0, avg2TriggerRoi = -55.0, oppositeTriggerRoi = -50.0)
     }
 
     @Test fun stopLossAndCallbackAreOverridablePerSymbol() {
@@ -68,39 +68,63 @@ class SettingsResolverTest {
     }
 
 
-    @Test fun triggerDefaultsAreMinus60AndMinus50() {
+    @Test fun triggerDefaultsAreTheApprovedTwoOrderAveraging() {
         val s = LocalCoinSettings.sanitized("X")
-        assertEquals(-60.0, s.averagingTriggerRoi, 1e-9)
+        assertEquals(-25.0, s.avg1TriggerRoi, 1e-9); assertEquals(-50.0, s.avg2TriggerRoi, 1e-9)
+        assertEquals(50.0, s.avg1AllocationPct, 1e-9); assertEquals(50.0, s.avg2AllocationPct, 1e-9)
+        assertTrue(s.averagingEnabled)
         assertEquals(-50.0, s.oppositeTriggerRoi, 1e-9)
     }
 
     @Test fun triggersAreIndependentSettings() {
-        val a = SettingsResolver.resolve("X", global, mapOf(SettingKeys.AVERAGING_TRIGGER_ROI to -30.0))
-        assertEquals(-30.0, a.averagingTriggerRoi, 1e-9)
+        val a = SettingsResolver.resolve("X", global, mapOf(SettingKeys.AVG1_TRIGGER_ROI to -30.0))
+        assertEquals(-30.0, a.avg1TriggerRoi, 1e-9); assertEquals(-50.0, a.avg2TriggerRoi, 1e-9)
         assertEquals(-50.0, a.oppositeTriggerRoi, 1e-9)
         val o = SettingsResolver.resolve("X", global, mapOf(SettingKeys.OPPOSITE_TRIGGER_ROI to -40.0))
-        assertEquals(-60.0, o.averagingTriggerRoi, 1e-9)
+        assertEquals(-25.0, o.avg1TriggerRoi, 1e-9); assertEquals(-50.0, o.avg2TriggerRoi, 1e-9)
         assertEquals(-40.0, o.oppositeTriggerRoi, 1e-9)
     }
 
     @Test fun positiveTriggerInputIsStoredNegative() {
-        val s = LocalCoinSettings.sanitized("X", averagingTriggerRoi = 30.0, oppositeTriggerRoi = 40.0)
-        assertEquals(-30.0, s.averagingTriggerRoi, 1e-9)
+        val s = LocalCoinSettings.sanitized("X", avg1TriggerRoi = 30.0, oppositeTriggerRoi = 40.0)
+        assertEquals(-30.0, s.avg1TriggerRoi, 1e-9)
         assertEquals(-40.0, s.oppositeTriggerRoi, 1e-9)
     }
 
     @Test fun triggersBeyondStopLossAreRejectedStrictly() {
         for (bad in listOf(-80.01, -90.0, -100.0, 0.0, 5.0)) {
-            try { LocalCoinSettings(symbol = "X", averagingTriggerRoi = bad); fail("avg $bad") } catch (_: IllegalArgumentException) {}
+            try { LocalCoinSettings(symbol = "X", avg1TriggerRoi = bad); fail("avg1 $bad") } catch (_: IllegalArgumentException) {}
+            try { LocalCoinSettings(symbol = "X", avg2TriggerRoi = bad); fail("avg2 $bad") } catch (_: IllegalArgumentException) {}
             try { LocalCoinSettings(symbol = "X", oppositeTriggerRoi = bad); fail("opp $bad") } catch (_: IllegalArgumentException) {}
         }
-        LocalCoinSettings(symbol = "X", averagingTriggerRoi = -80.0, oppositeTriggerRoi = -0.5) // boundaries allowed
+        LocalCoinSettings(symbol = "X", avg2TriggerRoi = -80.0, oppositeTriggerRoi = -0.5) // boundaries allowed
     }
 
     @Test fun resolveStrictThrowsWhereResolveCorrects() {
-        val bad = mapOf<String, Any>(SettingKeys.AVERAGING_TRIGGER_ROI to -90.0)
+        val bad = mapOf<String, Any>(SettingKeys.AVG2_TRIGGER_ROI to -90.0)
         try { SettingsResolver.resolveStrict("X", global, bad); fail() } catch (_: IllegalArgumentException) {}
-        assertEquals(-60.0, SettingsResolver.resolve("X", global, bad).averagingTriggerRoi, 1e-9)
+        assertEquals(-50.0, SettingsResolver.resolve("X", global, bad).avg2TriggerRoi, 1e-9)
+    }
+
+    @Test fun averagingAllocationsMustAddUpTo100AndTriggersMustBeOrdered() {
+        try { LocalCoinSettings(symbol = "X", avg1AllocationPct = 60.0, avg2AllocationPct = 60.0); fail() } catch (_: IllegalArgumentException) {}
+        try { LocalCoinSettings(symbol = "X", avg1AllocationPct = 0.0, avg2AllocationPct = 100.0); fail() } catch (_: IllegalArgumentException) {}
+        try { LocalCoinSettings(symbol = "X", avg1TriggerRoi = -50.0, avg2TriggerRoi = -25.0); fail() } catch (_: IllegalArgumentException) {}
+        try { LocalCoinSettings(symbol = "X", avg1TriggerRoi = -40.0, avg2TriggerRoi = -40.0); fail() } catch (_: IllegalArgumentException) {}
+        val s = LocalCoinSettings(symbol = "X", avg1AllocationPct = 30.0, avg2AllocationPct = 70.0, avg1TriggerRoi = -20.0, avg2TriggerRoi = -45.0)
+        assertEquals(30.0, s.avg1AllocationPct, 1e-9); assertEquals(70.0, s.avg2AllocationPct, 1e-9)
+    }
+
+    @Test fun anInvalidStoredAveragingPairFallsBackToASafeValidPair() {
+        val s = SettingsResolver.resolve("X", global, mapOf(SettingKeys.AVG1_ALLOCATION to 10.0, SettingKeys.AVG2_ALLOCATION to 10.0))
+        assertEquals(50.0, s.avg1AllocationPct, 1e-9); assertEquals(50.0, s.avg2AllocationPct, 1e-9)
+        val tight = LocalCoinSettings.sanitized("X", stopLossRoi = 20.0) // default -50 is beyond this Stop Loss
+        assertTrue(tight.avg1TriggerRoi > tight.avg2TriggerRoi && tight.avg2TriggerRoi >= -20.0)
+    }
+
+    @Test fun theOldSingleOrderAveragingKeysNoLongerExist() {
+        assertTrue(SettingKeys.ALL.none { it == "averagingMargin" || it == "averagingTriggerRoi" })
+        assertTrue(SettingKeys.ALL.containsAll(listOf(SettingKeys.AVERAGING_ENABLED, SettingKeys.AVG1_ALLOCATION, SettingKeys.AVG1_TRIGGER_ROI, SettingKeys.AVG2_ALLOCATION, SettingKeys.AVG2_TRIGGER_ROI)))
     }
 
     @Test fun directionIsNotASetting() {

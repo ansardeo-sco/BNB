@@ -10,6 +10,7 @@ import com.ansardeo.bnb.demo.exec.DemoExecutionService
 import com.ansardeo.bnb.demo.exec.EntryStatus
 import com.ansardeo.bnb.demo.trade.DemoTradeClient
 import com.ansardeo.bnb.demo.trade.ExchangeRules
+import com.ansardeo.bnb.trading.AveragingMath
 import com.ansardeo.bnb.trading.EntryBook
 import com.ansardeo.bnb.trading.EntryCandidate
 import com.ansardeo.bnb.trading.EntryKind
@@ -36,11 +37,17 @@ import com.ansardeo.bnb.trading.PlaceResult as StrategyPlace
 /** Adapter that lets the approved [EntryPriorityService] see the Demo entries placed by this app. Only app-placed entries are known. */
 class DemoCycleEntryBook(private val svc: DemoExecutionService, private val store: DemoExecStore, private val clock: () -> Long) : EntryBook {
     @Volatile var creds: DemoCredentials? = null
+    /**
+     * While the two Averaging orders of ONE cycle are being submitted together, that cycle's own Averaging orders are not treated as competitors of
+     * each other (Order 2 is deliberately priced better than Order 1 and must not replace it). Every OTHER pending entry still competes normally.
+     */
+    @Volatile var siblingAveragingCycle: String? = null
 
     private fun isPendingEntry(e: DemoEntry) = e.executed.signum() <= 0 && (e.status == EntryStatus.SENDING || e.status == EntryStatus.UNKNOWN || e.status == EntryStatus.NEW)
 
     override suspend fun pending(symbol: String, direction: String): List<PendingEntry> =
         store.all().filter { it.symbol.equals(symbol, true) && it.direction.equals(direction, true) && isPendingEntry(it) }
+            .filter { !(siblingAveragingCycle != null && it.cycleId == siblingAveragingCycle && it.avgSlot > 0) }
             .map { PendingEntry("ENTRY:${it.id}", kindOf(it.kind), it.symbol, it.direction, it.limitPrice.toDoubleOrNull() ?: 0.0, null) }
             .filter { it.price > 0.0 }
 
@@ -89,7 +96,7 @@ sealed class EngineSubmit {
  * [DemoExecutionService] for every order, so Stop Loss placement/verification/fail-safe stay exactly as in Phase 3A.
  *
  *  - Entries: always through [EntryPriorityService] (Global Best Entry Price Priority).
- *  - Averaging: once per cycle, when the cycle Position ROI (on its weighted average entry) reaches the Averaging trigger.
+ *  - Averaging: once per cycle, when the cycle Position ROI reaches Order 1's trigger, TWO LIMIT orders are submitted together; both prices come from the Initial Entry fill price (never the WAP).
  *  - Opposite-Side: ROI trigger + callback trail via [OppositeTrigger], then one opposite entry (its own cycle).
  *  - Profit exit: cycle ROI Trailing Stop via [TrailingStopMath] on the cycle WAP; when it fires ALL open entries of the cycle are closed at market.
  *  - Re-entry: after a Trailing close with positive booked ROI (same side 50 %, opposite 100 % of booked ROI).
@@ -190,16 +197,21 @@ class DemoStrategyEngine(
     fun hasOpenCycles(): Boolean = store.cycles().any { it.status != CycleStatus.CLOSED }
 
     // ------------------------------------------------------------------ entries
-    private suspend fun submitLocked(c: DemoCredentials, symbol: String, direction: String, price: BigDecimal, kind: EntryKind, cycleId: String?, marginOverride: BigDecimal? = null): EngineSubmit {
+    private suspend fun submitLocked(c: DemoCredentials, symbol: String, direction: String, price: BigDecimal, kind: EntryKind, cycleId: String?, marginOverride: BigDecimal? = null, avgSlot: Int = 0): EngineSubmit {
         val s = settingsOf(symbol)
-        val margin = when (kind) { EntryKind.AVERAGING -> s.averagingMargin; EntryKind.OPPOSITE_SIDE -> s.oppositeMargin; else -> marginOverride?.toDouble() ?: s.marginAmount }
+        // Averaging margin is always passed in (a share of the Initial Entry Margin); there is no separate fixed Averaging margin any more.
+        val marginBd: BigDecimal = when (kind) {
+            EntryKind.AVERAGING -> marginOverride ?: return EngineSubmit.NotPlaced("Averaging margin was not provided.")
+            EntryKind.OPPOSITE_SIDE -> BigDecimal.valueOf(s.oppositeMargin)
+            else -> marginOverride ?: BigDecimal.valueOf(s.marginAmount)
+        }
         val cid = cycleId ?: newCycleId()
         if (cycleId == null) store.putCycle(DemoCycle(cid, symbol, direction, s.leverage, kind.name, createdAt = clock(), updatedAt = clock()))
         book.creds = c
         var placed: DemoEntry? = null
-        val candidate = EntryCandidate("NEW:$cid:${kind.name}", kind, symbol, direction, price.toDouble(), null)
+        val candidate = EntryCandidate("NEW:$cid:${kind.name}:$avgSlot", kind, symbol, direction, price.toDouble(), null)
         val outcome = priority.submit(candidate, place = {
-            when (val r = svc.placeEntry(c, DemoExecutionService.EntryRequest(symbol, direction, price, BigDecimal.valueOf(margin), s.leverage, s.stopLossRoi, s.stopLossEnabled, cid, kind.name))) {
+            when (val r = svc.placeEntry(c, DemoExecutionService.EntryRequest(symbol, direction, price, marginBd, s.leverage, s.stopLossRoi, s.stopLossEnabled, cid, kind.name, avgSlot))) {
                 is DemoExecutionService.PlaceResult.Placed -> { placed = r.entry; StrategyPlace.Ok(r.entry) }
                 is DemoExecutionService.PlaceResult.Unknown -> { placed = r.entry; StrategyPlace.Ok(r.entry) } // exists on the exchange or will be resolved by the next refresh
                 is DemoExecutionService.PlaceResult.Refused -> StrategyPlace.Failed(r.reason)
@@ -248,6 +260,12 @@ class DemoStrategyEngine(
             log(cy, "closed: no open entries left (no automatic re-entry for this reason)")
             return
         }
+        if (cy.status == CycleStatus.ACTIVE && live.isEmpty() && pending.any { it.avgSlot > 0 } && es.any { it.avgSlot == 0 && it.executed.signum() > 0 }) {
+            // The Initial Entry was filled and is gone again (its own Stop Loss / manual close) and nothing is open: the unfilled Averaging orders of this cycle must not fire later.
+            for (e in pending.filter { it.avgSlot > 0 }) svc.cancelEntry(c, e.id)
+            log(cy, "no open entry is left: the remaining unfilled Averaging order(s) of this cycle are being cancelled")
+            return
+        }
         if (cy.status == CycleStatus.CLOSING) { continueClosing(c, cy); return }
         if (live.isEmpty()) return // waiting for the entry to fill
         val wap = wapOf(live) ?: return
@@ -276,12 +294,18 @@ class DemoStrategyEngine(
         val roi = RoiMath.positionRoi(side, wap, mark, cy.leverage)
         val lossLimit = RoiMath.triggerLimit(s.stopLossEnabled, s.stopLossRoi)
 
-        // 2) averaging (max one per cycle; the flag is set whatever the outcome, so it can never repeat)
-        val avgTrigger = RoiMath.normalizeLossTrigger(s.averagingTriggerRoi)
-        if (StrategyRules.averagingEligible(s.averagingEnabled, cy.avgDone) && RoiMath.isValidLossTrigger(avgTrigger, lossLimit) && roi <= BigDecimal.valueOf(avgTrigger)) {
-            cy = save(cy.copy(avgDone = true))
-            log(cy, "Averaging trigger reached (ROI ${roi.setScale(2, RoundingMode.HALF_UP)}%): placing one Averaging entry at ${mark.toPlainString()}")
-            report(cy, submitLocked(c, cy.symbol, cy.direction, mark, EntryKind.AVERAGING, cy.id))
+        // 2) Averaging: two LIMIT orders, both priced from the Initial Entry FILL price, submitted together once Order 1's trigger ROI is reached.
+        //    The Initial Entry fill price and margin are saved once (never recomputed from the WAP).
+        if (cy.initFill == null) {
+            val init = live.filter { it.avgSlot == 0 }.minByOrNull { it.createdAt }
+            val fill = init?.average
+            if (init != null && fill != null) cy = save(cy.copy(initFill = fill.toPlainString(), initMargin = AveragingMath.initialMargin(init.executed, fill, cy.leverage).toPlainString()))
+        }
+        val avgCfg = s.averagingConfig
+        if (StrategyRules.averagingEligible(s.averagingEnabled, cy.avgDone) && cy.initFill != null && cy.initMargin != null &&
+            AveragingMath.validate(avgCfg, lossLimit) == null && roi <= BigDecimal.valueOf(avgCfg.order1TriggerRoi)) {
+            cy = save(cy.copy(avgDone = true)) // saved BEFORE anything is sent: the pair can never be submitted twice
+            cy = submitAveraging(c, cy, s, roi)
         }
 
         // 3) opposite-side trigger (ROI trigger + callback trail), then one opposite entry that starts its own cycle
@@ -297,6 +321,28 @@ class DemoStrategyEngine(
                 report(cy, submitLocked(c, cy.symbol, opp, mark, EntryKind.OPPOSITE_SIDE, null))
             }
         }
+    }
+
+    /** Submits Averaging Order 1 and Order 2 together (neither waits for the other). Each slot is flagged as sent before it is sent. */
+    private suspend fun submitAveraging(c: DemoCredentials, cy0: DemoCycle, s: LocalCoinSettings, roi: BigDecimal): DemoCycle {
+        var cy = cy0
+        val side = TrailSide.fromDirection(cy.direction)
+        val fill = BigDecimal(cy.initFill!!); val initMargin = BigDecimal(cy.initMargin!!)
+        val plan = AveragingMath.plan(side, fill, cy.leverage, initMargin, s.averagingConfig)
+        log(cy, "Averaging trigger reached (ROI ${roi.setScale(2, RoundingMode.HALF_UP)}%): submitting BOTH LIMIT orders together, priced from the Initial Entry fill ${fill.toPlainString()} " +
+            plan.joinToString(" | ") { "Order ${it.slot}: ${it.allocationPct.stripTrailingZeros().toPlainString()}% = ${it.margin.setScale(4, RoundingMode.HALF_UP).toPlainString()} USDT, ${it.triggerRoi.stripTrailingZeros().toPlainString()}% ROI @ ${it.rawPrice.setScale(4, RoundingMode.HALF_UP).toPlainString()}" })
+        book.siblingAveragingCycle = cy.id
+        try {
+            for (o in plan) {
+                cy = save(if (o.slot == 1) cy.copy(avg1Sent = true) else cy.copy(avg2Sent = true))
+                val r = submitLocked(c, cy.symbol, cy.direction, o.rawPrice, EntryKind.AVERAGING, cy.id, o.margin, o.slot)
+                log(cy, "Averaging Order ${o.slot}: " + when (r) {
+                    is EngineSubmit.Placed -> "sent (${r.entry.quantity} @ ${r.entry.limitPrice}); active only after Binance Demo confirms"
+                    is EngineSubmit.NotPlaced -> "not placed: ${r.message}"
+                })
+            }
+        } finally { book.siblingAveragingCycle = null }
+        return cy
     }
 
     private suspend fun continueClosing(c: DemoCredentials, cy: DemoCycle) {

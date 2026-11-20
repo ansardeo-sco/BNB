@@ -232,12 +232,13 @@ class MainActivity : AppCompatActivity() {
         stopRefresh()
         val root = pageContainer()
 
-        // 1) WALLET BALANCE (top)
-        val balCard = addCard(root, "WALLET BALANCE - BINANCE DEMO")
+        // 1) ACCOUNT (top): Equity, Wallet Balance, Total Unrealized PNL and Available Balance, all from Binance Demo
+        val balCard = addCard(root, "EQUITY (MARGIN BALANCE) - BINANCE DEMO")
         val balText = priceTv("-- USDT", 26f, green).apply { gravity = Gravity.END; textAlignment = View.TEXT_ALIGNMENT_VIEW_END }
         balCard.addView(balText, LinearLayout.LayoutParams(-1, -2))
         addSpace(balCard, 4)
-        val balSub = text("Loading Binance Demo wallet...", 12f, muted); balCard.addView(balSub)
+        val balSub = text("Loading Binance Demo account...", 12f, muted); balCard.addView(balSub)
+        val balRows = column(); balCard.addView(balRows)
 
         // 2) LIVE MARKET (below)
         val marketCard = addCard(root, "LIVE CRYPTOCURRENCY PRICES (READ-ONLY)")
@@ -284,18 +285,33 @@ class MainActivity : AppCompatActivity() {
         tabViews.forEachIndexed { i, v -> v.setOnClickListener { homeTab = tabNames[i]; renderList() } }
         renderList()
 
+        var walletBusy = false
         fun renderWallet() {
             val creds = DemoCredentialStore.repository(this).load()
-            if (creds == null) { balText.text = "-- USDT"; balSub.text = "Save your Binance Demo keys in More to see the Demo wallet."; return }
+            if (creds == null) { balText.text = "-- USDT"; balRows.removeAllViews(); balSub.text = "Save your Binance Demo keys in More to see the Demo account."; return }
+            if (walletBusy) return
+            walletBusy = true
             lifecycleScope.launch {
-                val r = DemoTradeClient.create().balance(creds)
-                val w = if (r.ok) com.ansardeo.bnb.demo.exec.DemoAccountView.parseWallet(r.body) else null
-                val ents = DemoExecutionProvider.get(this@MainActivity).entries()
-                val positions = ents.count { it.status != EntryStatus.CLOSED && it.status != EntryStatus.CANCELED && it.status != EntryStatus.REJECTED && it.executed.signum() > 0 }
-                val orders = ents.count { it.orderActive }
-                if (w == null) { balSub.text = "Could not read the Binance Demo wallet (${if (r.ok) "unexpected answer" else r.describe()}). Retrying with the next refresh." ; return@launch }
-                balText.text = PriceFormatter.formatUsdt(w.equity.toDouble())
-                balSub.text = "Wallet ${PriceFormatter.formatUsdt(w.walletBalance.toDouble())} | Available ${PriceFormatter.formatUsdt(w.available.toDouble())} | Unrealized ${PriceFormatter.formatPnl(w.unrealized.toDouble())} | Positions: $positions | Open Orders: $orders (from Binance Demo)"
+                try {
+                    val client = DemoTradeClient.create()
+                    val r = client.balance(creds)
+                    val pr = client.positionRiskAll(creds)
+                    val sum = if (r.ok) com.ansardeo.bnb.demo.exec.DemoAccountView.summarize(r.body, if (pr.ok) pr.body else null) else null
+                    val ents = DemoExecutionProvider.get(this@MainActivity).entries()
+                    val orders = ents.count { it.orderActive }
+                    balRows.removeAllViews()
+                    if (sum == null) { balText.text = "-- USDT"; balSub.text = "Could not read the Binance Demo wallet (${if (r.ok) "unexpected answer" else r.describe()}). Retrying with the next refresh."; return@launch }
+                    val eq = sum.equity; val upl = sum.totalUnrealizedPnl
+                    balText.text = if (eq != null) PriceFormatter.formatUsdt(eq.toDouble()) else "-- USDT"
+                    balText.setTextColor(if (eq != null) green else muted)
+                    balSub.text = if (upl != null) "Equity = Wallet Balance + Total Unrealized PNL (all open positions, isolated included). All values come from Binance Demo."
+                        else "Equity and Unrealized PNL are unavailable: positions could not be read (${if (pr.ok) "unexpected answer" else pr.describe()}). Wallet Balance below is correct. Retrying with the next refresh."
+                    addLabel(balRows, "Wallet Balance", PriceFormatter.formatUsdt(sum.walletBalance.toDouble()))
+                    addLabel(balRows, "Equity / Margin Balance", if (eq != null) PriceFormatter.formatUsdt(eq.toDouble()) else "unavailable", if (eq != null) white else yellow)
+                    addLabel(balRows, "Total Unrealized PNL", if (upl != null) PriceFormatter.formatPnl(upl.toDouble()) else "unavailable", if (upl == null) yellow else if (upl.signum() >= 0) green else red)
+                    addLabel(balRows, "Available Balance", PriceFormatter.formatUsdt(sum.availableBalance.toDouble()))
+                    addLabel(balRows, "Open Positions / Orders", "${sum.openPositions?.toString() ?: "--"} / $orders")
+                } finally { walletBusy = false }
             }
         }
 
@@ -317,9 +333,9 @@ class MainActivity : AppCompatActivity() {
                     mStatus.setTextColor(if (ov.stale) yellow else green)
                     mUpdated.text = "Last update: ${ov.lastUpdate ?: "--"} (auto-refresh)"
                     renderList()
-                    renderWallet()
                 }
             }
+            renderWallet() // account data refreshes on every cycle, whether or not the public market data loaded
             val r = Runnable { refreshMarket() }; refreshRunnable = r; mainHandler.postDelayed(r, 15000)
         }
         renderWallet(); refreshMarket()
@@ -456,7 +472,12 @@ class MainActivity : AppCompatActivity() {
             addSummaryRow("Margin", "${PriceFormatter.formatUsdt(margin)} / ${lev}x")
             addSummaryRow("Cycle Stop Loss (ROI)", if (eff.stopLossEnabled) "-${fmtNum(eff.stopLossRoi)}% Position ROI" else "Disabled")
             addSummaryRow("Trailing ROI (activation / callback)", if (eff.trailingEnabled) "${eff.trailingActivationRoi} / ${eff.trailingCallbackRoi}" else "Disabled")
-            addSummaryRow("Averaging trigger ROI", if (eff.averagingEnabled) "${fmtNum(eff.averagingTriggerRoi)}% (margin ${fmtNum(eff.averagingMargin)})" else "Disabled")
+            if (eff.averagingEnabled) {
+                addSummaryRow("Averaging", "2 LIMIT orders · total margin = Initial Entry Margin (${fmtNum(margin)} USDT)")
+                addSummaryRow("Averaging Order 1", "${fmtNum(eff.avg1AllocationPct)}% = ${fmtNum(margin * eff.avg1AllocationPct / 100.0)} USDT | ${fmtNum(eff.avg1TriggerRoi)}% ROI")
+                addSummaryRow("Averaging Order 2", "${fmtNum(eff.avg2AllocationPct)}% = ${fmtNum(margin * eff.avg2AllocationPct / 100.0)} USDT | ${fmtNum(eff.avg2TriggerRoi)}% ROI")
+                addSummaryRow("Averaging price basis / submission", "Initial Entry fill price / both orders together")
+            } else addSummaryRow("Averaging", "Disabled")
             addSummaryRow("Opposite-side trigger ROI / callback", if (eff.oppositeEnabled) "${fmtNum(eff.oppositeTriggerRoi)}% / ${fmtNum(eff.oppositeCallbackRoi)}% (margin ${fmtNum(eff.oppositeMargin)})" else "Disabled")
             addSummaryRow("Re-entry ROI (of booked ROI)", if (eff.reentryEnabled) "50% same / 100% opposite" else "Disabled")
             addSummaryRow("Estimated Qty", if (qty != null) PriceFormatter.formatQty(qty) else "--")
@@ -880,7 +901,7 @@ class MainActivity : AppCompatActivity() {
             val cur = mapOf<String, Any>(
                 SettingKeys.MARGIN to eff.marginAmount, SettingKeys.LEVERAGE to eff.leverage,
                 SettingKeys.TRAILING_ENABLED to eff.trailingEnabled, SettingKeys.TRAILING_ACTIVATION_ROI to eff.trailingActivationRoi, SettingKeys.TRAILING_CALLBACK_ROI to eff.trailingCallbackRoi,
-                SettingKeys.AVERAGING_ENABLED to eff.averagingEnabled, SettingKeys.AVERAGING_MARGIN to eff.averagingMargin, SettingKeys.AVERAGING_TRIGGER_ROI to eff.averagingTriggerRoi,
+                SettingKeys.AVERAGING_ENABLED to eff.averagingEnabled, SettingKeys.AVG1_ALLOCATION to eff.avg1AllocationPct, SettingKeys.AVG1_TRIGGER_ROI to eff.avg1TriggerRoi, SettingKeys.AVG2_ALLOCATION to eff.avg2AllocationPct, SettingKeys.AVG2_TRIGGER_ROI to eff.avg2TriggerRoi,
                 SettingKeys.REENTRY_ENABLED to eff.reentryEnabled,
                 SettingKeys.OPPOSITE_ENABLED to eff.oppositeEnabled, SettingKeys.OPPOSITE_MARGIN to eff.oppositeMargin, SettingKeys.OPPOSITE_TRIGGER_ROI to eff.oppositeTriggerRoi,
                 SettingKeys.OPPOSITE_CALLBACK_ROI to eff.oppositeCallbackRoi,
@@ -1029,12 +1050,22 @@ class MainActivity : AppCompatActivity() {
                 { big, cap -> big.text = "50% / 100%"; cap.text = "Same / Opposite of booked ROI" }
             ) { _ -> }
 
-            tile("Averaging", false, SettingKeys.AVERAGING_ENABLED, listOf(SettingKeys.AVERAGING_ENABLED, SettingKeys.AVERAGING_MARGIN, SettingKeys.AVERAGING_TRIGGER_ROI),
-                "One averaging LIMIT per cycle, priced where Position ROI reaches the trigger (leverage included). Independent of Opposite-Side. Trigger is negative (default -60) and limited by the Stop Loss ROI.",
-                { big, cap -> big.text = "${f(numOf(SettingKeys.AVERAGING_MARGIN))} USDT  |  ${f(numOf(SettingKeys.AVERAGING_TRIGGER_ROI))}%"; cap.text = "Margin  |  Trigger ROI" }
+            tile("Averaging", false, SettingKeys.AVERAGING_ENABLED, listOf(SettingKeys.AVERAGING_ENABLED, SettingKeys.AVG1_ALLOCATION, SettingKeys.AVG1_TRIGGER_ROI, SettingKeys.AVG2_ALLOCATION, SettingKeys.AVG2_TRIGGER_ROI),
+                "Two LIMIT orders. Total Averaging Margin is automatically equal to the ACTUAL Initial Entry Margin of the cycle (a separate allocation of the same size), split by the percentages below. When the cycle's Position ROI reaches Order 1's trigger, BOTH orders are sent together. Both prices are measured from the Initial Entry FILL price (never from the WAP) and never move. Each filled order gets its own Stop Loss. Triggers are negative and limited by the Stop Loss ROI; allocations must add up to 100%. Independent of Opposite-Side.",
+                { big, cap ->
+                    val m = numOf(SettingKeys.MARGIN) ?: 0.0
+                    big.text = "Averaging — 2 LIMIT Orders"
+                    cap.text = "Total = Initial Entry Margin (${f(m)} USDT)\n" +
+                        "Order 1: ${f(numOf(SettingKeys.AVG1_ALLOCATION))}% (${f(m * (numOf(SettingKeys.AVG1_ALLOCATION) ?: 0.0) / 100.0)} USDT) | ${f(numOf(SettingKeys.AVG1_TRIGGER_ROI))}% ROI\n" +
+                        "Order 2: ${f(numOf(SettingKeys.AVG2_ALLOCATION))}% (${f(m * (numOf(SettingKeys.AVG2_ALLOCATION) ?: 0.0) / 100.0)} USDT) | ${f(numOf(SettingKeys.AVG2_TRIGGER_ROI))}% ROI\n" +
+                        "Price Basis: Initial Entry · Submission: Both Orders Together"
+                }
             ) { ed ->
-                num(ed, "Averaging margin (USDT)", SettingKeys.AVERAGING_MARGIN)
-                num(ed, "Averaging Trigger ROI (%) — negative, default -60", SettingKeys.AVERAGING_TRIGGER_ROI, signed = true)
+                ed.addView(text("Total Averaging Margin (USDT): equal to the Initial Entry Margin (automatic, not editable)", 12f, muted)); addSpace(ed, 6)
+                num(ed, "Order 1 — Margin allocation (%) — default 50", SettingKeys.AVG1_ALLOCATION)
+                num(ed, "Order 1 — Trigger ROI (%) — negative, default -25", SettingKeys.AVG1_TRIGGER_ROI, signed = true)
+                num(ed, "Order 2 — Margin allocation (%) — default 50", SettingKeys.AVG2_ALLOCATION)
+                num(ed, "Order 2 — Trigger ROI (%) — negative, default -50", SettingKeys.AVG2_TRIGGER_ROI, signed = true)
             }
 
             tile("Opposite-Side", true, SettingKeys.OPPOSITE_ENABLED, listOf(SettingKeys.OPPOSITE_ENABLED, SettingKeys.OPPOSITE_MARGIN, SettingKeys.OPPOSITE_TRIGGER_ROI, SettingKeys.OPPOSITE_CALLBACK_ROI),
@@ -1049,7 +1080,7 @@ class MainActivity : AppCompatActivity() {
             refreshAll = {
                 tiles.forEach { it.refresh() }
                 val slTxt = if (boolOf(SettingKeys.STOP_LOSS_ENABLED)) "-${f(numOf(SettingKeys.STOP_LOSS_ROI))}%" else "Disabled"
-                derivedTv.text = "Derived at ${levNow()}x: Stop Loss $slTxt | Averaging ${f(numOf(SettingKeys.AVERAGING_TRIGGER_ROI))}% | Opposite ${f(numOf(SettingKeys.OPPOSITE_TRIGGER_ROI))}% | Re-entry ${f(numOf(SettingKeys.TRAILING_ACTIVATION_ROI)?.div(2.0))}%"
+                derivedTv.text = "Derived at ${levNow()}x: Stop Loss $slTxt | Averaging ${f(numOf(SettingKeys.AVG1_TRIGGER_ROI))}% / ${f(numOf(SettingKeys.AVG2_TRIGGER_ROI))}% | Opposite ${f(numOf(SettingKeys.OPPOSITE_TRIGGER_ROI))}% | Re-entry ${f(numOf(SettingKeys.TRAILING_ACTIVATION_ROI)?.div(2.0))}%"
             }
             refreshAll()
             relayout()
@@ -1064,7 +1095,7 @@ class MainActivity : AppCompatActivity() {
                     val v = HashMap<String, Any>()
                     boolControls.forEach { (k, s) -> v[k] = s.isChecked }
                     numControls.forEach { (k, et) -> v[k] = et.text.toString().toDoubleOrNull() ?: throw IllegalArgumentException("Enter a valid number for every field.") }
-                    listOf(SettingKeys.AVERAGING_TRIGGER_ROI, SettingKeys.OPPOSITE_TRIGGER_ROI).forEach { k -> v[k] = RoiMath.normalizeLossTrigger(v[k] as Double) }
+                    listOf(SettingKeys.AVG1_TRIGGER_ROI, SettingKeys.AVG2_TRIGGER_ROI, SettingKeys.OPPOSITE_TRIGGER_ROI).forEach { k -> v[k] = RoiMath.normalizeLossTrigger(v[k] as Double) }
                     v[SettingKeys.STOP_LOSS_ROI] = Math.abs(v[SettingKeys.STOP_LOSS_ROI] as Double)
                     v[SettingKeys.LEVERAGE] = LeverageConfig.requireSupported(LeverageConfig.SUPPORTED_LEVERAGES.getOrElse(levSpin.selectedItemPosition) { 6 })
                     // Strict validation (throws with a readable message) before anything is saved.
@@ -1075,8 +1106,9 @@ class MainActivity : AppCompatActivity() {
                         oppositeTriggerRoi = v[SettingKeys.OPPOSITE_TRIGGER_ROI] as Double,
                         oppositeCallbackRoi = v[SettingKeys.OPPOSITE_CALLBACK_ROI] as Double,
                         stopLossEnabled = v[SettingKeys.STOP_LOSS_ENABLED] as Boolean, stopLossRoi = v[SettingKeys.STOP_LOSS_ROI] as Double,
-                        averagingEnabled = v[SettingKeys.AVERAGING_ENABLED] as Boolean, averagingMargin = v[SettingKeys.AVERAGING_MARGIN] as Double,
-                        averagingTriggerRoi = v[SettingKeys.AVERAGING_TRIGGER_ROI] as Double,
+                        averagingEnabled = v[SettingKeys.AVERAGING_ENABLED] as Boolean,
+                        avg1AllocationPct = v[SettingKeys.AVG1_ALLOCATION] as Double, avg1TriggerRoi = v[SettingKeys.AVG1_TRIGGER_ROI] as Double,
+                        avg2AllocationPct = v[SettingKeys.AVG2_ALLOCATION] as Double, avg2TriggerRoi = v[SettingKeys.AVG2_TRIGGER_ROI] as Double,
                         reentryEnabled = v[SettingKeys.REENTRY_ENABLED] as Boolean,
                         trailingEnabled = v[SettingKeys.TRAILING_ENABLED] as Boolean,
                         trailingActivationRoi = v[SettingKeys.TRAILING_ACTIVATION_ROI] as Double, trailingCallbackRoi = v[SettingKeys.TRAILING_CALLBACK_ROI] as Double,
@@ -1136,8 +1168,8 @@ class MainActivity : AppCompatActivity() {
                     addLabel(box, "Initial Margin", "${fmtNum(eff.marginAmount)} USDT${tag(SettingKeys.MARGIN)}")
                     addLabel(box, "Leverage", "${eff.leverage}x${tag(SettingKeys.LEVERAGE)}")
                     addLabel(box, "Averaging", onOff(eff.averagingEnabled) + tag(SettingKeys.AVERAGING_ENABLED), if (eff.averagingEnabled) green else lockedColor)
-                    addLabel(box, "Averaging Margin", "${fmtNum(eff.averagingMargin)} USDT${tag(SettingKeys.AVERAGING_MARGIN)}")
-                    addLabel(box, "Averaging Trigger ROI", "${fmtNum(eff.averagingTriggerRoi)}%${tag(SettingKeys.AVERAGING_TRIGGER_ROI)}")
+                    addLabel(box, "Averaging Order 1", "${fmtNum(eff.avg1AllocationPct)}% of Initial Margin | ${fmtNum(eff.avg1TriggerRoi)}% ROI${tag(SettingKeys.AVG1_TRIGGER_ROI)}")
+                    addLabel(box, "Averaging Order 2", "${fmtNum(eff.avg2AllocationPct)}% of Initial Margin | ${fmtNum(eff.avg2TriggerRoi)}% ROI${tag(SettingKeys.AVG2_TRIGGER_ROI)}")
                     addLabel(box, "Opposite-Side", onOff(eff.oppositeEnabled) + tag(SettingKeys.OPPOSITE_ENABLED), if (eff.oppositeEnabled) green else lockedColor)
                     addLabel(box, "Opposite-Side Margin", "${fmtNum(eff.oppositeMargin)} USDT${tag(SettingKeys.OPPOSITE_MARGIN)}")
                     addLabel(box, "Opposite-Side Trigger ROI", "${fmtNum(eff.oppositeTriggerRoi)}%${tag(SettingKeys.OPPOSITE_TRIGGER_ROI)}")
@@ -1539,7 +1571,7 @@ class MainActivity : AppCompatActivity() {
 
         fun statusLine(e: DemoEntry): String {
             val sl = when (e.slState) { "VERIFIED" -> "Stop Loss ACTIVE @ ${e.slTrigger} (qty ${e.protectedQty})"; "DONE" -> "Stop Loss triggered/finished"; "LOST" -> "Stop Loss LOST"; else -> "no Stop Loss" }
-            return "${e.symbol} ${e.direction} ${e.quantity} @ ${e.limitPrice} · ${e.status} · filled ${e.executedQty}" + (e.avgPrice?.let { " @ $it" } ?: "") + " · $sl" + (if (e.note.isNotBlank()) " · ${e.note}" else "")
+            return (if (e.avgSlot > 0) "Averaging Order ${e.avgSlot} · " else "") + "${e.symbol} ${e.direction} ${e.quantity} @ ${e.limitPrice} · ${e.status} · filled ${e.executedQty}" + (e.avgPrice?.let { " @ $it" } ?: "") + " · $sl" + (if (e.note.isNotBlank()) " · ${e.note}" else "")
         }
 
         fun refresh() {
@@ -1621,8 +1653,13 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun cycleLine(cy: com.ansardeo.bnb.demo.exec.DemoCycle): String =
-        "${cy.symbol} ${cy.direction} ${cy.leverage}x · ${cy.kind} · ${cy.status}" + (if (cy.avgDone) " · averaged" else "") + (if (cy.oppDone) " · opposite sent" else "") +
+        "${cy.symbol} ${cy.direction} ${cy.leverage}x · ${cy.kind} · ${cy.status}" + (if (cy.avgDone) " · averaging sent (Order 1 ${avgLabel(cy, 1)}, Order 2 ${avgLabel(cy, 2)})" else "") + (if (cy.oppDone) " · opposite sent" else "") +
             (if (cy.trailActive) " · trailing stop ${cy.trailStop?.take(10)}" else "") + (cy.bookedRoi?.let { " · booked ROI $it%" } ?: "") + (if (cy.note.isNotBlank()) " · ${cy.note}" else "")
+
+    private fun avgLabel(cy: com.ansardeo.bnb.demo.exec.DemoCycle, slot: Int): String {
+        val e = com.ansardeo.bnb.demo.exec.DemoExecutionProvider.get(this).entries().lastOrNull { it.cycleId == cy.id && it.avgSlot == slot }
+        return com.ansardeo.bnb.demo.exec.averagingStateOf(e).name
+    }
 
     // ---------------- helpers ----------------
     private fun createDarkSpinnerAdapter(items: List<String>): ArrayAdapter<String> =

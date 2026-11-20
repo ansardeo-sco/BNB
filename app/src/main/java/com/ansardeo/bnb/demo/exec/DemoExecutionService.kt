@@ -38,7 +38,7 @@ class DemoExecutionService(
     private val mutex = Mutex()
     private var counter = 0
 
-    data class EntryRequest(val symbol: String, val direction: String, val limitPrice: BigDecimal, val marginAmount: BigDecimal, val expectedLeverage: Int, val slRoiPercent: Double, val slEnabled: Boolean, val cycleId: String = "", val kind: String = "MANUAL")
+    data class EntryRequest(val symbol: String, val direction: String, val limitPrice: BigDecimal, val marginAmount: BigDecimal, val expectedLeverage: Int, val slRoiPercent: Double, val slEnabled: Boolean, val cycleId: String = "", val kind: String = "MANUAL", val avgSlot: Int = 0)
 
     sealed class PlaceResult {
         data class Placed(val entry: DemoEntry) : PlaceResult()
@@ -315,7 +315,7 @@ class DemoExecutionService(
         prep as OrderPrep.Result.Ok
 
         val id = newId()
-        var e = DemoEntry(id, req.symbol, req.direction, req.expectedLeverage, req.slRoiPercent, prep.priceText, prep.quantityText, status = EntryStatus.SENDING, createdAt = clock(), updatedAt = clock(), cycleId = req.cycleId, kind = req.kind, slOn = req.slEnabled)
+        var e = DemoEntry(id, req.symbol, req.direction, req.expectedLeverage, req.slRoiPercent, prep.priceText, prep.quantityText, status = EntryStatus.SENDING, createdAt = clock(), updatedAt = clock(), cycleId = req.cycleId, kind = req.kind, slOn = req.slEnabled, avgSlot = req.avgSlot)
         save(e)
         ev("$id: sending ${req.direction} LIMIT ${prep.quantityText} @ ${prep.priceText}")
         val r = api.newLimitOrder(c, req.symbol, side, req.direction, prep.quantityText, prep.priceText, id)
