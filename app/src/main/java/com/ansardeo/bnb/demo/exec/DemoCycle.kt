@@ -6,6 +6,9 @@ import java.math.BigDecimal
 
 enum class CycleStatus { ACTIVE, CLOSING, CLOSED }
 
+/** One recorded lifecycle event of a cycle (type: ENTRY_FILLED, AVERAGING_FILLED, SL_PLACED, TRAILING_ACTIVATED, TRAILING_TRIGGERED, OPPOSITE_PLACED, OPPOSITE_TRIGGERED, CLOSED). [at] = when the app recorded it. */
+data class CycleEvent(val type: String, val at: Long, val text: String, val ref: String = "")
+
 /**
  * One strategy cycle on Binance Demo: a first entry (Manual / Opposite-Side / Re-entry) plus up to two Averaging LIMIT entries (both priced from the Initial Entry fill), all in one direction.
  * The cycle owns the app-side ROI Trailing Stop state (on the cycle's weighted average entry price) and the Opposite-Side trigger state.
@@ -39,6 +42,13 @@ data class DemoCycle(
     val trMode: String = "",
     val trAlgoId: Long? = null, val trQty: String = "", val trWap: String = "", val trActivation: String? = null, val trCallback: String? = null, val trFail: Int = 0,
     val bookedRoi: String? = null,
+    /** Position presentation records (Phase 6). [closeReason]: TRAILING_STOP, STOP_LOSS, MANUAL_CLOSE, PANIC_CLOSE or "" (= Unknown, never guessed). */
+    val closeReason: String = "", val closedAt: Long = 0L,
+    /** Opposite cycles: the cycle whose Opposite-Side order opened this position. */
+    val sourceCycleId: String? = null,
+    /** Stored once computed from Binance Demo fills: net realized PNL (after commission), average exit price, commissions. */
+    val resRealized: String? = null, val resExit: String? = null, val resFees: String? = null,
+    val ev: List<CycleEvent> = emptyList(),
     val note: String = "",
     val createdAt: Long = 0L,
     val updatedAt: Long = 0L,
@@ -55,6 +65,8 @@ data class DemoCycle(
         put("avgDone", avgDone); initFill?.let { put("initFill", it) }; initMargin?.let { put("initMargin", it) }; put("avg1Sent", avg1Sent); put("avg2Sent", avg2Sent); put("oppDone", oppDone); oppAlgoId?.let { put("oppAlgoId", it) }; put("oppQty", oppQty); oppActivation?.let { put("oppActivation", it) }; oppCallback?.let { put("oppCallback", it) }; put("oppAdopted", oppAdopted); put("reentryDone", reentryDone)
         closePrice?.let { put("closePrice", it) }; closeWap?.let { put("closeWap", it) }
         put("exitBy", exitBy); put("trMode", trMode); trAlgoId?.let { put("trAlgoId", it) }; put("trQty", trQty); put("trWap", trWap); trActivation?.let { put("trActivation", it) }; trCallback?.let { put("trCallback", it) }; put("trFail", trFail); bookedRoi?.let { put("bookedRoi", it) }
+        put("closeReason", closeReason); put("closedAt", closedAt); sourceCycleId?.let { put("sourceCycleId", it) }; resRealized?.let { put("resRealized", it) }; resExit?.let { put("resExit", it) }; resFees?.let { put("resFees", it) }
+        put("ev", org.json.JSONArray().also { a -> ev.forEach { e -> a.put(JSONObject().put("t", e.type).put("a", e.at).put("x", e.text).put("r", e.ref)) } })
         put("note", note); put("createdAt", createdAt); put("updatedAt", updatedAt)
     }.toString()
 
@@ -70,6 +82,8 @@ data class DemoCycle(
                 avgDone = o.optBoolean("avgDone"), initFill = s("initFill"), initMargin = s("initMargin"), avg1Sent = o.optBoolean("avg1Sent"), avg2Sent = o.optBoolean("avg2Sent"), oppDone = o.optBoolean("oppDone"), oppAlgoId = if (o.has("oppAlgoId")) o.getLong("oppAlgoId") else null, oppQty = o.optString("oppQty", ""), oppActivation = s("oppActivation"), oppCallback = s("oppCallback"), oppAdopted = o.optBoolean("oppAdopted"), reentryDone = o.optBoolean("reentryDone"),
                 closePrice = s("closePrice"), closeWap = s("closeWap"),
                 exitBy = o.optString("exitBy", ""), trMode = o.optString("trMode", ""), trAlgoId = if (o.has("trAlgoId")) o.getLong("trAlgoId") else null, trQty = o.optString("trQty", ""), trWap = o.optString("trWap", ""), trActivation = s("trActivation"), trCallback = s("trCallback"), trFail = o.optInt("trFail", 0), bookedRoi = s("bookedRoi"),
+                closeReason = o.optString("closeReason", ""), closedAt = o.optLong("closedAt", 0L), sourceCycleId = s("sourceCycleId"), resRealized = s("resRealized"), resExit = s("resExit"), resFees = s("resFees"),
+                ev = o.optJSONArray("ev")?.let { a -> (0 until a.length()).mapNotNull { i -> a.optJSONObject(i)?.let { j -> CycleEvent(j.optString("t"), j.optLong("a"), j.optString("x"), j.optString("r")) } } } ?: emptyList(),
                 note = o.optString("note", ""), createdAt = o.optLong("createdAt", 0L), updatedAt = o.optLong("updatedAt", 0L),
             )
         }.getOrNull()

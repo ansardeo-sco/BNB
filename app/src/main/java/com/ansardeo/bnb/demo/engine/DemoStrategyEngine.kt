@@ -2,6 +2,7 @@ package com.ansardeo.bnb.demo.engine
 
 import com.ansardeo.bnb.data.LocalCoinSettings
 import com.ansardeo.bnb.demo.DemoCredentials
+import com.ansardeo.bnb.demo.exec.CycleEvent
 import com.ansardeo.bnb.demo.exec.CycleStatus
 import com.ansardeo.bnb.demo.exec.DemoCycle
 import com.ansardeo.bnb.demo.exec.DemoEntry
@@ -130,7 +131,8 @@ class DemoStrategyEngine(
         for (cy in store.cycles().filter { it.oppAlgoId != null && !it.oppAdopted }) {
             try { adoptOpposite(c, cy) } catch (ce: CancellationException) { throw ce } catch (t: Throwable) { log(cy, "Opposite-Side check failed (${t::class.java.simpleName}); will retry") }
         }
-        for (cy in store.cycles().filter { it.status != CycleStatus.CLOSED }) {
+        for (cy0 in store.cycles().filter { it.status != CycleStatus.CLOSED }) {
+            val cy = recordLifecycle(cy0).also { if (it.ev != cy0.ev) store.putCycle(it) }
             try { manage(c, cy) } catch (ce: CancellationException) { throw ce } catch (t: Throwable) { log(cy, "pass failed (${t::class.java.simpleName}); will retry") }
         }
     }
@@ -156,7 +158,7 @@ class DemoStrategyEngine(
             val es = store.all().filter { it.cycleId == cy.id }
             if (es.any { isPending(it) || isLive(it) }) { log(cy, "panic close: not everything is closed yet; check Binance Demo"); continue }
             cleanupTrailing(c, cy)
-            save(cy.copy(status = CycleStatus.CLOSED, reentryDone = true, note = "Closed by panic close (no re-entry)."))
+            save(cy.copy(status = CycleStatus.CLOSED, reentryDone = true, closeReason = "PANIC_CLOSE", note = "Closed by panic close (no re-entry)."))
             log(cy, "closed by panic close (no re-entry)")
         }
         lines.add(cancelOpposingLocked(c))
@@ -378,9 +380,9 @@ class DemoStrategyEngine(
         }
         val s = settingsOf(cy0.symbol)
         val avg = info.price ?: detail.second ?: mark(cy0.symbol) ?: return
-        val newCy = DemoCycle(newCycleId(), cy0.symbol, oppDir, cy0.leverage, EntryKind.OPPOSITE_SIDE.name, createdAt = clock(), updatedAt = clock())
+        val newCy = DemoCycle(newCycleId(), cy0.symbol, oppDir, cy0.leverage, EntryKind.OPPOSITE_SIDE.name, sourceCycleId = cy0.id, createdAt = clock(), updatedAt = clock())
         store.putCycle(newCy)
-        save(cy0.copy(oppAdopted = true, note = cy0.note.ifBlank { "Opposite-Side order fired; position adopted in cycle ${newCy.id}." }))
+        save(recordEvent(cy0.copy(oppAdopted = true, note = cy0.note.ifBlank { "Opposite-Side order fired; position adopted in cycle ${newCy.id}." }), "OPPOSITE_TRIGGERED", "", "Opposite-Side order triggered; opposite position adopted (cycle ${newCy.id})"))
         log(cy0, "the Binance Opposite-Side order FIRED: adopting the $oppDir position (${ExchangeRules.plain(untracked)} @ ${avg.toPlainString()}) in cycle ${newCy.id} and placing its Stop Loss")
         svc.adoptExchangePosition(c, cy0.symbol, oppDir, cy0.leverage, untracked, avg, s.stopLossRoi, s.stopLossEnabled, newCy.id, EntryKind.OPPOSITE_SIDE.name)
     }
@@ -433,7 +435,7 @@ class DemoStrategyEngine(
         val close = cy0.closePrice?.let { BigDecimal(it) }; val wap = cy0.closeWap?.let { BigDecimal(it) }
         if (close == null || wap == null) { save(cy0.copy(status = CycleStatus.CLOSED, note = "Closed.")); return }
         val booked = ReentryFormula.bookedRoi(side, wap, close, cy0.leverage)
-        var cy = save(cy0.copy(bookedRoi = booked.setScale(4, RoundingMode.HALF_UP).toPlainString(), reentryDone = true, status = CycleStatus.CLOSED, note = "Closed by Trailing Stop."))
+        var cy = save(cy0.copy(bookedRoi = booked.setScale(4, RoundingMode.HALF_UP).toPlainString(), reentryDone = true, status = CycleStatus.CLOSED, closeReason = "TRAILING_STOP", note = "Closed by Trailing Stop."))
         log(cy, "closed by Trailing Stop; booked ROI ${booked.setScale(2, RoundingMode.HALF_UP)}% (WAP ${wap.toPlainString()} -> close ${close.toPlainString()})")
         val s = settingsOf(cy.symbol)
         if (!s.reentryEnabled) { log(cy, "Re-entry is disabled in Settings"); return }
@@ -517,7 +519,55 @@ class DemoStrategyEngine(
         is EngineSubmit.Placed -> log(cy, "entry order sent (${r.entry.kind} ${r.entry.direction} ${r.entry.quantity} @ ${r.entry.limitPrice}); active only after Binance Demo confirms")
         is EngineSubmit.NotPlaced -> log(cy, "entry not placed: ${r.message}")
     }
-    private fun save(cy: DemoCycle): DemoCycle { val n = cy.copy(updatedAt = clock()); store.putCycle(n); return n }
+    private fun save(cy: DemoCycle): DemoCycle {
+        // keep events recorded by an earlier save of the same pass, record newly visible lifecycle events, and stamp the close
+        val prev = store.getCycle(cy.id)?.ev ?: emptyList()
+        var n = cy.copy(ev = prev + cy.ev.filter { e -> prev.none { it.type == e.type && it.ref == e.ref } })
+        n = recordLifecycle(n)
+        if (n.status == CycleStatus.CLOSED && n.closedAt == 0L) {
+            val reason = n.closeReason.ifBlank { if (store.all().any { it.cycleId == n.id && it.slState == "DONE" }) "STOP_LOSS" else "" }
+            n = recordEvent(n.copy(closedAt = clock(), closeReason = reason), "CLOSED", "", "Position closed — " + closeReasonLabel(reason))
+        }
+        n = n.copy(updatedAt = clock()); store.putCycle(n); return n
+    }
+
+    private fun closeReasonLabel(r: String) = when (r) { "TRAILING_STOP" -> "Trailing Stop"; "STOP_LOSS" -> "Stop Loss"; "MANUAL_CLOSE" -> "Manual Close"; "PANIC_CLOSE" -> "Panic Close"; "EMERGENCY_STOP" -> "Emergency Stop"; else -> "reason unknown" }
+
+    private fun recordEvent(cy: DemoCycle, type: String, ref: String, text: String): DemoCycle =
+        if (cy.ev.any { it.type == type && it.ref == ref }) cy else cy.copy(ev = (cy.ev + CycleEvent(type, clock(), text, ref)).takeLast(80))
+
+    /** Records what is visible RIGHT NOW (idempotent). Timestamps are the moment the app first saw the fact; nothing is invented. */
+    private fun recordLifecycle(cy0: DemoCycle): DemoCycle {
+        var cy = cy0
+        val orderOf = store.all().filter { it.cycleId == cy.id }.sortedBy { it.createdAt }
+        for (e in orderOf) {
+            if (e.executed.signum() > 0) {
+                if (e.avgSlot == 0) cy = recordEvent(cy, "ENTRY_FILLED", e.id, (if (cy.kind == EntryKind.OPPOSITE_SIDE.name) "Opposite position opened: " else "Initial entry filled: ") + "${e.executedQty} @ ${e.avgPrice ?: "?"}")
+                else cy = recordEvent(cy, "AVERAGING_FILLED", e.id, "Averaging order ${e.avgSlot} filled: ${e.executedQty} @ ${e.avgPrice ?: "?"}")
+            }
+            if (e.slState == "VERIFIED" || e.slState == "DONE") cy = recordEvent(cy, "SL_PLACED", e.id, "Stop Loss confirmed by Binance @ ${e.slTrigger ?: "?"}")
+        }
+        if (cy.trailActive) cy = recordEvent(cy, "TRAILING_ACTIVATED", "", "Trailing Stop activated")
+        if (cy.exitBy.isNotEmpty()) cy = recordEvent(cy, "TRAILING_TRIGGERED", "", "Trailing Stop triggered (${if (cy.exitBy == "EXCHANGE") "Binance order" else "app-side"})")
+        if (cy.oppAlgoId != null) cy = recordEvent(cy, "OPPOSITE_PLACED", "", "Opposite-Side order placed on Binance (activation ${cy.oppActivation ?: "?"})")
+        return cy
+    }
+
+    /** The cycle a live position belongs to (null = opened outside the app). */
+    fun openCycleFor(symbol: String, direction: String): DemoCycle? = store.cycles().lastOrNull { it.symbol == symbol && it.direction == direction && it.status != CycleStatus.CLOSED }
+
+    /** The user is closing this position by hand: remembers the reason (only if none is recorded yet). */
+    fun noteManualClose(symbol: String, direction: String) {
+        val cy = openCycleFor(symbol, direction) ?: return
+        if (cy.closeReason.isBlank()) store.putCycle(cy.copy(closeReason = "MANUAL_CLOSE"))
+    }
+
+    /** Stores the realized result computed from Binance fills (display data only; no trading logic reads it). */
+    fun recordCycleResult(cycleId: String, realized: String, exit: String?, fees: String) {
+        val cy = store.getCycle(cycleId) ?: return
+        store.putCycle(cy.copy(resRealized = realized, resExit = exit, resFees = fees))
+    }
+    fun cycleById(id: String): DemoCycle? = store.getCycle(id)
     private fun log(cy: DemoCycle, text: String) = store.addEvent(clock(), "CYCLE ${cy.id} ${cy.symbol} ${cy.direction}: $text")
     private fun newCycleId(): String = "cy" + java.lang.Long.toString(clock(), 36) + (counter++ % 100).toString().padStart(2, '0')
 }

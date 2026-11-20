@@ -601,6 +601,41 @@ class DemoStrategyEngineTest {
         assertEquals("no re-entry order after a panic close", limitsBefore, limitPosts().size)
     }
 
+    @Test fun panicCloseRecordsItsReasonTimeAndEvent() {
+        ex.limitFill = "full"; ex.fillPrice = "60000"; submit("LONG", "60000")
+        runBlocking { engine.panicCloseAll(creds) }
+        val cy = store.cycles().single()
+        assertEquals(CycleStatus.CLOSED, cy.status); assertEquals("PANIC_CLOSE", cy.closeReason); assertTrue(cy.closedAt > 0)
+        assertTrue(cy.ev.any { it.type == "CLOSED" && it.text.contains("Panic Close") })
+    }
+
+    @Test fun lifecycleEventsComeFromRealFillsOnly() {
+        settings = settings.copy(averagingEnabled = false, oppositeEnabled = false)
+        ex.limitFill = "full"; ex.fillPrice = "60000"; ex.longAmt = "0.01"; ex.shortAmt = "0"; submit("LONG", "60000"); tick(); tick()
+        val types = store.cycles().single().ev.map { it.type }
+        assertEquals(1, types.count { it == "ENTRY_FILLED" }); assertEquals(1, types.count { it == "SL_PLACED" })
+        assertFalse("AVERAGING_FILLED" in types); assertFalse("TRAILING_TRIGGERED" in types); assertFalse("CLOSED" in types)
+        assertEquals(store.cycles().single(), DemoCycle.fromJson(store.cycles().single().toJson())) // events survive storage
+    }
+
+    @Test fun manualCloseIsRememberedAndAClosedCycleWithoutAReasonStaysUnknown() {
+        settings = settings.copy(averagingEnabled = false, oppositeEnabled = false)
+        ex.limitFill = "full"; ex.fillPrice = "60000"; submit("LONG", "60000")
+        engine.noteManualClose("BTCUSDT", "LONG")
+        assertEquals("MANUAL_CLOSE", store.cycles().single().closeReason)
+        engine.noteManualClose("BTCUSDT", "LONG"); assertEquals("MANUAL_CLOSE", store.cycles().single().closeReason)
+        assertNull(engine.openCycleFor("BTCUSDT", "SHORT"))
+    }
+
+    @Test fun anAdoptedOppositePositionKnowsItsSourceCycle() {
+        oppSetup(); tick()
+        val src = store.cycles().single(); ex.triggerAlgo(src.oppAlgoId!!); ex.shortAmt = "0.0158"; tick()
+        val opp = store.cycles().single { it.kind == "OPPOSITE_SIDE" }
+        assertEquals(src.id, opp.sourceCycleId)
+        assertTrue(store.getCycle(src.id)!!.ev.any { it.type == "OPPOSITE_TRIGGERED" })
+        assertTrue(store.getCycle(src.id)!!.ev.any { it.type == "OPPOSITE_PLACED" })
+    }
+
     // ---------------- Stop Loss OFF / ON (per-entry) ----------------
     @Test fun stopLossOffStillPlacesTheEntryAndNeverCreatesAStopLossOrHalt() {
         settings = settings.copy(stopLossEnabled = false, averagingEnabled = false, oppositeEnabled = false)
