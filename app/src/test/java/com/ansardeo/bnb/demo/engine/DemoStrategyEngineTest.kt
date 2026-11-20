@@ -284,7 +284,7 @@ class DemoStrategyEngineTest {
         val p = oppPosts().single().requestUrl!!
         assertEquals("TRAILING_STOP_MARKET", p.queryParameter("type"))
         assertEquals("MARK_PRICE", p.queryParameter("workingType"))
-        assertEquals("63300", p.queryParameter("activatePrice").let { BigDecimal(it).stripTrailingZeros().toPlainString() }) // 60000 x (1 + 33/600)
+        assertEquals("64000", BigDecimal(p.queryParameter("activatePrice")!!).stripTrailingZeros().toPlainString()) // Opposite default +40 % ROI at 6x; the closing trailing setting (33) is not used
         assertEquals("0.5", p.queryParameter("callbackRate")) // 3 % ROI / 6x
         assertNull(p.queryParameter("reduceOnly")); assertNull(p.queryParameter("closePosition"))
         tick(); tick(); assertEquals(1, oppPosts().size)
@@ -302,7 +302,7 @@ class DemoStrategyEngineTest {
         ex.limitFill = "full"; ex.fillPrice = "60000"; ex.longAmt = "0"; ex.shortAmt = "0.01"
         submit("SHORT", "60000"); tick()
         val p = trailPosts().single { it.requestUrl!!.queryParameter("side") == "BUY" }.requestUrl!!
-        assertEquals("LONG", p.queryParameter("positionSide")); assertEquals("56700", BigDecimal(p.queryParameter("activatePrice")!!).stripTrailingZeros().toPlainString().let { if (it.contains("E")) BigDecimal(it).toPlainString() else it })
+        assertEquals("LONG", p.queryParameter("positionSide")); assertEquals(0, BigDecimal("56000").compareTo(BigDecimal(p.queryParameter("activatePrice")!!)))
     }
 
     @Test fun withoutAPassedOpeningProbeNothingIsPlacedAndThereIsNoSubstitute() {

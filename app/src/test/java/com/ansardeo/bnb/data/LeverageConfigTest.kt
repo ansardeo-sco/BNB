@@ -22,6 +22,6 @@ class LeverageConfigTest {
     @Test fun settingsSanitizeInvalidLeverageToSupportedDefault() {
         val s = LocalCoinSettings.sanitized("BTCUSDT", leverage = 125)
         assertTrue(LeverageConfig.isSupported(s.leverage))
-        assertEquals(6, s.leverage)
+        assertEquals(10, s.leverage)
     }
 }

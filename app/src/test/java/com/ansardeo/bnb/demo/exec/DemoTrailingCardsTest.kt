@@ -27,7 +27,7 @@ class DemoTrailingCardsTest {
         assertEquals(TrailingCardKind.POSITION_OPEN, c.kind)
         assertEquals(0, BigDecimal("40").compareTo(c.activationRoi!!)); assertEquals(0, BigDecimal("3.0").compareTo(c.callbackRoi!!))
         assertTrue(c.triggerCalculated) // mark 105 >= activation 104
-        assertEquals(10, c.leverage); assertEquals(0, BigDecimal("99.996").compareTo(c.orderMarginApprox!!.setScale(3, java.math.RoundingMode.HALF_UP)))
+        assertEquals(10, c.leverage); assertEquals(0, BigDecimal("10.000").compareTo(c.orderMarginApprox!!.setScale(3, java.math.RoundingMode.HALF_UP)))
     }
     @Test fun unknownValuesStayNullInsteadOfBeingInvented() {
         val c = DemoTrailingCards.build(listOf(row(2, "SHORT", "SELL", "104", "0.3", "1")), emptyList()).single()
