@@ -373,7 +373,17 @@ class DemoExecutionService(
     }
 
     // ------------------------------------------------------------------ placing
+    /** Writes a user-level note to the event trail (Emergency Stop, Panic Close ...). Text only; never keys or request data. */
+    fun note(text: String) = ev(text)
+
+    /** An entry that is refused BEFORE anything is sent (coin not ready, halted ...) leaves a reason in the event trail, also in Auto-Trading. Binance rejections are already logged where they happen. */
     private suspend fun place(c: DemoCredentials, req: EntryRequest): PlaceResult {
+        val r = placeCore(c, req)
+        if (r is PlaceResult.Refused && !r.reason.startsWith("Binance rejected")) ev("${req.symbol} ${req.direction}: entry not placed — ${r.reason}")
+        return r
+    }
+
+    private suspend fun placeCore(c: DemoCredentials, req: EntryRequest): PlaceResult {
         store.halt()?.let { return PlaceResult.Refused("Demo trading is halted: $it") }
         if (req.direction != "LONG" && req.direction != "SHORT") return PlaceResult.Refused("Direction must be LONG or SHORT.")
         // Stop Loss OFF is a valid choice: the entry is placed normally, no app-generated Stop Loss follows, and the position stays under Binance liquidation rules.
@@ -391,7 +401,7 @@ class DemoExecutionService(
         if (cfg == null) return PlaceResult.Refused("Margin/leverage could not be read: ${sc.describe()} · Binance answered: ${sc.body.take(160).ifBlank { "(empty)" }}")
         if (!cfg.first.equals("ISOLATED", true)) return PlaceResult.Refused("${req.symbol} is ${cfg.first}, not ISOLATED. Run the Safety Setup first.")
         if (cfg.second != req.expectedLeverage) return PlaceResult.Refused("${req.symbol} leverage on Binance is ${cfg.second}x but Settings say ${req.expectedLeverage}x. Run the Safety Setup first.")
-        val rules = rulesFor(req.symbol) ?: return PlaceResult.Refused("Exchange rules for ${req.symbol} are not available.")
+        val rules = rulesFor(req.symbol) ?: return PlaceResult.Refused("${req.symbol} is not available on Binance Demo (no exchange rules).")
         val mp = api.markPrice(req.symbol)
         val mark = if (mp.ok) runCatching { BigDecimal(JSONObject(mp.body).getString("markPrice")) }.getOrNull() else null
         if (mark == null || mark.signum() <= 0) return PlaceResult.Refused("Mark price unavailable: ${mp.describe()}")

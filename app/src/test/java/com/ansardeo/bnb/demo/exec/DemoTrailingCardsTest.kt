@@ -43,7 +43,7 @@ class DemoTrailingCardsTest {
     }
     @Test fun trailingCardsHaveNoCancelButtonAndNoAppMonitoredLabel() {
         val src = mainSource()
-        val i = src.indexOf("private fun renderTrailingCards"); val j = src.indexOf("/** History > Open")
+        val i = src.indexOf("private fun renderTrailingCards"); val j = src.indexOf("private var eventsFailOnly")
         val block = src.substring(i, j)
         assertFalse(block.contains("addCancelButton")); assertFalse(src.contains("Cancel Trailing Stop")); assertFalse(src.contains("APP MONITORED"))
         assertFalse(block.contains("Highest")); assertFalse(block.contains("Lowest"))

@@ -85,6 +85,11 @@ class DemoTradeClient internal constructor(
         val first = call(Endpoint.EXCHANGE_INFO, listOf("symbol" to symbol), null, slow = true)
         return if (first.error != null && first.error !is DemoHostViolation) call(Endpoint.EXCHANGE_INFO, listOf("symbol" to symbol), null, slow = true) else first
     }
+    /** Same public endpoint without the symbol filter: every symbol listed on Binance Demo (used for the coin search and for tick/step formatting). */
+    suspend fun exchangeInfoAll(): TradeResponse {
+        val first = call(Endpoint.EXCHANGE_INFO, emptyList(), null, slow = true)
+        return if (first.error != null && first.error !is DemoHostViolation) call(Endpoint.EXCHANGE_INFO, emptyList(), null, slow = true) else first
+    }
     suspend fun markPrice(symbol: String) = call(Endpoint.MARK_PRICE, listOf("symbol" to symbol), null)
 
     // ---- account (read-only) ----

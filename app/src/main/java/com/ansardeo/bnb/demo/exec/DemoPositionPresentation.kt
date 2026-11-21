@@ -50,20 +50,21 @@ object TrailingTrigger {
 
 enum class SlLevel { OK, WARN, BAD }
 object SlDisplay {
-    data class Line(val text: String, val level: SlLevel)
+    /** [text] = price + status in ONE line ("0.01314 · ACTIVE, confirmed by Binance"); the Binance order ID is separate ([orderId]) so the screen can show it small on its own line. */
+    data class Line(val text: String, val level: SlLevel, val orderId: String? = null)
     /** Real trigger price plus the Binance order status. "ACTIVE" is only said when Binance listed the order. [liveAlgoIds] null = the Binance list could not be read. */
     fun of(e: DemoEntry, liveAlgoIds: Set<Long>?): Line {
-        val id = e.slAlgoId?.let { " · ID $it" } ?: ""
+        val id = e.slAlgoId?.toString()
         val px = e.slTrigger ?: "?"
         return when {
             !e.slOn -> Line("OFF (disabled in Settings; Binance liquidation rules apply)", SlLevel.WARN)
             e.slState == "VERIFIED" -> when {
-                liveAlgoIds == null -> Line("$px · last confirmed by Binance (list unreadable now)$id", SlLevel.WARN)
-                e.slAlgoId != null && e.slAlgoId in liveAlgoIds -> Line("$px · ACTIVE, confirmed by Binance$id", SlLevel.OK)
-                else -> Line("$px · NOT FOUND on Binance Demo$id", SlLevel.BAD)
+                liveAlgoIds == null -> Line("$px · last confirmed by Binance (list unreadable now)", SlLevel.WARN, id)
+                e.slAlgoId != null && e.slAlgoId in liveAlgoIds -> Line("$px · ACTIVE, confirmed by Binance", SlLevel.OK, id)
+                else -> Line("$px · NOT FOUND on Binance Demo", SlLevel.BAD, id)
             }
-            e.slState == "DONE" -> Line("$px · triggered / finished$id", SlLevel.WARN)
-            e.slState == "LOST" -> Line("$px · no longer active$id", SlLevel.BAD)
+            e.slState == "DONE" -> Line("$px · triggered / finished", SlLevel.WARN, id)
+            e.slState == "LOST" -> Line("$px · no longer active", SlLevel.BAD, id)
             else -> Line("not confirmed by Binance yet", SlLevel.WARN)
         }
     }

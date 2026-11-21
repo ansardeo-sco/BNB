@@ -13,6 +13,8 @@ data class SymbolRules(
     val percentUp: BigDecimal?,
     val percentDown: BigDecimal?,
     val status: String?,
+    val contractType: String? = null,
+    val quoteAsset: String? = null,
 )
 
 /** Exchange filters (tick / step / min notional) and BigDecimal rounding. Pure Kotlin, unit tested. */
@@ -35,10 +37,25 @@ object ExchangeRules {
                     "PERCENT_PRICE" -> { up = f.optString("multiplierUp").takeIf { it.isNotBlank() }?.let { BigDecimal(it) }; down = f.optString("multiplierDown").takeIf { it.isNotBlank() }?.let { BigDecimal(it) } }
                 }
             }
-            if (tick != null && step != null && minQty != null) found = SymbolRules(symbol, tick, step, minQty, minNotional, up, down, s.optString("status").ifBlank { null })
+            if (tick != null && step != null && minQty != null) found = SymbolRules(symbol, tick, step, minQty, minNotional, up, down, s.optString("status").ifBlank { null }, s.optString("contractType").ifBlank { null }, s.optString("quoteAsset").ifBlank { null })
         }
         found
     } catch (e: Exception) { null }
+
+    /** Every symbol of an exchangeInfo answer (Binance Demo without a symbol filter). Null = unreadable body. */
+    fun parseAll(exchangeInfoBody: String): List<SymbolRules>? {
+        val syms = runCatching { JSONObject(exchangeInfoBody).getJSONArray("symbols") }.getOrNull() ?: return null
+        val out = ArrayList<SymbolRules>()
+        for (i in 0 until syms.length()) {
+            val name = syms.optJSONObject(i)?.optString("symbol").orEmpty(); if (name.isBlank()) continue
+            parse("{\"symbols\":[" + syms.getJSONObject(i).toString() + "]}", name)?.let { out += it }
+        }
+        return out
+    }
+
+    /** The coins the app offers: listed on Binance Demo, status TRADING, USDT-quoted perpetual. Sorted, no duplicates. */
+    fun tradable(all: List<SymbolRules>): List<String> =
+        all.filter { it.status == "TRADING" && it.symbol.endsWith("USDT") && (it.quoteAsset == null || it.quoteAsset == "USDT") && (it.contractType == null || it.contractType == "PERPETUAL") }.map { it.symbol }.distinct().sorted()
 
     fun floorToStep(value: BigDecimal, step: BigDecimal): BigDecimal = value.divide(step, 0, RoundingMode.FLOOR).multiply(step)
     fun ceilToStep(value: BigDecimal, step: BigDecimal): BigDecimal = value.divide(step, 0, RoundingMode.CEILING).multiply(step)
