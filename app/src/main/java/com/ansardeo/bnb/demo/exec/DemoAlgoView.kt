@@ -9,7 +9,12 @@ enum class AlgoKind { STOP_LOSS, TRAILING_STOP, OTHER }
 data class AlgoRow(
     val algoId: Long, val symbol: String, val direction: String, val orderType: String, val kind: AlgoKind,
     val triggerPrice: String?, val activationPrice: String?, val callbackRate: String?, val quantity: String, val status: String, val clientAlgoId: String,
-) { val active: Boolean get() = status == "NEW" || status == "WORKING" }
+    /** Binance order side (BUY/SELL); with [direction] it tells a CLOSING order (LONG+SELL, SHORT+BUY) from an OPENING one (LONG+BUY, SHORT+SELL). Blank = not reported. */
+    val side: String = "",
+) {
+    val closesPosition: Boolean get() = (direction == "LONG" && side == "SELL") || (direction == "SHORT" && side == "BUY")
+    val opensPosition: Boolean get() = (direction == "LONG" && side == "BUY") || (direction == "SHORT" && side == "SELL")
+ val active: Boolean get() = status == "NEW" || status == "WORKING" }
 
 /** Pure parsing and classification of /fapi/v1/openAlgoOrders. Stop Loss and Trailing Stop are decided ONLY by the order type Binance reports. */
 object DemoAlgoView {
@@ -30,7 +35,7 @@ object DemoAlgoView {
             val type = o.optString("orderType").ifBlank { o.optString("type") }
             val row = AlgoRow(id, o.optString("symbol"), o.optString("positionSide"), type, classify(type),
                 o.optString("triggerPrice").ifBlank { null }, o.optString("activatePrice").ifBlank { o.optString("activationPrice") }.ifBlank { null },
-                o.optString("callbackRate").ifBlank { null }, o.optString("quantity").ifBlank { o.optString("origQty") }, o.optString("algoStatus"), o.optString("clientAlgoId"))
+                o.optString("callbackRate").ifBlank { null }, o.optString("quantity").ifBlank { o.optString("origQty") }, o.optString("algoStatus"), o.optString("clientAlgoId"), o.optString("side"))
             if (row.active) out += row
         }
         return out

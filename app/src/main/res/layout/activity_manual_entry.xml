@@ -26,7 +26,7 @@
             android:layout_marginTop="6dp"
             android:background="@color/bg_card"
             android:padding="8dp"
-            android:text="LIMIT ENTRY ONLY • simulated stages never submit real orders"
+            android:text="LIMIT ENTRY + exchange Stop Loss • Binance Demo only"
             android:textColor="@color/accent_yellow"
             android:textSize="11sp"
             android:textStyle="bold" />
@@ -136,11 +136,20 @@
 
 
 
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:text="Margin (USDT) — Initial Entry margin"
+            android:textColor="@color/text_muted"
+            android:textSize="12sp"
+            android:textStyle="bold" />
+
         <EditText
             android:id="@+id/etEntryMargin"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="8dp"
+            android:layout_marginTop="4dp"
             android:background="@color/bg_input"
             android:hint="Margin (USDT)"
             android:inputType="numberDecimal"
@@ -188,7 +197,7 @@
                 android:layout_weight="1"
                 android:background="@drawable/bg_btn_long_rounded"
                 android:backgroundTint="@null"
-                android:text="Open Long"
+                android:text="Place LONG Entry"
                 android:textAllCaps="false"
                 android:textColor="@color/text_primary"
                 android:textStyle="bold"
@@ -205,7 +214,7 @@
                 android:layout_weight="1"
                 android:background="@drawable/bg_btn_short_rounded"
                 android:backgroundTint="@null"
-                android:text="Open Short"
+                android:text="Place SHORT Entry"
                 android:textAllCaps="false"
                 android:textColor="@color/text_primary"
                 android:textStyle="bold"

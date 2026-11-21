@@ -1,34 +1,45 @@
 package com.ansardeo.bnb.trading
 
 import java.math.BigDecimal
+import java.math.MathContext
+import java.math.RoundingMode
 
 /**
- * Opposite-Side reversal trigger, expressed in Position ROI exactly like the cycle Trailing Stop.
+ * Opposite-Side trailing order maths. The order itself is a REAL Binance TRAILING_STOP_MARKET conditional order placed when the initial entry fills;
+ * the app only computes its parameters here.
  *
- * - Activation: the SOURCE position's Position ROI reaches -|triggerRoi| (default -50), leverage included:
- *   price = W * (1 -/+ triggerRoi / (100 * L))  (LONG source: below W, SHORT source: above W).
- * - Callback: after activation the trigger trails the adverse extreme (LONG source: lowest price, SHORT source: highest price) and
- *   fires when the price reverses by the callback ROI (default 5), leverage included, NOT a raw 5% price move:
- *   LONG source : trigger = Lo * (1 + callbackRoi / (100 * L)),  fires when price >= trigger
- *   SHORT source: trigger = Hi * (1 - callbackRoi / (100 * L)),  fires when price <= trigger
- *
- * It reuses [TrailingStopMath] with the OPPOSITE side, so there is one verified formula for every ROI-based trigger.
+ * - Activation price: the price at which the SOURCE position reaches +activationRoi Position ROI (default +40), leverage included:
+ *   LONG source: W * (1 + A / (100 L)), SHORT source: W * (1 - A / (100 L)). (The caller rounds it to the tick size.)
+ * - Callback: Binance takes a PRICE percent, so callback ROI is converted: price% = callbackRoi / leverage, rounded to 0.1 (Binance step), never below 0.1.
+ * - Quantity: fixed at placement = oppositeMargin * leverage / activation price (the price it is expected to open at).
+ * - Side: the OPPOSITE of the source (LONG source opens SELL + positionSide SHORT; SHORT source opens BUY + positionSide LONG).
  * Pure Kotlin/JVM (unit tested).
  */
 object OppositeTrigger {
+    private val MC = MathContext(28, RoundingMode.HALF_EVEN)
+    val MIN_CALLBACK_PCT: BigDecimal = BigDecimal("0.1")
+    val MAX_CALLBACK_PCT: BigDecimal = BigDecimal("10.0")
+
     fun oppositeSide(source: TrailSide): TrailSide = if (source == TrailSide.LONG) TrailSide.SHORT else TrailSide.LONG
 
-    /** [triggerRoi] may be given negative (-50) or positive (50); only its magnitude is used. */
-    fun activationPrice(source: TrailSide, wap: BigDecimal, leverage: Int, triggerRoi: BigDecimal): BigDecimal =
-        TrailingStopMath.activationPrice(oppositeSide(source), wap, leverage, triggerRoi.abs())
+    /** Unrounded activation price from the source position's fill/WAP. */
+    fun activationPrice(source: TrailSide, wap: BigDecimal, leverage: Int, activationRoi: BigDecimal): BigDecimal =
+        TrailingStopMath.activationPrice(source, wap, leverage, activationRoi.abs())
 
-    fun step(
-        source: TrailSide,
-        wap: BigDecimal,
-        leverage: Int,
-        triggerRoi: BigDecimal,
-        callbackRoi: BigDecimal,
-        previous: TrailingState,
-        mark: BigDecimal,
-    ): TrailingStep = TrailingStopMath.step(oppositeSide(source), wap, leverage, TrailingConfig(triggerRoi.abs(), callbackRoi), previous, mark)
+    /** Callback ROI -> Binance price percent (1 decimal). Null when the result is outside Binance's accepted range. */
+    fun callbackPricePercent(callbackRoi: BigDecimal, leverage: Int): BigDecimal? {
+        require(leverage > 0) { "Leverage must be greater than 0" }
+        val raw = callbackRoi.abs().divide(BigDecimal(leverage), MC).setScale(1, RoundingMode.HALF_UP)
+        val v = raw.max(MIN_CALLBACK_PCT)
+        return if (v > MAX_CALLBACK_PCT) null else v
+    }
+
+    /** Quantity (unrounded) the opposite order will open: margin * leverage / activation price. */
+    fun quantity(margin: BigDecimal, leverage: Int, activation: BigDecimal): BigDecimal {
+        require(activation.signum() > 0) { "Activation price must be greater than 0" }
+        return margin.multiply(BigDecimal(leverage)).divide(activation, 12, RoundingMode.DOWN)
+    }
+
+    /** The Binance (side, positionSide) of the opening order for a source direction. */
+    fun orderSides(sourceDirection: String): Pair<String, String> = if (sourceDirection == "LONG") "SELL" to "SHORT" else "BUY" to "LONG"
 }

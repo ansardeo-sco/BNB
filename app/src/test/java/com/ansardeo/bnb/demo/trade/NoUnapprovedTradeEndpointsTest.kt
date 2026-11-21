@@ -22,7 +22,10 @@ class NoUnapprovedTradeEndpointsTest {
             if (f.name != "DemoTradeClient.kt") { assertFalse("${f.name}: trailing parameters", t.contains("callbackRate") || t.contains("activatePrice") || t.contains("TRAILING_STOP_MARKET")) }
         }
         val client = code(sources().first { it.name == "DemoTradeClient.kt" })
-        assertEquals(1, Regex("\"type\" to \"TRAILING_STOP_MARKET\"").findAll(client).count())
+        // Phase 5 approval adds exactly ONE separate opening trailing builder (the Opposite-Side order): closing builder + opening builder = 2.
+        assertEquals(2, Regex("\"type\" to \"TRAILING_STOP_MARKET\"").findAll(client).count())
+        assertTrue(client.contains("require((positionSide == \"SHORT\" && side == \"SELL\") || (positionSide == \"LONG\" && side == \"BUY\")) { \"opening side only\" }"))
+        assertEquals(1, Regex("suspend fun newOpeningTrailingAlgo").findAll(client).count())
         assertTrue(client.contains("require((positionSide == \"LONG\" && side == \"SELL\") || (positionSide == \"SHORT\" && side == \"BUY\")) { \"closing side only\" }"))
         // Step 3 approval: margin-type / leverage CHANGES may be requested only by the typed methods of the trade client (and listed in the catalog), nowhere else.
         val settingChange = listOf("/fapi/v1/leverage", "\"marginType\" to", "\"leverage\" to")

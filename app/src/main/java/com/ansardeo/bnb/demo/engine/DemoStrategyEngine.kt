@@ -2,6 +2,7 @@ package com.ansardeo.bnb.demo.engine
 
 import com.ansardeo.bnb.data.LocalCoinSettings
 import com.ansardeo.bnb.demo.DemoCredentials
+import com.ansardeo.bnb.demo.exec.CycleEvent
 import com.ansardeo.bnb.demo.exec.CycleStatus
 import com.ansardeo.bnb.demo.exec.DemoCycle
 import com.ansardeo.bnb.demo.exec.DemoEntry
@@ -10,6 +11,7 @@ import com.ansardeo.bnb.demo.exec.DemoExecutionService
 import com.ansardeo.bnb.demo.exec.EntryStatus
 import com.ansardeo.bnb.demo.trade.DemoTradeClient
 import com.ansardeo.bnb.demo.trade.ExchangeRules
+import com.ansardeo.bnb.trading.AveragingMath
 import com.ansardeo.bnb.trading.EntryBook
 import com.ansardeo.bnb.trading.EntryCandidate
 import com.ansardeo.bnb.trading.EntryKind
@@ -36,11 +38,17 @@ import com.ansardeo.bnb.trading.PlaceResult as StrategyPlace
 /** Adapter that lets the approved [EntryPriorityService] see the Demo entries placed by this app. Only app-placed entries are known. */
 class DemoCycleEntryBook(private val svc: DemoExecutionService, private val store: DemoExecStore, private val clock: () -> Long) : EntryBook {
     @Volatile var creds: DemoCredentials? = null
+    /**
+     * While the two Averaging orders of ONE cycle are being submitted together, that cycle's own Averaging orders are not treated as competitors of
+     * each other (Order 2 is deliberately priced better than Order 1 and must not replace it). Every OTHER pending entry still competes normally.
+     */
+    @Volatile var siblingAveragingCycle: String? = null
 
     private fun isPendingEntry(e: DemoEntry) = e.executed.signum() <= 0 && (e.status == EntryStatus.SENDING || e.status == EntryStatus.UNKNOWN || e.status == EntryStatus.NEW)
 
     override suspend fun pending(symbol: String, direction: String): List<PendingEntry> =
         store.all().filter { it.symbol.equals(symbol, true) && it.direction.equals(direction, true) && isPendingEntry(it) }
+            .filter { !(siblingAveragingCycle != null && it.cycleId == siblingAveragingCycle && it.avgSlot > 0) }
             .map { PendingEntry("ENTRY:${it.id}", kindOf(it.kind), it.symbol, it.direction, it.limitPrice.toDoubleOrNull() ?: 0.0, null) }
             .filter { it.price > 0.0 }
 
@@ -89,8 +97,9 @@ sealed class EngineSubmit {
  * [DemoExecutionService] for every order, so Stop Loss placement/verification/fail-safe stay exactly as in Phase 3A.
  *
  *  - Entries: always through [EntryPriorityService] (Global Best Entry Price Priority).
- *  - Averaging: once per cycle, when the cycle Position ROI (on its weighted average entry) reaches the Averaging trigger.
- *  - Opposite-Side: ROI trigger + callback trail via [OppositeTrigger], then one opposite entry (its own cycle).
+ *  - Averaging: once per cycle, when the cycle Position ROI reaches Order 1's trigger, TWO LIMIT orders are submitted together; both prices come from the Initial Entry fill price (never the WAP).
+ *  - Opposite-Side: ONE real Binance opening Trailing Stop order (opposite side, +40% ROI activation, 3% ROI callback by default) placed right after the initial entry's fill;
+ *    it lives on Binance (works with the app closed), and when it has opened a position the app adopts it as its own cycle with its own Stop Loss.
  *  - Profit exit: cycle ROI Trailing Stop via [TrailingStopMath] on the cycle WAP; when it fires ALL open entries of the cycle are closed at market.
  *  - Re-entry: after a Trailing close with positive booked ROI (same side 50 %, opposite 100 % of booked ROI).
  *  - There is NO cycle-level Stop Loss and NO fixed Take Profit. Each entry keeps its own Stop Loss (placed by the execution service).
@@ -104,6 +113,8 @@ class DemoStrategyEngine(
     private val clock: () -> Long = { System.currentTimeMillis() },
     /** True only after the Demo Trailing Stop probe passed: then the cycle Trailing Stop is placed as an order on Binance Demo (Phase 3C). */
     private val trailingOrderOk: () -> Boolean = { false },
+    /** True only after the Demo OPENING trailing probe passed. Without it the Opposite-Side order is NOT used (no silent fallback to app monitoring). */
+    private val openingTrailingOk: () -> Boolean = { false },
 ) {
     private val mutex = Mutex()
     private val book = DemoCycleEntryBook(svc, store, clock)
@@ -116,7 +127,12 @@ class DemoStrategyEngine(
 
     /** One strategy pass over every open cycle. Never throws (except cancellation); a failure is logged and retried on the next pass. */
     suspend fun tick(c: DemoCredentials) = mutex.withLock {
-        for (cy in store.cycles().filter { it.status != CycleStatus.CLOSED }) {
+        // Opposite-Side orders live on Binance and may fire after their source cycle is closed (or while the app was closed): adopt those first.
+        for (cy in store.cycles().filter { it.oppAlgoId != null && !it.oppAdopted }) {
+            try { adoptOpposite(c, cy) } catch (ce: CancellationException) { throw ce } catch (t: Throwable) { log(cy, "Opposite-Side check failed (${t::class.java.simpleName}); will retry") }
+        }
+        for (cy0 in store.cycles().filter { it.status != CycleStatus.CLOSED }) {
+            val cy = recordLifecycle(cy0).also { if (it.ev != cy0.ev) store.putCycle(it) }
             try { manage(c, cy) } catch (ce: CancellationException) { throw ce } catch (t: Throwable) { log(cy, "pass failed (${t::class.java.simpleName}); will retry") }
         }
     }
@@ -142,11 +158,27 @@ class DemoStrategyEngine(
             val es = store.all().filter { it.cycleId == cy.id }
             if (es.any { isPending(it) || isLive(it) }) { log(cy, "panic close: not everything is closed yet; check Binance Demo"); continue }
             cleanupTrailing(c, cy)
-            save(cy.copy(status = CycleStatus.CLOSED, reentryDone = true, note = "Closed by panic close (no re-entry)."))
+            save(cy.copy(status = CycleStatus.CLOSED, reentryDone = true, closeReason = "PANIC_CLOSE", note = "Closed by panic close (no re-entry)."))
             log(cy, "closed by panic close (no re-entry)")
         }
+        lines.add(cancelOpposingLocked(c))
         val open = store.all().count { isLive(it) || isPending(it) }
         (if (lines.isEmpty()) "No open positions." else lines.joinToString("\n")) + (if (open > 0) "\nStill open/pending: $open — check Binance Demo." else "")
+    }
+
+    /** Emergency stop / Panic close: cancels every Opposite-Side trailing order that is still waiting on Binance Demo. (Turning Auto-Trading OFF alone does NOT.) */
+    suspend fun cancelOpposingOrders(c: DemoCredentials): String = mutex.withLock { cancelOpposingLocked(c) }
+
+    private suspend fun cancelOpposingLocked(c: DemoCredentials): String {
+        val open = store.cycles().filter { it.oppAlgoId != null && !it.oppAdopted }
+        if (open.isEmpty()) return "No Opposite-Side trailing orders waiting."
+        var n = 0
+        for (cy in open) {
+            val st = svc.cancelAlgoOrder(c, cy.oppAlgoId!!)
+            log(cy, "Opposite-Side trailing order cancelled by emergency stop / panic close (status $st)")
+            if (st != null && st != "NEW" && st != "WORKING") { save(cy.copy(oppAdopted = true, note = "Opposite-Side order cancelled by emergency stop / panic close.")); n++ }
+        }
+        return "Opposite-Side trailing orders cancelled: $n of ${open.size}."
     }
 
     /** Fetches the Demo mark price of every symbol that has an open position (public data) so the Positions tab can show the current price. */
@@ -190,16 +222,21 @@ class DemoStrategyEngine(
     fun hasOpenCycles(): Boolean = store.cycles().any { it.status != CycleStatus.CLOSED }
 
     // ------------------------------------------------------------------ entries
-    private suspend fun submitLocked(c: DemoCredentials, symbol: String, direction: String, price: BigDecimal, kind: EntryKind, cycleId: String?, marginOverride: BigDecimal? = null): EngineSubmit {
+    private suspend fun submitLocked(c: DemoCredentials, symbol: String, direction: String, price: BigDecimal, kind: EntryKind, cycleId: String?, marginOverride: BigDecimal? = null, avgSlot: Int = 0): EngineSubmit {
         val s = settingsOf(symbol)
-        val margin = when (kind) { EntryKind.AVERAGING -> s.averagingMargin; EntryKind.OPPOSITE_SIDE -> s.oppositeMargin; else -> marginOverride?.toDouble() ?: s.marginAmount }
+        // Averaging margin is always passed in (a share of the Initial Entry Margin); there is no separate fixed Averaging margin any more.
+        val marginBd: BigDecimal = when (kind) {
+            EntryKind.AVERAGING -> marginOverride ?: return EngineSubmit.NotPlaced("Averaging margin was not provided.")
+            EntryKind.OPPOSITE_SIDE -> BigDecimal.valueOf(s.oppositeMargin)
+            else -> marginOverride ?: BigDecimal.valueOf(s.marginAmount)
+        }
         val cid = cycleId ?: newCycleId()
         if (cycleId == null) store.putCycle(DemoCycle(cid, symbol, direction, s.leverage, kind.name, createdAt = clock(), updatedAt = clock()))
         book.creds = c
         var placed: DemoEntry? = null
-        val candidate = EntryCandidate("NEW:$cid:${kind.name}", kind, symbol, direction, price.toDouble(), null)
+        val candidate = EntryCandidate("NEW:$cid:${kind.name}:$avgSlot", kind, symbol, direction, price.toDouble(), null)
         val outcome = priority.submit(candidate, place = {
-            when (val r = svc.placeEntry(c, DemoExecutionService.EntryRequest(symbol, direction, price, BigDecimal.valueOf(margin), s.leverage, s.stopLossRoi, s.stopLossEnabled, cid, kind.name))) {
+            when (val r = svc.placeEntry(c, DemoExecutionService.EntryRequest(symbol, direction, price, marginBd, s.leverage, s.stopLossRoi, s.stopLossEnabled, cid, kind.name, avgSlot))) {
                 is DemoExecutionService.PlaceResult.Placed -> { placed = r.entry; StrategyPlace.Ok(r.entry) }
                 is DemoExecutionService.PlaceResult.Unknown -> { placed = r.entry; StrategyPlace.Ok(r.entry) } // exists on the exchange or will be resolved by the next refresh
                 is DemoExecutionService.PlaceResult.Refused -> StrategyPlace.Failed(r.reason)
@@ -248,6 +285,12 @@ class DemoStrategyEngine(
             log(cy, "closed: no open entries left (no automatic re-entry for this reason)")
             return
         }
+        if (cy.status == CycleStatus.ACTIVE && live.isEmpty() && pending.any { it.avgSlot > 0 } && es.any { it.avgSlot == 0 && it.executed.signum() > 0 }) {
+            // The Initial Entry was filled and is gone again (its own Stop Loss / manual close) and nothing is open: the unfilled Averaging orders of this cycle must not fire later.
+            for (e in pending.filter { it.avgSlot > 0 }) svc.cancelEntry(c, e.id)
+            log(cy, "no open entry is left: the remaining unfilled Averaging order(s) of this cycle are being cancelled")
+            return
+        }
         if (cy.status == CycleStatus.CLOSING) { continueClosing(c, cy); return }
         if (live.isEmpty()) return // waiting for the entry to fill
         val wap = wapOf(live) ?: return
@@ -276,27 +319,94 @@ class DemoStrategyEngine(
         val roi = RoiMath.positionRoi(side, wap, mark, cy.leverage)
         val lossLimit = RoiMath.triggerLimit(s.stopLossEnabled, s.stopLossRoi)
 
-        // 2) averaging (max one per cycle; the flag is set whatever the outcome, so it can never repeat)
-        val avgTrigger = RoiMath.normalizeLossTrigger(s.averagingTriggerRoi)
-        if (StrategyRules.averagingEligible(s.averagingEnabled, cy.avgDone) && RoiMath.isValidLossTrigger(avgTrigger, lossLimit) && roi <= BigDecimal.valueOf(avgTrigger)) {
-            cy = save(cy.copy(avgDone = true))
-            log(cy, "Averaging trigger reached (ROI ${roi.setScale(2, RoundingMode.HALF_UP)}%): placing one Averaging entry at ${mark.toPlainString()}")
-            report(cy, submitLocked(c, cy.symbol, cy.direction, mark, EntryKind.AVERAGING, cy.id))
+        // 2) Averaging: two LIMIT orders, both priced from the Initial Entry FILL price, submitted together once Order 1's trigger ROI is reached.
+        //    The Initial Entry fill price and margin are saved once (never recomputed from the WAP).
+        if (cy.initFill == null) {
+            val init = live.filter { it.avgSlot == 0 }.minByOrNull { it.createdAt }
+            val fill = init?.average
+            if (init != null && fill != null) cy = save(cy.copy(initFill = fill.toPlainString(), initMargin = AveragingMath.initialMargin(init.executed, fill, cy.leverage).toPlainString()))
         }
+        // 1b) Opposite-Side: ONE real Binance opening Trailing Stop order, once per cycle, right after the initial entry is filled AND protected by its own Stop Loss.
+        //     Never re-placed afterwards (not after Averaging either). Cycles that were themselves opened by an Opposite-Side order do not place another one.
+        if (cy.kind != EntryKind.OPPOSITE_SIDE.name && StrategyRules.oppositeEligible(s.oppositeEnabled, cy.oppDone, true) && cy.initFill != null) {
+            val init = live.filter { it.avgSlot == 0 }.minByOrNull { it.createdAt }
+            if (init != null && (init.slState == "VERIFIED" || !init.slOn)) cy = placeOpposite(c, cy, s)
+        }
+        val avgCfg = s.averagingConfig
+        if (StrategyRules.averagingEligible(s.averagingEnabled, cy.avgDone) && cy.initFill != null && cy.initMargin != null &&
+            AveragingMath.validate(avgCfg, lossLimit) == null && roi <= BigDecimal.valueOf(avgCfg.order1TriggerRoi)) {
+            cy = save(cy.copy(avgDone = true)) // saved BEFORE anything is sent: the pair can never be submitted twice
+            cy = submitAveraging(c, cy, s, roi)
+        }
+    }
 
-        // 3) opposite-side trigger (ROI trigger + callback trail), then one opposite entry that starts its own cycle
-        val oppTrigger = RoiMath.normalizeLossTrigger(s.oppositeTriggerRoi)
-        if (StrategyRules.oppositeEligible(s.oppositeEnabled, cy.oppDone, true) && RoiMath.isValidLossTrigger(oppTrigger, lossLimit) && s.oppositeCallbackRoi > 0.0) {
-            val st = OppositeTrigger.step(side, wap, cy.leverage, TrailingStopMath.bd(oppTrigger), TrailingStopMath.bd(s.oppositeCallbackRoi), cy.oppState(), mark)
-            cy = save(cy.withOpp(st.state))
-            if (st.justActivated) log(cy, "Opposite-Side trigger armed at ${mark.toPlainString()}")
-            if (st.exitTriggered) {
-                cy = save(cy.copy(oppDone = true))
-                val opp = OppositeTrigger.oppositeSide(side).name
-                log(cy, "Opposite-Side trigger fired: placing one $opp entry at ${mark.toPlainString()}")
-                report(cy, submitLocked(c, cy.symbol, opp, mark, EntryKind.OPPOSITE_SIDE, null))
+    /** Places the Opposite-Side order (attempted ONCE per cycle: the flag is saved first, so a repeated pass can never send a second one). */
+    private suspend fun placeOpposite(c: DemoCredentials, cy0: DemoCycle, s: LocalCoinSettings): DemoCycle {
+        var cy = save(cy0.copy(oppDone = true))
+        if (!openingTrailingOk()) { log(cy, "Opposite-Side order NOT placed: the Binance Demo opening Trailing Stop probe has not passed (More tab). Opposite-Side is not used; there is no app-side substitute."); return cy }
+        val fill = BigDecimal(cy.initFill!!)
+        val (oppSide, oppPos) = OppositeTrigger.orderSides(cy.direction)
+        when (val r = svc.placeOpposingTrailingOrder(c, cy.symbol, cy.direction, cy.leverage, BigDecimal.valueOf(s.oppositeMargin), fill,
+            TrailingStopMath.bd(s.oppositeActivationRoi), TrailingStopMath.bd(s.oppositeCallbackRoi), cy.id)) {
+            is DemoExecutionService.OpposingResult.Placed -> {
+                cy = save(cy.copy(oppAlgoId = r.order.algoId, oppQty = r.order.quantity, oppActivation = r.order.activation, oppCallback = r.order.callback))
+                log(cy, "Opposite-Side order is ACTIVE on Binance Demo (confirmed): $oppSide/$oppPos qty ${r.order.quantity}, activation ${r.order.activation} (+${s.oppositeActivationRoi.toBigDecimal().stripTrailingZeros().toPlainString()}% ROI of the source), callback ${r.order.callback}% price (= ${s.oppositeCallbackRoi.toBigDecimal().stripTrailingZeros().toPlainString()}% ROI at ${cy.leverage}x). It stays on Binance even if this position closes first; when it fires it opens as a MARKET order.")
             }
+            is DemoExecutionService.OpposingResult.Refused -> log(cy, "Opposite-Side order NOT placed: ${r.reason}")
         }
+        return cy
+    }
+
+    /**
+     * Follows the Opposite-Side order on Binance. When it fired, the position Binance opened is adopted: it gets its own cycle (kind OPPOSITE_SIDE) and its own
+     * Stop Loss at once (fail-safe close + halt only if that Stop Loss cannot be placed). Runs for closed source cycles too.
+     */
+    private suspend fun adoptOpposite(c: DemoCredentials, cy0: DemoCycle) {
+        val id = cy0.oppAlgoId ?: return
+        val info = svc.algoInfo(c, id)
+        val st = info.status ?: return // unreadable: retried by the next pass
+        when (st) {
+            "NEW", "WORKING" -> return
+            "TRIGGERING", "TRIGGERED", "FINISHED" -> Unit
+            else -> { save(cy0.copy(oppAdopted = true, note = cy0.note.ifBlank { "Opposite-Side order ended without opening a position ($st)." })); log(cy0, "the Binance Opposite-Side order ended with status $st (no position opened by it)"); return }
+        }
+        val oppDir = if (cy0.direction == "LONG") "SHORT" else "LONG"
+        val detail = svc.exchangePositionDetail(c, cy0.symbol, oppDir) ?: return
+        val tracked = store.all().filter { it.symbol == cy0.symbol && it.direction == oppDir && isLive(it) }.fold(BigDecimal.ZERO) { a, e -> a.add(liveQty(e)) }
+        val untracked = detail.first.subtract(tracked)
+        if (untracked.signum() <= 0) {
+            if (st == "FINISHED") { save(cy0.copy(oppAdopted = true)); log(cy0, "the Binance Opposite-Side order finished but no untracked $oppDir position was found (already closed, or already tracked)") }
+            return // TRIGGERING/TRIGGERED: the position may not be visible yet
+        }
+        val s = settingsOf(cy0.symbol)
+        val avg = info.price ?: detail.second ?: mark(cy0.symbol) ?: return
+        val newCy = DemoCycle(newCycleId(), cy0.symbol, oppDir, cy0.leverage, EntryKind.OPPOSITE_SIDE.name, sourceCycleId = cy0.id, createdAt = clock(), updatedAt = clock())
+        store.putCycle(newCy)
+        save(recordEvent(cy0.copy(oppAdopted = true, note = cy0.note.ifBlank { "Opposite-Side order fired; position adopted in cycle ${newCy.id}." }), "OPPOSITE_TRIGGERED", "", "Opposite-Side order triggered; opposite position adopted (cycle ${newCy.id})"))
+        log(cy0, "the Binance Opposite-Side order FIRED: adopting the $oppDir position (${ExchangeRules.plain(untracked)} @ ${avg.toPlainString()}) in cycle ${newCy.id} and placing its Stop Loss")
+        svc.adoptExchangePosition(c, cy0.symbol, oppDir, cy0.leverage, untracked, avg, s.stopLossRoi, s.stopLossEnabled, newCy.id, EntryKind.OPPOSITE_SIDE.name)
+    }
+
+    /** Submits Averaging Order 1 and Order 2 together (neither waits for the other). Each slot is flagged as sent before it is sent. */
+    private suspend fun submitAveraging(c: DemoCredentials, cy0: DemoCycle, s: LocalCoinSettings, roi: BigDecimal): DemoCycle {
+        var cy = cy0
+        val side = TrailSide.fromDirection(cy.direction)
+        val fill = BigDecimal(cy.initFill!!); val initMargin = BigDecimal(cy.initMargin!!)
+        val plan = AveragingMath.plan(side, fill, cy.leverage, initMargin, s.averagingConfig)
+        log(cy, "Averaging trigger reached (ROI ${roi.setScale(2, RoundingMode.HALF_UP)}%): submitting BOTH LIMIT orders together, priced from the Initial Entry fill ${fill.toPlainString()} " +
+            plan.joinToString(" | ") { "Order ${it.slot}: ${it.allocationPct.stripTrailingZeros().toPlainString()}% = ${it.margin.setScale(4, RoundingMode.HALF_UP).toPlainString()} USDT, ${it.triggerRoi.stripTrailingZeros().toPlainString()}% ROI @ ${it.rawPrice.setScale(4, RoundingMode.HALF_UP).toPlainString()}" })
+        book.siblingAveragingCycle = cy.id
+        try {
+            for (o in plan) {
+                cy = save(if (o.slot == 1) cy.copy(avg1Sent = true) else cy.copy(avg2Sent = true))
+                val r = submitLocked(c, cy.symbol, cy.direction, o.rawPrice, EntryKind.AVERAGING, cy.id, o.margin, o.slot)
+                log(cy, "Averaging Order ${o.slot}: " + when (r) {
+                    is EngineSubmit.Placed -> "sent (${r.entry.quantity} @ ${r.entry.limitPrice}); active only after Binance Demo confirms"
+                    is EngineSubmit.NotPlaced -> "not placed: ${r.message}"
+                })
+            }
+        } finally { book.siblingAveragingCycle = null }
+        return cy
     }
 
     private suspend fun continueClosing(c: DemoCredentials, cy: DemoCycle) {
@@ -325,7 +435,7 @@ class DemoStrategyEngine(
         val close = cy0.closePrice?.let { BigDecimal(it) }; val wap = cy0.closeWap?.let { BigDecimal(it) }
         if (close == null || wap == null) { save(cy0.copy(status = CycleStatus.CLOSED, note = "Closed.")); return }
         val booked = ReentryFormula.bookedRoi(side, wap, close, cy0.leverage)
-        var cy = save(cy0.copy(bookedRoi = booked.setScale(4, RoundingMode.HALF_UP).toPlainString(), reentryDone = true, status = CycleStatus.CLOSED, note = "Closed by Trailing Stop."))
+        var cy = save(cy0.copy(bookedRoi = booked.setScale(4, RoundingMode.HALF_UP).toPlainString(), reentryDone = true, status = CycleStatus.CLOSED, closeReason = "TRAILING_EXIT", note = "Closed by Trailing Stop."))
         log(cy, "closed by Trailing Stop; booked ROI ${booked.setScale(2, RoundingMode.HALF_UP)}% (WAP ${wap.toPlainString()} -> close ${close.toPlainString()})")
         val s = settingsOf(cy.symbol)
         if (!s.reentryEnabled) { log(cy, "Re-entry is disabled in Settings"); return }
@@ -409,7 +519,55 @@ class DemoStrategyEngine(
         is EngineSubmit.Placed -> log(cy, "entry order sent (${r.entry.kind} ${r.entry.direction} ${r.entry.quantity} @ ${r.entry.limitPrice}); active only after Binance Demo confirms")
         is EngineSubmit.NotPlaced -> log(cy, "entry not placed: ${r.message}")
     }
-    private fun save(cy: DemoCycle): DemoCycle { val n = cy.copy(updatedAt = clock()); store.putCycle(n); return n }
+    private fun save(cy: DemoCycle): DemoCycle {
+        // keep events recorded by an earlier save of the same pass, record newly visible lifecycle events, and stamp the close
+        val prev = store.getCycle(cy.id)?.ev ?: emptyList()
+        var n = cy.copy(ev = prev + cy.ev.filter { e -> prev.none { it.type == e.type && it.ref == e.ref } })
+        n = recordLifecycle(n)
+        if (n.status == CycleStatus.CLOSED && n.closedAt == 0L) {
+            val reason = n.closeReason.ifBlank { if (store.all().any { it.cycleId == n.id && it.slState == "DONE" }) "STOP_LOSS" else "" }
+            n = recordEvent(n.copy(closedAt = clock(), closeReason = reason), "CLOSED", "", "Position closed — " + closeReasonLabel(reason))
+        }
+        n = n.copy(updatedAt = clock()); store.putCycle(n); return n
+    }
+
+    private fun closeReasonLabel(r: String) = when (r) { "TRAILING_EXIT" -> "Trailing Stop"; "STOP_LOSS" -> "Stop Loss"; "MANUAL_CLOSE" -> "Manual Close"; "PANIC_CLOSE" -> "Panic Close"; "EMERGENCY_STOP" -> "Emergency Stop"; else -> "reason unknown" }
+
+    private fun recordEvent(cy: DemoCycle, type: String, ref: String, text: String): DemoCycle =
+        if (cy.ev.any { it.type == type && it.ref == ref }) cy else cy.copy(ev = (cy.ev + CycleEvent(type, clock(), text, ref)).takeLast(80))
+
+    /** Records what is visible RIGHT NOW (idempotent). Timestamps are the moment the app first saw the fact; nothing is invented. */
+    private fun recordLifecycle(cy0: DemoCycle): DemoCycle {
+        var cy = cy0
+        val orderOf = store.all().filter { it.cycleId == cy.id }.sortedBy { it.createdAt }
+        for (e in orderOf) {
+            if (e.executed.signum() > 0) {
+                if (e.avgSlot == 0) cy = recordEvent(cy, "ENTRY_FILLED", e.id, (if (cy.kind == EntryKind.OPPOSITE_SIDE.name) "Opposite position opened: " else "Initial entry filled: ") + "${e.executedQty} @ ${e.avgPrice ?: "?"}")
+                else cy = recordEvent(cy, "AVERAGING_FILLED", e.id, "Averaging order ${e.avgSlot} filled: ${e.executedQty} @ ${e.avgPrice ?: "?"}")
+            }
+            if (e.slState == "VERIFIED" || e.slState == "DONE") cy = recordEvent(cy, "SL_PLACED", e.id, "Stop Loss confirmed by Binance @ ${e.slTrigger ?: "?"}")
+        }
+        if (cy.trailActive) cy = recordEvent(cy, "TRAILING_ACTIVATED", "", "Trailing Stop activated")
+        if (cy.exitBy.isNotEmpty()) cy = recordEvent(cy, "TRAILING_TRIGGERED", "", "Trailing Stop triggered (${if (cy.exitBy == "EXCHANGE") "Binance order" else "app-side"})")
+        if (cy.oppAlgoId != null) cy = recordEvent(cy, "OPPOSITE_PLACED", "", "Opposite-Side order placed on Binance (activation ${cy.oppActivation ?: "?"})")
+        return cy
+    }
+
+    /** The cycle a live position belongs to (null = opened outside the app). */
+    fun openCycleFor(symbol: String, direction: String): DemoCycle? = store.cycles().lastOrNull { it.symbol == symbol && it.direction == direction && it.status != CycleStatus.CLOSED }
+
+    /** The user is closing this position by hand: remembers the reason (only if none is recorded yet). */
+    fun noteManualClose(symbol: String, direction: String) {
+        val cy = openCycleFor(symbol, direction) ?: return
+        if (cy.closeReason.isBlank()) store.putCycle(cy.copy(closeReason = "MANUAL_CLOSE"))
+    }
+
+    /** Stores the realized result computed from Binance fills (display data only; no trading logic reads it). */
+    fun recordCycleResult(cycleId: String, realized: String, exit: String?, fees: String) {
+        val cy = store.getCycle(cycleId) ?: return
+        store.putCycle(cy.copy(resRealized = realized, resExit = exit, resFees = fees))
+    }
+    fun cycleById(id: String): DemoCycle? = store.getCycle(id)
     private fun log(cy: DemoCycle, text: String) = store.addEvent(clock(), "CYCLE ${cy.id} ${cy.symbol} ${cy.direction}: $text")
     private fun newCycleId(): String = "cy" + java.lang.Long.toString(clock(), 36) + (counter++ % 100).toString().padStart(2, '0')
 }

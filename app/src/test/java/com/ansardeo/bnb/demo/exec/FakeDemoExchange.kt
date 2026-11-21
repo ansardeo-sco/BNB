@@ -79,7 +79,10 @@ class FakeDemoExchange {
                         MockResponse().setBody("""{"algoId":${a.id},"algoStatus":"$st"}""")
                     } ?: err(-2013, "no algo")
                     path == "/fapi/v1/algoOrder" && m == "DELETE" -> algos[p("algoId")!!.toLong()]?.let { it.status = "CANCELED"; MockResponse().setBody("""{"algoId":${it.id},"algoStatus":"CANCELED"}""") } ?: err(-2011, "Unknown")
-                    path == "/fapi/v1/openAlgoOrders" -> MockResponse().setBody(algos.values.filter { it.status == "NEW" }.joinToString(",", "[", "]") { """{"algoId":${it.id},"clientAlgoId":"${it.cid}","algoStatus":"NEW"}""" })
+                    path == "/fapi/v1/openAlgoOrders" -> MockResponse().setBody(algos.values.filter { it.status == "NEW" }.joinToString(",", "[", "]") {
+                        """{"algoId":${it.id},"clientAlgoId":"${it.cid}","algoStatus":"NEW","symbol":"BTCUSDT","side":"${it.params["side"] ?: ""}","positionSide":"${it.params["positionSide"] ?: ""}","orderType":"${it.params["type"] ?: ""}","activatePrice":"${it.params["activatePrice"] ?: ""}","callbackRate":"${it.params["callbackRate"] ?: ""}","quantity":"${it.params["quantity"] ?: ""}"}""" })
+                    path == "/fapi/v1/openOrders" -> MockResponse().setBody(orders.values.filter { it.status == "NEW" || it.status == "PARTIALLY_FILLED" }.joinToString(",", "[", "]") {
+                        """{"orderId":${it.id},"symbol":"BTCUSDT","side":"${it.side}","positionSide":"${it.positionSide ?: ""}","type":"${it.type}","price":"${it.price}","origQty":"${it.origQty}","executedQty":"${it.execQty}","status":"${it.status}"}""" })
                     else -> MockResponse().setResponseCode(404)
                 }
             }
@@ -87,6 +90,8 @@ class FakeDemoExchange {
         server.start(); return this
     }
     fun fill(orderId: Long, price: String) { orders[orderId]!!.let { it.status = "FILLED"; it.execQty = it.origQty; it.avg = price } }
+    /** Simulates Binance firing a conditional order: it leaves the open list with [status] and, for an opening order, the position appears. */
+    fun triggerAlgo(id: Long, status: String = "FINISHED") { algos[id]!!.status = status }
     fun posts(path: String) = synchronized(requests) { requests.filter { it.method == "POST" && it.requestUrl!!.encodedPath == path } }
     fun requests(method: String, path: String) = synchronized(requests) { requests.filter { it.method == method && it.requestUrl!!.encodedPath == path } }
     fun shutdown() = server.shutdown()

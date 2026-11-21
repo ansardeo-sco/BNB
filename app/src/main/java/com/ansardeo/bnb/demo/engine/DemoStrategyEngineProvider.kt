@@ -10,6 +10,6 @@ object DemoStrategyEngineProvider {
     @Volatile private var instance: DemoStrategyEngine? = null
     fun get(context: Context): DemoStrategyEngine = instance ?: synchronized(this) {
         val app = context.applicationContext
-        instance ?: DemoStrategyEngine(DemoTradeClient.create(), DemoExecutionProvider.get(app), DemoExecutionProvider.store(app), settingsOf = { symbol -> LocalCoinSettingsStore.load(app, symbol) }, trailingOrderOk = { com.ansardeo.bnb.demo.trade.DemoTrailingProbeStore.supported(app) }).also { instance = it }
+        instance ?: DemoStrategyEngine(DemoTradeClient.create(), DemoExecutionProvider.get(app), DemoExecutionProvider.store(app), settingsOf = { symbol -> LocalCoinSettingsStore.load(app, symbol) }, trailingOrderOk = { com.ansardeo.bnb.demo.trade.DemoTrailingProbeStore.supported(app) }, openingTrailingOk = { com.ansardeo.bnb.demo.trade.DemoOpeningTrailingProbeStore.supported(app) }).also { instance = it }
     }
 }

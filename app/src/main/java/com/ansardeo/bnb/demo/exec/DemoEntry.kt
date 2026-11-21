@@ -1,5 +1,6 @@
 package com.ansardeo.bnb.demo.exec
 
+import com.ansardeo.bnb.trading.AveragingOrderState
 import org.json.JSONObject
 import java.math.BigDecimal
 
@@ -35,6 +36,8 @@ data class DemoEntry(
     val kind: String = "MANUAL",
     /** Individual Stop Loss switch captured at placement. OFF = no app-generated Stop Loss (the position is left to Binance liquidation rules). */
     val slOn: Boolean = true,
+    /** Averaging order slot: 0 = not an Averaging order, 1 = Averaging Order 1, 2 = Averaging Order 2. */
+    val avgSlot: Int = 0,
 ) {
     val executed: BigDecimal get() = bd(executedQty)
     val protectedQuantity: BigDecimal get() = bd(protectedQty)
@@ -63,7 +66,7 @@ data class DemoEntry(
         put("limitPrice", limitPrice); put("quantity", quantity); orderId?.let { put("orderId", it) }; put("status", status.name)
         put("executedQty", executedQty); avgPrice?.let { put("avgPrice", it) }; put("protectedQty", protectedQty); put("closedQty", closedQty)
         slAlgoId?.let { put("slAlgoId", it) }; slTrigger?.let { put("slTrigger", it) }; put("slState", slState)
-        put("note", note); put("createdAt", createdAt); put("updatedAt", updatedAt); put("cycleId", cycleId); put("kind", kind); put("slOn", slOn)
+        put("note", note); put("createdAt", createdAt); put("updatedAt", updatedAt); put("cycleId", cycleId); put("kind", kind); put("slOn", slOn); put("avgSlot", avgSlot)
     }.toString()
 
     companion object {
@@ -76,8 +79,21 @@ data class DemoEntry(
                 status = EntryStatus.valueOf(o.getString("status")), executedQty = o.optString("executedQty", "0"), avgPrice = if (o.has("avgPrice")) o.getString("avgPrice") else null,
                 protectedQty = o.optString("protectedQty", "0"), closedQty = o.optString("closedQty", "0"), slAlgoId = if (o.has("slAlgoId")) o.getLong("slAlgoId") else null, slTrigger = if (o.has("slTrigger")) o.getString("slTrigger") else null,
                 slState = o.optString("slState", "NONE"), note = o.optString("note", ""), createdAt = o.optLong("createdAt", 0L), updatedAt = o.optLong("updatedAt", 0L),
-                cycleId = o.optString("cycleId", ""), kind = o.optString("kind", "MANUAL"), slOn = o.optBoolean("slOn", true),
+                cycleId = o.optString("cycleId", ""), kind = o.optString("kind", "MANUAL"), slOn = o.optBoolean("slOn", true), avgSlot = o.optInt("avgSlot", 0),
             )
         }.getOrNull()
+    }
+}
+
+/** Execution state of one Averaging order slot, derived ONLY from the stored exchange status of its entry (null entry = never submitted). */
+fun averagingStateOf(e: DemoEntry?): AveragingOrderState {
+    if (e == null) return AveragingOrderState.NOT_SUBMITTED
+    return when (e.status) {
+        EntryStatus.SENDING, EntryStatus.UNKNOWN, EntryStatus.NEW -> AveragingOrderState.NEW
+        EntryStatus.PARTIALLY_FILLED -> AveragingOrderState.PARTIALLY_FILLED
+        EntryStatus.FILLED, EntryStatus.CLOSED, EntryStatus.FAILSAFE_CLOSED, EntryStatus.UNPROTECTED -> AveragingOrderState.FILLED
+        EntryStatus.CANCELED -> AveragingOrderState.CANCELED
+        EntryStatus.REJECTED -> AveragingOrderState.REJECTED
+        EntryStatus.EXPIRED -> AveragingOrderState.EXPIRED
     }
 }

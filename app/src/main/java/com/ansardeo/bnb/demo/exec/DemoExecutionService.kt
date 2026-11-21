@@ -38,7 +38,7 @@ class DemoExecutionService(
     private val mutex = Mutex()
     private var counter = 0
 
-    data class EntryRequest(val symbol: String, val direction: String, val limitPrice: BigDecimal, val marginAmount: BigDecimal, val expectedLeverage: Int, val slRoiPercent: Double, val slEnabled: Boolean, val cycleId: String = "", val kind: String = "MANUAL")
+    data class EntryRequest(val symbol: String, val direction: String, val limitPrice: BigDecimal, val marginAmount: BigDecimal, val expectedLeverage: Int, val slRoiPercent: Double, val slEnabled: Boolean, val cycleId: String = "", val kind: String = "MANUAL", val avgSlot: Int = 0)
 
     sealed class PlaceResult {
         data class Placed(val entry: DemoEntry) : PlaceResult()
@@ -197,6 +197,94 @@ class DemoExecutionService(
         }
     }
 
+    sealed class OpposingResult {
+        data class Placed(val order: TrailingPlaced) : OpposingResult()
+        data class Refused(val reason: String) : OpposingResult()
+    }
+
+    /**
+     * Phase 5: places the Opposite-Side order — ONE real Binance opening Trailing Stop order (LONG source: SELL + SHORT; SHORT source: BUY + LONG).
+     * Duplicate prevention happens HERE, at placement only: nothing is placed unless Binance positionRisk is readable and shows no position in the
+     * opposite direction, and no pending opposite entry order / pending opposite trailing order exists (store and Binance). Unreadable = not placed.
+     * Returns Placed only after Binance confirmed the order as active (queried back).
+     */
+    suspend fun placeOpposingTrailingOrder(
+        c: DemoCredentials, symbol: String, sourceDirection: String, leverage: Int, margin: BigDecimal, sourceFill: BigDecimal,
+        activationRoi: BigDecimal, callbackRoi: BigDecimal, tag: String,
+    ): OpposingResult = withContext(Dispatchers.IO) {
+        mutex.withLock {
+            val rules = rulesFor(symbol) ?: return@withLock OpposingResult.Refused("exchange rules unavailable")
+            val oppDir = if (sourceDirection == "LONG") "SHORT" else "LONG"
+            val (side, posSide) = com.ansardeo.bnb.trading.OppositeTrigger.orderSides(sourceDirection)
+            val cb = com.ansardeo.bnb.trading.OppositeTrigger.callbackPricePercent(callbackRoi, leverage)
+                ?: return@withLock OpposingResult.Refused("callback ${callbackRoi.toPlainString()}% ROI at ${leverage}x is outside Binance's 0.1%–10% price-callback range")
+            val raw = com.ansardeo.bnb.trading.OppositeTrigger.activationPrice(TrailSide.fromDirection(sourceDirection), sourceFill, leverage, activationRoi)
+            val act = if (sourceDirection == "LONG") ExchangeRules.ceilToStep(raw, rules.tickSize) else ExchangeRules.floorToStep(raw, rules.tickSize)
+            if (act.signum() <= 0) return@withLock OpposingResult.Refused("activation price is not valid")
+            val mp = api.markPrice(symbol)
+            val mark = if (mp.ok) runCatching { BigDecimal(JSONObject(mp.body).getString("markPrice")) }.getOrNull() else null
+            if (mark == null || mark.signum() <= 0) return@withLock OpposingResult.Refused("mark price unavailable")
+            // Binance rule: a SELL trailing order activates above the latest price, a BUY one below it.
+            if (side == "SELL" && act <= mark) return@withLock OpposingResult.Refused("the mark price ${ExchangeRules.plain(mark)} is already at/above the activation price ${ExchangeRules.plain(act)}")
+            if (side == "BUY" && act >= mark) return@withLock OpposingResult.Refused("the mark price ${ExchangeRules.plain(mark)} is already at/below the activation price ${ExchangeRules.plain(act)}")
+            val qty = ExchangeRules.floorToStep(com.ansardeo.bnb.trading.OppositeTrigger.quantity(margin, leverage, act), rules.stepSize)
+            if (qty < rules.minQty || qty.multiply(act) < rules.minNotional) return@withLock OpposingResult.Refused("quantity ${ExchangeRules.plain(qty)} is below the exchange minimum (quantity/notional)")
+            // ---- duplicate prevention (placement time only)
+            val held = readPosition(c, symbol, oppDir) ?: return@withLock OpposingResult.Refused("positionRisk could not be read, so a duplicate cannot be ruled out")
+            if (held.signum() > 0) return@withLock OpposingResult.Refused("a $oppDir position already exists on Binance Demo (${ExchangeRules.plain(held)})")
+            if (store.all().any { it.symbol == symbol && it.direction == oppDir && (it.orderActive || it.status == EntryStatus.SENDING || it.status == EntryStatus.UNKNOWN) })
+                return@withLock OpposingResult.Refused("a pending $oppDir entry order already exists")
+            val oo = api.openOrdersAll(c)
+            val basics = if (oo.ok) BasicOrderRow.parse(oo.body) else null
+            if (basics == null) return@withLock OpposingResult.Refused("open orders could not be read, so a duplicate cannot be ruled out")
+            if (basics.any { it.symbol == symbol && it.direction == oppDir && it.side == side }) return@withLock OpposingResult.Refused("a pending $oppDir entry order already exists on Binance Demo")
+            val ao = api.openAlgoOrders(c, symbol)
+            val algos = if (ao.ok) DemoAlgoView.parse(ao.body) else null
+            if (algos == null) return@withLock OpposingResult.Refused("conditional orders could not be read, so a duplicate cannot be ruled out")
+            if (DemoAlgoView.trailingStops(algos).any { it.symbol.ifBlank { symbol } == symbol && it.direction == oppDir && it.side == side }) return@withLock OpposingResult.Refused("a pending opposite trailing order already exists")
+            val qtyText = ExchangeRules.plain(qty); val actText = ExchangeRules.plain(act); val cbText = cb.toPlainString()
+            val cid = tag + "O" + (counter++ % 1000).toString()
+            val r = api.newOpeningTrailingAlgo(c, symbol, side, posSide, qtyText, actText, cbText, cid)
+            val id = if (r.ok) runCatching { JSONObject(r.body).getLong("algoId") }.getOrNull() else null
+            if (id == null) { ev("$tag: Opposite-Side order not accepted — ${r.describe()}"); return@withLock OpposingResult.Refused("Binance did not accept it: ${r.describe()}") }
+            if (!verifyAlgo(c, symbol, id)) { ev("$tag: Opposite-Side order not confirmed by Binance Demo"); api.cancelAlgo(c, id); return@withLock OpposingResult.Refused("Binance did not confirm it as active (it was cancelled again)") }
+            ev("$tag: Opposite-Side order ACTIVE on Binance Demo (confirmed): $side/$posSide qty $qtyText activation $actText callback $cbText% (price)")
+            OpposingResult.Placed(TrailingPlaced(id, qtyText, actText, cbText))
+        }
+    }
+
+    /** Open quantity and entry price Binance reports for one direction of a symbol (null = could not be read). */
+    suspend fun exchangePositionDetail(c: DemoCredentials, symbol: String, direction: String): Pair<BigDecimal, BigDecimal?>? = withContext(Dispatchers.IO) {
+        mutex.withLock {
+            val r = api.positionRisk(c, symbol)
+            if (!r.ok) return@withLock null
+            val a = jsonArray(r.body) ?: return@withLock null
+            var total = BigDecimal.ZERO; var value = BigDecimal.ZERO; var seen = false
+            for (i in 0 until a.length()) {
+                val o = a.optJSONObject(i) ?: continue
+                if (o.optString("symbol", symbol) != symbol || o.optString("positionSide") != direction) continue
+                seen = true
+                val amt = DemoEntry.bd(o.optString("positionAmt", "0")).abs(); total = total.add(amt)
+                value = value.add(amt.multiply(DemoEntry.bd(o.optString("entryPrice", "0"))))
+            }
+            if (!seen) null else Pair(total, if (total.signum() > 0 && value.signum() > 0) value.divide(total, 12, RoundingMode.HALF_UP) else null)
+        }
+    }
+
+    /**
+     * Adopts a position that Binance opened by itself (the triggered Opposite-Side order) as a normal entry of [cycleId]: recorded as FILLED with its
+     * quantity and fill price, then protected at once with its own Stop Loss (fail-safe close + halt only if that Stop Loss cannot be placed).
+     */
+    suspend fun adoptExchangePosition(c: DemoCredentials, symbol: String, direction: String, leverage: Int, qty: BigDecimal, avg: BigDecimal, slRoi: Double, slOn: Boolean, cycleId: String, kind: String): DemoEntry = withContext(Dispatchers.IO) {
+        mutex.withLock {
+            val id = newId()
+            val e = save(DemoEntry(id, symbol, direction, leverage, slRoi, ExchangeRules.plain(avg), ExchangeRules.plain(qty), orderId = null, status = EntryStatus.FILLED,
+                executedQty = ExchangeRules.plain(qty), avgPrice = ExchangeRules.plain(avg), createdAt = clock(), updatedAt = clock(), cycleId = cycleId, kind = kind, slOn = slOn, note = "Opened by Binance (Opposite-Side trailing order); adopted by the app"))
+            ev("$id: adopted $direction ${ExchangeRules.plain(qty)} @ ${ExchangeRules.plain(avg)} opened by Binance (Opposite-Side order); placing its own Stop Loss")
+            progress(c, e)
+        }
+    }
+
     /** Status of a conditional order as Binance reports it now (null = could not be read) plus its actual fill price when Binance gives one. */
     suspend fun algoInfo(c: DemoCredentials, algoId: Long): AlgoInfo = withContext(Dispatchers.IO) {
         mutex.withLock {
@@ -285,7 +373,17 @@ class DemoExecutionService(
     }
 
     // ------------------------------------------------------------------ placing
+    /** Writes a user-level note to the event trail (Emergency Stop, Panic Close ...). Text only; never keys or request data. */
+    fun note(text: String) = ev(text)
+
+    /** An entry that is refused BEFORE anything is sent (coin not ready, halted ...) leaves a reason in the event trail, also in Auto-Trading. Binance rejections are already logged where they happen. */
     private suspend fun place(c: DemoCredentials, req: EntryRequest): PlaceResult {
+        val r = placeCore(c, req)
+        if (r is PlaceResult.Refused && !r.reason.startsWith("Binance rejected")) ev("${req.symbol} ${req.direction}: entry not placed — ${r.reason}")
+        return r
+    }
+
+    private suspend fun placeCore(c: DemoCredentials, req: EntryRequest): PlaceResult {
         store.halt()?.let { return PlaceResult.Refused("Demo trading is halted: $it") }
         if (req.direction != "LONG" && req.direction != "SHORT") return PlaceResult.Refused("Direction must be LONG or SHORT.")
         // Stop Loss OFF is a valid choice: the entry is placed normally, no app-generated Stop Loss follows, and the position stays under Binance liquidation rules.
@@ -303,7 +401,7 @@ class DemoExecutionService(
         if (cfg == null) return PlaceResult.Refused("Margin/leverage could not be read: ${sc.describe()} · Binance answered: ${sc.body.take(160).ifBlank { "(empty)" }}")
         if (!cfg.first.equals("ISOLATED", true)) return PlaceResult.Refused("${req.symbol} is ${cfg.first}, not ISOLATED. Run the Safety Setup first.")
         if (cfg.second != req.expectedLeverage) return PlaceResult.Refused("${req.symbol} leverage on Binance is ${cfg.second}x but Settings say ${req.expectedLeverage}x. Run the Safety Setup first.")
-        val rules = rulesFor(req.symbol) ?: return PlaceResult.Refused("Exchange rules for ${req.symbol} are not available.")
+        val rules = rulesFor(req.symbol) ?: return PlaceResult.Refused("${req.symbol} is not available on Binance Demo (no exchange rules).")
         val mp = api.markPrice(req.symbol)
         val mark = if (mp.ok) runCatching { BigDecimal(JSONObject(mp.body).getString("markPrice")) }.getOrNull() else null
         if (mark == null || mark.signum() <= 0) return PlaceResult.Refused("Mark price unavailable: ${mp.describe()}")
@@ -315,7 +413,7 @@ class DemoExecutionService(
         prep as OrderPrep.Result.Ok
 
         val id = newId()
-        var e = DemoEntry(id, req.symbol, req.direction, req.expectedLeverage, req.slRoiPercent, prep.priceText, prep.quantityText, status = EntryStatus.SENDING, createdAt = clock(), updatedAt = clock(), cycleId = req.cycleId, kind = req.kind, slOn = req.slEnabled)
+        var e = DemoEntry(id, req.symbol, req.direction, req.expectedLeverage, req.slRoiPercent, prep.priceText, prep.quantityText, status = EntryStatus.SENDING, createdAt = clock(), updatedAt = clock(), cycleId = req.cycleId, kind = req.kind, slOn = req.slEnabled, avgSlot = req.avgSlot)
         save(e)
         ev("$id: sending ${req.direction} LIMIT ${prep.quantityText} @ ${prep.priceText}")
         val r = api.newLimitOrder(c, req.symbol, side, req.direction, prep.quantityText, prep.priceText, id)

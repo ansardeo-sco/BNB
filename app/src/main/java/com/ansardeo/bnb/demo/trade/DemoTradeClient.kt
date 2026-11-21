@@ -85,6 +85,11 @@ class DemoTradeClient internal constructor(
         val first = call(Endpoint.EXCHANGE_INFO, listOf("symbol" to symbol), null, slow = true)
         return if (first.error != null && first.error !is DemoHostViolation) call(Endpoint.EXCHANGE_INFO, listOf("symbol" to symbol), null, slow = true) else first
     }
+    /** Same public endpoint without the symbol filter: every symbol listed on Binance Demo (used for the coin search and for tick/step formatting). */
+    suspend fun exchangeInfoAll(): TradeResponse {
+        val first = call(Endpoint.EXCHANGE_INFO, emptyList(), null, slow = true)
+        return if (first.error != null && first.error !is DemoHostViolation) call(Endpoint.EXCHANGE_INFO, emptyList(), null, slow = true) else first
+    }
     suspend fun markPrice(symbol: String) = call(Endpoint.MARK_PRICE, listOf("symbol" to symbol), null)
 
     // ---- account (read-only) ----
@@ -161,6 +166,20 @@ class DemoTradeClient internal constructor(
      */
     suspend fun newTrailingStopAlgo(c: DemoCredentials, symbol: String, side: String, positionSide: String, quantity: String, activatePrice: String, callbackRate: String, clientAlgoId: String): TradeResponse {
         require((positionSide == "LONG" && side == "SELL") || (positionSide == "SHORT" && side == "BUY")) { "closing side only" }
+        require(clientAlgoId.matches(Regex("[.A-Za-z0-9:/_-]{1,36}"))) { "clientAlgoId" }
+        val p = ArrayList<Pair<String, String>>()
+        p += "algoType" to "CONDITIONAL"; p += "symbol" to symbol; p += "side" to side; p += "positionSide" to positionSide
+        p += "type" to "TRAILING_STOP_MARKET"; p += "quantity" to quantity; p += "activatePrice" to activatePrice; p += "callbackRate" to callbackRate
+        p += "workingType" to "MARK_PRICE"; p += "clientAlgoId" to clientAlgoId
+        return call(Endpoint.ALGO_NEW_STOP, p, c)
+    }
+    /**
+     * Phase 5 (approved): the ONE opening trailing order — the Opposite-Side order. OPENING side only (the opposite of the source position:
+     * SELL + SHORT or BUY + LONG), a fixed quantity, MARK_PRICE trigger, callback in PRICE percent. Same endpoint as every other conditional order;
+     * never reduceOnly / closePosition (not allowed in Hedge Mode). It executes as a MARKET order when Binance triggers it.
+     */
+    suspend fun newOpeningTrailingAlgo(c: DemoCredentials, symbol: String, side: String, positionSide: String, quantity: String, activatePrice: String, callbackRate: String, clientAlgoId: String): TradeResponse {
+        require((positionSide == "SHORT" && side == "SELL") || (positionSide == "LONG" && side == "BUY")) { "opening side only" }
         require(clientAlgoId.matches(Regex("[.A-Za-z0-9:/_-]{1,36}"))) { "clientAlgoId" }
         val p = ArrayList<Pair<String, String>>()
         p += "algoType" to "CONDITIONAL"; p += "symbol" to symbol; p += "side" to side; p += "positionSide" to positionSide

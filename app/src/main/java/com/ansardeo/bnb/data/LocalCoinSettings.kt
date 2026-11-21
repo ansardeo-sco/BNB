@@ -1,6 +1,7 @@
 package com.ansardeo.bnb.data
 
 import android.content.Context
+import com.ansardeo.bnb.trading.AveragingMath
 import com.ansardeo.bnb.trading.RoiMath
 import org.json.JSONObject
 
@@ -21,10 +22,12 @@ object SettingKeys {
     const val OPPOSITE_ENABLED = "oppositeEnabled"
     const val OPPOSITE_MARGIN = "oppositeMargin"
     const val AVERAGING_ENABLED = "averagingEnabled"
-    const val AVERAGING_MARGIN = "averagingMargin"
-    const val AVERAGING_TRIGGER_ROI = "averagingTriggerRoi"
-    const val OPPOSITE_TRIGGER_ROI = "oppositeTriggerRoi"
-    const val OPPOSITE_CALLBACK_ROI = "oppositeCallbackRoi"
+    const val AVG1_ALLOCATION = "avg1AllocationPct"
+    const val AVG1_TRIGGER_ROI = "avg1TriggerRoi"
+    const val AVG2_ALLOCATION = "avg2AllocationPct"
+    const val AVG2_TRIGGER_ROI = "avg2TriggerRoi"
+    const val OPPOSITE_TRIGGER_ROI = "oppTrailActivationRoi"
+    const val OPPOSITE_CALLBACK_ROI = "oppTrailCallbackRoi"
     const val STOP_LOSS_ENABLED = "stopLossEnabled"
     const val STOP_LOSS_ROI = "stopLossRoi"
     const val REENTRY_ENABLED = "reentryEnabled"
@@ -35,7 +38,7 @@ object SettingKeys {
     val ALL = listOf(
         MARGIN, LEVERAGE,
         TRAILING_ENABLED, TRAILING_ACTIVATION_ROI, TRAILING_CALLBACK_ROI,
-        AVERAGING_ENABLED, AVERAGING_MARGIN, AVERAGING_TRIGGER_ROI, REENTRY_ENABLED, OPPOSITE_ENABLED, OPPOSITE_MARGIN, OPPOSITE_TRIGGER_ROI, OPPOSITE_CALLBACK_ROI,
+        AVERAGING_ENABLED, AVG1_ALLOCATION, AVG1_TRIGGER_ROI, AVG2_ALLOCATION, AVG2_TRIGGER_ROI, REENTRY_ENABLED, OPPOSITE_ENABLED, OPPOSITE_MARGIN, OPPOSITE_TRIGGER_ROI, OPPOSITE_CALLBACK_ROI,
         STOP_LOSS_ENABLED, STOP_LOSS_ROI,
     )
 }
@@ -46,20 +49,23 @@ object SettingKeys {
  * Everything is a user-editable Position-ROI setting except Re-entry ROI, which is derived automatically as Activation ROI / 2.
  * The Stop Loss is ONE cycle-level stop (enable + ROI, default 80 = -80% Position ROI); there is no per-entry Stop Loss.
  * LONG and SHORT are ALWAYS permitted: direction is not a setting.
- * Averaging and Opposite-Side are independent features, each with its own enable, margin and negative Position ROI trigger.
+ * Averaging (two LIMIT orders, margin = Initial Entry Margin split by allocation, two negative Position-ROI triggers) and Opposite-Side are independent features.
  * There is no Take Profit setting: the profit exit is the ROI Trailing Stop
  * (activation ROI default 33, callback ROI default 3; ROI percentages, not price percentages).
  */
 data class LocalCoinSettings(
     val symbol: String,
-    val marginAmount: Double = 2.0,
-    val leverage: Int = 6,
+    val marginAmount: Double = DEFAULT_MARGIN,
+    val leverage: Int = DEFAULT_LEVERAGE,
     val oppositeEnabled: Boolean = true,
-    val oppositeMargin: Double = 2.0,
+    val oppositeMargin: Double = DEFAULT_MARGIN,
     val averagingEnabled: Boolean = true,
-    val averagingMargin: Double = 2.0,
-    val averagingTriggerRoi: Double = DEFAULT_AVERAGING_TRIGGER_ROI,
-    val oppositeTriggerRoi: Double = DEFAULT_OPPOSITE_TRIGGER_ROI,
+    /** Two-order Averaging: Total Averaging Margin is always the actual Initial Entry Margin; these are the split (%) and the Position-ROI triggers. */
+    val avg1AllocationPct: Double = AveragingMath.DEFAULT_ORDER1_ALLOCATION,
+    val avg1TriggerRoi: Double = AveragingMath.DEFAULT_ORDER1_TRIGGER_ROI,
+    val avg2AllocationPct: Double = AveragingMath.DEFAULT_ORDER2_ALLOCATION,
+    val avg2TriggerRoi: Double = AveragingMath.DEFAULT_ORDER2_TRIGGER_ROI,
+    val oppositeActivationRoi: Double = DEFAULT_OPPOSITE_ACTIVATION_ROI,
     val oppositeCallbackRoi: Double = DEFAULT_OPPOSITE_CALLBACK_ROI,
     val stopLossEnabled: Boolean = true,
     val stopLossRoi: Double = DEFAULT_STOP_LOSS_ROI,
@@ -71,36 +77,39 @@ data class LocalCoinSettings(
     init {
         LeverageConfig.requireSupported(leverage)
         require(marginAmount > 0.0) { "Margin must be positive" }
-        require(averagingMargin > 0.0) { "Averaging margin must be positive" }
         require(oppositeMargin > 0.0) { "Opposite margin must be positive" }
         require(trailingActivationRoi.isFinite() && trailingActivationRoi > 0.0) { "Trailing activation ROI must be greater than 0" }
         require(trailingCallbackRoi.isFinite() && trailingCallbackRoi > 0.0) { "Trailing callback ROI must be greater than 0" }
         require(RoiMath.isValidStopLossRoi(stopLossRoi)) { "Stop Loss ROI must be greater than 0 and below ${RoiMath.LIQUIDATION_ROI.toInt()}% (the simulated liquidation)" }
-        require(oppositeCallbackRoi.isFinite() && oppositeCallbackRoi > 0.0) { "Opposite-Side callback ROI must be greater than 0" }
+        require(oppositeCallbackRoi.isFinite() && oppositeCallbackRoi > 0.0) { "Opposite trailing callback ROI must be greater than 0" }
+        require(oppositeActivationRoi.isFinite() && oppositeActivationRoi > 0.0) { "Opposite trailing activation ROI must be greater than 0" }
         val limit = RoiMath.triggerLimit(stopLossEnabled, stopLossRoi)
-        require(RoiMath.isValidLossTrigger(averagingTriggerRoi, limit)) { "Averaging Trigger ROI must be between -${limit.toInt()}% and 0% (the Stop Loss is at -${limit.toInt()}%)" }
-        require(RoiMath.isValidLossTrigger(oppositeTriggerRoi, limit)) { "Opposite-Side Trigger ROI must be between -${limit.toInt()}% and 0% (the Stop Loss is at -${limit.toInt()}%)" }
+        AveragingMath.validate(averagingConfig, limit)?.let { throw IllegalArgumentException(it) }
     }
 
+    val averagingConfig: AveragingMath.Config get() = AveragingMath.Config(avg1AllocationPct, avg1TriggerRoi, avg2AllocationPct, avg2TriggerRoi)
 
     companion object {
-        const val DEFAULT_ACTIVATION_ROI = 33.0
-        const val DEFAULT_CALLBACK_ROI = 3.0
-        const val DEFAULT_AVERAGING_TRIGGER_ROI = -60.0
-        const val DEFAULT_OPPOSITE_TRIGGER_ROI = -50.0
-        const val DEFAULT_OPPOSITE_CALLBACK_ROI = 5.0
+        const val DEFAULT_MARGIN = 100.0
+        const val DEFAULT_LEVERAGE = 10
+        const val DEFAULT_ACTIVATION_ROI = 40.0
+        const val DEFAULT_CALLBACK_ROI = 5.0
+        const val DEFAULT_OPPOSITE_ACTIVATION_ROI = 40.0
+        const val DEFAULT_OPPOSITE_CALLBACK_ROI = 3.0
         const val DEFAULT_STOP_LOSS_ROI = 80.0
 
         fun sanitized(
             symbol: String,
-            marginAmount: Double = 2.0,
-            leverage: Int = 6,
+            marginAmount: Double = DEFAULT_MARGIN,
+            leverage: Int = DEFAULT_LEVERAGE,
             oppositeEnabled: Boolean = true,
-            oppositeMargin: Double = 2.0,
+            oppositeMargin: Double = DEFAULT_MARGIN,
             averagingEnabled: Boolean = true,
-            averagingMargin: Double = 2.0,
-            averagingTriggerRoi: Double = DEFAULT_AVERAGING_TRIGGER_ROI,
-            oppositeTriggerRoi: Double = DEFAULT_OPPOSITE_TRIGGER_ROI,
+            avg1AllocationPct: Double = AveragingMath.DEFAULT_ORDER1_ALLOCATION,
+            avg1TriggerRoi: Double = AveragingMath.DEFAULT_ORDER1_TRIGGER_ROI,
+            avg2AllocationPct: Double = AveragingMath.DEFAULT_ORDER2_ALLOCATION,
+            avg2TriggerRoi: Double = AveragingMath.DEFAULT_ORDER2_TRIGGER_ROI,
+            oppositeActivationRoi: Double = DEFAULT_OPPOSITE_ACTIVATION_ROI,
             oppositeCallbackRoi: Double = DEFAULT_OPPOSITE_CALLBACK_ROI,
             stopLossEnabled: Boolean = true,
             stopLossRoi: Double = DEFAULT_STOP_LOSS_ROI,
@@ -109,22 +118,23 @@ data class LocalCoinSettings(
             trailingActivationRoi: Double = DEFAULT_ACTIVATION_ROI,
             trailingCallbackRoi: Double = DEFAULT_CALLBACK_ROI,
         ): LocalCoinSettings {
-            val lev = if (LeverageConfig.isSupported(leverage)) leverage else 6
+            val lev = if (LeverageConfig.isSupported(leverage)) leverage else DEFAULT_LEVERAGE
             fun pos(v: Double, d: Double) = if (v.isFinite() && v > 0.0) v else d
             val slRoi = Math.abs(stopLossRoi).takeIf { RoiMath.isValidStopLossRoi(it) } ?: DEFAULT_STOP_LOSS_ROI
             val limit = RoiMath.triggerLimit(stopLossEnabled, slRoi)
             fun trig(v: Double, d: Double): Double =
                 (if (v.isFinite()) RoiMath.normalizeLossTrigger(v) else d).takeIf { RoiMath.isValidLossTrigger(it, limit) } ?: d.takeIf { RoiMath.isValidLossTrigger(it, limit) } ?: -limit
+            val avg = AveragingMath.sanitize(AveragingMath.Config(avg1AllocationPct, avg1TriggerRoi, avg2AllocationPct, avg2TriggerRoi), limit)
             return LocalCoinSettings(
                 symbol = symbol.uppercase(),
-                marginAmount = pos(marginAmount, 2.0),
+                marginAmount = pos(marginAmount, DEFAULT_MARGIN),
                 leverage = lev,
                 oppositeEnabled = oppositeEnabled,
-                oppositeMargin = pos(oppositeMargin, 2.0),
+                oppositeMargin = pos(oppositeMargin, DEFAULT_MARGIN),
                 averagingEnabled = averagingEnabled,
-                averagingMargin = pos(averagingMargin, 2.0),
-                averagingTriggerRoi = trig(averagingTriggerRoi, DEFAULT_AVERAGING_TRIGGER_ROI),
-                oppositeTriggerRoi = trig(oppositeTriggerRoi, DEFAULT_OPPOSITE_TRIGGER_ROI),
+                avg1AllocationPct = avg.order1AllocationPct, avg1TriggerRoi = avg.order1TriggerRoi,
+                avg2AllocationPct = avg.order2AllocationPct, avg2TriggerRoi = avg.order2TriggerRoi,
+                oppositeActivationRoi = pos(oppositeActivationRoi, DEFAULT_OPPOSITE_ACTIVATION_ROI),
                 oppositeCallbackRoi = pos(oppositeCallbackRoi, DEFAULT_OPPOSITE_CALLBACK_ROI),
                 stopLossEnabled = stopLossEnabled,
                 stopLossRoi = slRoi,
@@ -153,9 +163,9 @@ object SettingsResolver {
             oppositeEnabled = b(SettingKeys.OPPOSITE_ENABLED, global.oppositeEnabled),
             oppositeMargin = n(SettingKeys.OPPOSITE_MARGIN, global.oppositeMargin),
             averagingEnabled = b(SettingKeys.AVERAGING_ENABLED, global.averagingEnabled),
-            averagingMargin = n(SettingKeys.AVERAGING_MARGIN, global.averagingMargin),
-            averagingTriggerRoi = n(SettingKeys.AVERAGING_TRIGGER_ROI, global.averagingTriggerRoi),
-            oppositeTriggerRoi = n(SettingKeys.OPPOSITE_TRIGGER_ROI, global.oppositeTriggerRoi),
+            avg1AllocationPct = n(SettingKeys.AVG1_ALLOCATION, global.avg1AllocationPct), avg1TriggerRoi = n(SettingKeys.AVG1_TRIGGER_ROI, global.avg1TriggerRoi),
+            avg2AllocationPct = n(SettingKeys.AVG2_ALLOCATION, global.avg2AllocationPct), avg2TriggerRoi = n(SettingKeys.AVG2_TRIGGER_ROI, global.avg2TriggerRoi),
+            oppositeActivationRoi = n(SettingKeys.OPPOSITE_TRIGGER_ROI, global.oppositeActivationRoi),
             oppositeCallbackRoi = n(SettingKeys.OPPOSITE_CALLBACK_ROI, global.oppositeCallbackRoi),
             stopLossEnabled = b(SettingKeys.STOP_LOSS_ENABLED, global.stopLossEnabled),
             stopLossRoi = n(SettingKeys.STOP_LOSS_ROI, global.stopLossRoi),
@@ -178,9 +188,9 @@ object SettingsResolver {
             oppositeEnabled = b(SettingKeys.OPPOSITE_ENABLED, global.oppositeEnabled),
             oppositeMargin = n(SettingKeys.OPPOSITE_MARGIN, global.oppositeMargin),
             averagingEnabled = b(SettingKeys.AVERAGING_ENABLED, global.averagingEnabled),
-            averagingMargin = n(SettingKeys.AVERAGING_MARGIN, global.averagingMargin),
-            averagingTriggerRoi = n(SettingKeys.AVERAGING_TRIGGER_ROI, global.averagingTriggerRoi),
-            oppositeTriggerRoi = n(SettingKeys.OPPOSITE_TRIGGER_ROI, global.oppositeTriggerRoi),
+            avg1AllocationPct = n(SettingKeys.AVG1_ALLOCATION, global.avg1AllocationPct), avg1TriggerRoi = n(SettingKeys.AVG1_TRIGGER_ROI, global.avg1TriggerRoi),
+            avg2AllocationPct = n(SettingKeys.AVG2_ALLOCATION, global.avg2AllocationPct), avg2TriggerRoi = n(SettingKeys.AVG2_TRIGGER_ROI, global.avg2TriggerRoi),
+            oppositeActivationRoi = n(SettingKeys.OPPOSITE_TRIGGER_ROI, global.oppositeActivationRoi),
             oppositeCallbackRoi = n(SettingKeys.OPPOSITE_CALLBACK_ROI, global.oppositeCallbackRoi),
             stopLossEnabled = b(SettingKeys.STOP_LOSS_ENABLED, global.stopLossEnabled),
             stopLossRoi = n(SettingKeys.STOP_LOSS_ROI, global.stopLossRoi),
@@ -249,9 +259,11 @@ object LocalCoinSettingsStore {
             SettingKeys.OPPOSITE_ENABLED to settings.oppositeEnabled,
             SettingKeys.OPPOSITE_MARGIN to settings.oppositeMargin,
             SettingKeys.AVERAGING_ENABLED to settings.averagingEnabled,
-            SettingKeys.AVERAGING_MARGIN to settings.averagingMargin,
-            SettingKeys.AVERAGING_TRIGGER_ROI to settings.averagingTriggerRoi,
-            SettingKeys.OPPOSITE_TRIGGER_ROI to settings.oppositeTriggerRoi,
+            SettingKeys.AVG1_ALLOCATION to settings.avg1AllocationPct,
+            SettingKeys.AVG1_TRIGGER_ROI to settings.avg1TriggerRoi,
+            SettingKeys.AVG2_ALLOCATION to settings.avg2AllocationPct,
+            SettingKeys.AVG2_TRIGGER_ROI to settings.avg2TriggerRoi,
+            SettingKeys.OPPOSITE_TRIGGER_ROI to settings.oppositeActivationRoi,
             SettingKeys.OPPOSITE_CALLBACK_ROI to settings.oppositeCallbackRoi,
             SettingKeys.STOP_LOSS_ENABLED to settings.stopLossEnabled,
             SettingKeys.STOP_LOSS_ROI to settings.stopLossRoi,
